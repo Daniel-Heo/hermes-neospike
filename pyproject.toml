@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neospike"
+version = "1.0.0"
+description = "Private local hybrid text memory provider for Hermes Agent"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{name = "Daniel Heo"}]
+dependencies = [
+  "numpy>=2.0,<3",
+  "faiss-cpu>=1.16,<2",
+  "tokenizers>=0.22,<1",
+  "onnxruntime>=1.20,<2",
+  "huggingface-hub>=0.34,<2",
+  "jsonschema>=4,<5",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+# MCP stdio server for Claude Code (python -m neospike.mcp_server); not part of the default install.
+mcp = ["mcp>=2.3,<3"]
+
+[project.urls]
+Repository = "https://github.com/Daniel-Heo/hermes-neospike"
+Issues = "https://github.com/Daniel-Heo/hermes-neospike/issues"
+
+[project.scripts]
+neospike = "neospike.cli:main"
+neospike-inference = "neospike.inference:main"
+
+[project.entry-points."hermes_agent.memory_providers"]
+neospike = "neospike:register"
+
+[dependency-groups]
+dev = ["fastapi>=0.116,<1", "httpx>=0.28,<1", "pytest>=9,<10"]
+
+[tool.hatch.build]
+exclude = ["neospike/provider 2.py", "neospike/evaluation/results/**", "**/*.db", "**/*.db-*", "**/*.sqlite*", "**/*.zip", "**/*.jsonl", ".env*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["neospike"]
+
+[tool.pytest.ini_options]
+testpaths = ["neospike/tests"]
+addopts = "-q"

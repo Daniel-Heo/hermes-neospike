@@ -1,0 +1,52 @@
+﻿{"id": "d01", "split": "dev", "type": "changed", "lang": "en", "question": "Which server do Pelican deploys go to?", "gold": ["m02"], "stale": ["m01"]}
+{"id": "d02", "split": "dev", "type": "normal", "lang": "ko", "question": "주문 데이터베이스 백업은 몇 시에 돌아?", "gold": ["m03"], "category": "cross_language"}
+{"id": "d03", "split": "dev", "type": "normal", "lang": "en", "question": "How long is backup retention?", "gold": ["m04"]}
+{"id": "d04", "split": "dev", "type": "normal", "lang": "mixed", "question": "weekly meeting schedule 언제야?", "gold": ["m05"]}
+{"id": "d05", "split": "dev", "type": "changed", "lang": "ko", "question": "내 편집기 테마 뭐였지?", "gold": ["m06"], "stale": ["m28"], "category": "cross_language"}
+{"id": "d06", "split": "dev", "type": "normal", "lang": "en", "question": "What font does my editor use?", "gold": ["m07"], "category": "cross_language"}
+{"id": "d07", "split": "dev", "type": "normal", "lang": "ko", "question": "파이썬 버전 몇이야?", "gold": ["m08"], "category": "cross_language"}
+{"id": "d08", "split": "dev", "type": "normal", "lang": "en", "question": "Which tool runs the python unit test?", "gold": ["m09"], "category": "cross_language"}
+{"id": "d09", "split": "dev", "type": "normal", "lang": "ko", "question": "키보드 배열 뭐 쓰지?", "gold": ["m11"]}
+{"id": "d10", "split": "dev", "type": "normal", "lang": "en", "question": "How often is the API key rotation?", "gold": ["m12"]}
+{"id": "d11", "split": "dev", "type": "normal", "lang": "mixed", "question": "image cache size 제한?", "gold": ["m13"]}
+{"id": "d12", "split": "dev", "type": "normal", "lang": "en", "question": "What is the server log level?", "gold": ["m14"]}
+{"id": "d13", "split": "dev", "type": "normal", "lang": "ko", "question": "정원 물주기는 몇 시?", "gold": ["m16"], "category": "cross_language"}
+{"id": "d14", "split": "dev", "type": "changed", "lang": "en", "question": "What is the hotel budget cap?", "gold": ["m19"], "stale": ["m27"]}
+{"id": "d15", "split": "dev", "type": "normal", "lang": "en", "question": "Which vendor sells our coffee beans?", "gold": ["m26"]}
+{"id": "d16", "split": "dev", "type": "normal", "lang": "ko", "question": "회의는 언제 해?", "gold": ["m05"], "category": "cross_language"}
+{"id": "d17", "split": "dev", "type": "normal", "lang": "en", "question": "Which Postgres release do we run?", "gold": ["m22"]}
+{"id": "d18", "split": "dev", "type": "normal", "lang": "en", "question": "How much tire pressure for the bicycle?", "gold": ["m20"], "category": "cross_language"}
+{"id": "d19", "split": "dev", "type": "normal", "lang": "ko", "question": "모니터 색상 프로필?", "gold": ["m21"], "category": "cross_language"}
+{"id": "d20", "split": "dev", "type": "normal", "lang": "mixed", "question": "deploy 전에 unit test 기다려?", "gold": ["m23"]}
+{"id": "d21", "split": "dev", "type": "no_answer", "lang": "en", "question": "Which server hosts the volcano dashboard?", "gold": [], "no_answer_kind": "near"}
+{"id": "d22", "split": "dev", "type": "no_answer", "lang": "ko", "question": "피아노 레슨 일정은?", "gold": [], "no_answer_kind": "near"}
+{"id": "d23", "split": "dev", "type": "no_answer", "lang": "mixed", "question": "income tax 백업 서류 어디?", "gold": [], "no_answer_kind": "near"}
+{"id": "d24", "split": "dev", "type": "no_answer", "lang": "en", "question": "What is the dentist appointment schedule for the weekly checkup?", "gold": [], "no_answer_kind": "near"}
+{"id": "d25", "split": "dev", "type": "no_answer", "lang": "en", "question": "How do I tune a violin?", "gold": [], "no_answer_kind": "far"}
+{"id": "d26", "split": "dev", "type": "no_answer", "lang": "ko", "question": "스노보드 왁스는 뭐가 좋아?", "gold": [], "no_answer_kind": "far"}
+{"id": "d27", "split": "dev", "type": "no_answer", "lang": "en", "question": "Where is my passport?", "gold": [], "no_answer_kind": "far"}
+{"id": "d28", "split": "dev", "type": "no_answer", "lang": "ko", "question": "어제 저녁 뭐 먹었지?", "gold": [], "no_answer_kind": "far"}
+{"id": "t01", "split": "test", "type": "changed", "lang": "en", "question": "Where do we deploy Pelican now?", "gold": ["m02"], "stale": ["m01"]}
+{"id": "t02", "split": "test", "type": "normal", "lang": "ko", "question": "백업 보관 기간은?", "gold": ["m04"], "category": "cross_language"}
+{"id": "t03", "split": "test", "type": "normal", "lang": "en", "question": "When is the weekly full backup?", "gold": ["m24"], "category": "cross_language"}
+{"id": "t04", "split": "test", "type": "normal", "lang": "mixed", "question": "editor font 크기?", "gold": ["m07"], "category": "cross_language"}
+{"id": "t05", "split": "test", "type": "normal", "lang": "ko", "question": "공급업체 청구서 처리일?", "gold": ["m15"]}
+{"id": "t06", "split": "test", "type": "normal", "lang": "en", "question": "How often do the potted plants get watering?", "gold": ["m17"], "category": "cross_language"}
+{"id": "t07", "split": "test", "type": "normal", "lang": "ko", "question": "정원 식물 목록 노트?", "gold": ["n03"], "category": "cross_language"}
+{"id": "t08", "split": "test", "type": "normal", "lang": "en", "question": "Is the conference flight and hotel booked?", "gold": ["m18"]}
+{"id": "t09", "split": "test", "type": "normal", "lang": "mixed", "question": "monitor font scaling 몇 퍼센트?", "gold": ["m25"]}
+{"id": "t10", "split": "test", "type": "normal", "lang": "en", "question": "Where is the server cache?", "gold": ["m29"], "category": "cross_language"}
+{"id": "t11", "split": "test", "type": "normal", "lang": "ko", "question": "항공편 일정 어디 있어?", "gold": ["m30"], "category": "cross_language"}
+{"id": "t12", "split": "test", "type": "normal", "lang": "ko", "question": "편집기 단축키 정리한 노트 있어?", "gold": ["n04"]}
+{"id": "t13", "split": "test", "type": "normal", "lang": "en", "question": "Where is the database restore procedure?", "gold": ["n02"], "category": "cross_language"}
+{"id": "t14", "split": "test", "type": "normal", "lang": "en", "question": "What are the travel budget rules?", "gold": ["n05"]}
+{"id": "t15", "split": "test", "type": "normal", "lang": "ko", "question": "자전거 타이어 공기압 얼마로 맞춰?", "gold": ["m20"]}
+{"id": "t16", "split": "test", "type": "no_answer", "lang": "en", "question": "Which vendor fixes the bicycle?", "gold": [], "no_answer_kind": "near"}
+{"id": "t17", "split": "test", "type": "no_answer", "lang": "ko", "question": "커피 머신 구매 예산은?", "gold": [], "no_answer_kind": "near"}
+{"id": "t18", "split": "test", "type": "no_answer", "lang": "mixed", "question": "piano 키보드 연습 일정?", "gold": [], "no_answer_kind": "near"}
+{"id": "t19", "split": "test", "type": "no_answer", "lang": "en", "question": "What is the capital of the volcano island?", "gold": [], "no_answer_kind": "far"}
+{"id": "t20", "split": "test", "type": "no_answer", "lang": "ko", "question": "소득세 신고 마감일?", "gold": [], "no_answer_kind": "far"}
+{"id": "t21", "split": "test", "type": "no_answer", "lang": "mixed", "question": "dentist 예약 했나?", "gold": [], "no_answer_kind": "far"}
+{"id": "t22", "split": "test", "type": "no_answer", "lang": "en", "question": "Any news today?", "gold": [], "no_answer_kind": "far"}
+{"id": "t23", "split": "test", "type": "changed", "lang": "en", "question": "What is my editor theme now?", "gold": ["m06"], "stale": ["m28"]}
+{"id": "t24", "split": "test", "type": "changed", "lang": "ko", "question": "호텔 예산 상한은?", "gold": ["m19"], "stale": ["m27"], "category": "cross_language"}

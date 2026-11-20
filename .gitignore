@@ -218,3 +218,34 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --- neospike project rules (from previous repo .gitignore) ---
+*.py[cod]
+.venv/
+.venv-upgrade/
+.test-tmp/
+.build-upgrade/
+.it-*/
+.bk-*/
+.e2-*/
+!neospike/dashboard/dist/
+!neospike/dashboard/dist/**
+.DS_Store
+assets/*.zip
+# Never commit local memory, models, exports, or credentials
+models/
+*.sqlite*
+*.jsonl
+.env*
+# Search-evaluation outputs (runs, protocol.json, ledger.jsonl) are private and never distributable.
+neospike/evaluation/results/
+# The synthetic evaluation fixture is published despite the *.jsonl rule above.
+!neospike/tests/fixtures/eval/*.jsonl
+neospike/provider 2.py
+*.db
+*.db-*
+*.zip
+*.tar.gz
+
+# Claude Code local settings and lock files of this checkout
+.claude/

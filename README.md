@@ -98,8 +98,10 @@ The agent gets these tools from the provider:
 | `neospike_memory_delete` | Remove one item. |
 | `neospike_memory_reconcile` | Settle the older, similar items returned by a save. |
 | `neospike_memory_search` | Search stored knowledge. |
-| `neospike_note_read` | Read a whole note or doc. |
+| `neospike_note_read` | Read a whole note (agent or automatic). |
 | `neospike_note_write` | Create or update a note. |
+| `neospike_doc_read` | Read a whole doc (a note the user wrote). |
+| `neospike_doc_write` | Edit an existing doc, only when the user asks. |
 
 MCP clients get a smaller, mostly read-only set:
 

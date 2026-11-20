@@ -1,0 +1,175 @@
+﻿{
+ "_comment": "Synthetic fixture lexicon (fictional). ConceptEmbedder: one axis per concept + background.",
+ "background": 0.9,
+ "concepts": {
+  "deploy": [
+   "deploy",
+   "배포"
+  ],
+  "server": [
+   "server",
+   "서버"
+  ],
+  "database": [
+   "database",
+   "데이터베이스"
+  ],
+  "backup": [
+   "backup",
+   "백업"
+  ],
+  "retention": [
+   "retention",
+   "보관"
+  ],
+  "schedule": [
+   "schedule",
+   "일정"
+  ],
+  "weekly": [
+   "weekly",
+   "매주"
+  ],
+  "meeting": [
+   "meeting",
+   "회의"
+  ],
+  "editor": [
+   "editor",
+   "편집기"
+  ],
+  "theme": [
+   "theme",
+   "테마"
+  ],
+  "font": [
+   "font",
+   "글꼴"
+  ],
+  "python": [
+   "python",
+   "파이썬"
+  ],
+  "version": [
+   "version",
+   "버전"
+  ],
+  "unittest": [
+   "unit test",
+   "단위 테스트"
+  ],
+  "coffee": [
+   "coffee",
+   "커피"
+  ],
+  "lunch": [
+   "lunch",
+   "점심"
+  ],
+  "keyboard": [
+   "keyboard",
+   "키보드"
+  ],
+  "layout": [
+   "layout",
+   "배열"
+  ],
+  "apikey": [
+   "api key",
+   "api 키"
+  ],
+  "rotation": [
+   "rotation",
+   "교체"
+  ],
+  "cache": [
+   "cache",
+   "캐시"
+  ],
+  "size": [
+   "size",
+   "크기"
+  ],
+  "loglevel": [
+   "log level",
+   "로그 레벨"
+  ],
+  "vendor": [
+   "vendor",
+   "공급업체"
+  ],
+  "invoice": [
+   "invoice",
+   "청구서"
+  ],
+  "garden": [
+   "garden",
+   "정원"
+  ],
+  "plant": [
+   "plant",
+   "화분",
+   "식물"
+  ],
+  "watering": [
+   "watering",
+   "물주기"
+  ],
+  "flight": [
+   "flight",
+   "항공편"
+  ],
+  "hotel": [
+   "hotel",
+   "호텔"
+  ],
+  "budget": [
+   "budget",
+   "예산"
+  ],
+  "bicycle": [
+   "bicycle",
+   "자전거"
+  ],
+  "tire": [
+   "tire",
+   "타이어"
+  ],
+  "monitor": [
+   "monitor",
+   "모니터"
+  ],
+  "color": [
+   "color",
+   "색상"
+  ],
+  "volcano": [
+   "volcano",
+   "화산"
+  ],
+  "piano": [
+   "piano",
+   "피아노"
+  ],
+  "violin": [
+   "violin",
+   "바이올린"
+  ],
+  "snowboard": [
+   "snowboard",
+   "스노보드"
+  ],
+  "passport": [
+   "passport",
+   "여권"
+  ],
+  "dentist": [
+   "dentist",
+   "치과"
+  ],
+  "tax": [
+   "income tax",
+   "소득세"
+  ]
+ }
+}

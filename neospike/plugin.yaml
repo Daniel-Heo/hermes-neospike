@@ -1,0 +1,9 @@
+name: neospike
+version: 1.0.0
+description: "Private local hybrid text memory with profile isolation."
+hooks:
+  - on_memory_write
+  - transform_llm_output
+python_dependencies:
+  - "numpy>=2.0,<3"
+  - "faiss-cpu>=1.16,<2"

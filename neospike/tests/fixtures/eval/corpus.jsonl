@@ -1,0 +1,36 @@
+﻿{"key": "m01", "kind": "memory", "text": "Pelican deploys go to server alpha."}
+{"key": "m02", "kind": "memory", "text": "Pelican deploys moved to server beta.", "supersedes": "m01"}
+{"key": "m03", "kind": "memory", "text": "The orders database gets a backup at 02:00."}
+{"key": "m04", "kind": "memory", "text": "Backup copies are kept under a 30-day retention."}
+{"key": "m05", "kind": "memory", "text": "Weekly planning meeting schedule: Monday 10:00."}
+{"key": "m28", "kind": "memory", "text": "편집기 테마는 monokai였다."}
+{"key": "m06", "kind": "memory", "text": "My editor theme is solarized dark.", "supersedes": "m28"}
+{"key": "m07", "kind": "memory", "text": "편집기 글꼴은 JetBrains Mono 14로 쓴다."}
+{"key": "m08", "kind": "memory", "text": "Pelican runs Python version 3.12."}
+{"key": "m09", "kind": "memory", "text": "단위 테스트는 파이썬 pytest로 돌린다."}
+{"key": "m10", "kind": "memory", "text": "점심 뒤에는 커피를 디카페인으로 마신다."}
+{"key": "m11", "kind": "memory", "text": "키보드 배열은 colemak이다."}
+{"key": "m12", "kind": "memory", "text": "API key rotation happens every 90 days."}
+{"key": "m13", "kind": "memory", "text": "The image cache size limit is 2 GB."}
+{"key": "m14", "kind": "memory", "text": "Server log level stays at INFO in production."}
+{"key": "m15", "kind": "memory", "text": "공급업체 청구서는 매달 5일에 처리한다."}
+{"key": "m16", "kind": "memory", "text": "Garden watering runs at 6 am."}
+{"key": "m17", "kind": "memory", "text": "화분 물주기는 사흘에 한 번."}
+{"key": "m18", "kind": "memory", "text": "Conference flight and hotel are booked through the travel desk."}
+{"key": "m27", "kind": "memory", "text": "Hotel budget cap was 120 per night.", "importance": 0.3}
+{"key": "m19", "kind": "memory", "text": "Hotel budget cap is 150 per night."}
+{"key": "m20", "kind": "memory", "text": "자전거 타이어 공기압은 80 psi로 맞춘다."}
+{"key": "m21", "kind": "memory", "text": "Monitor color profile is sRGB."}
+{"key": "m22", "kind": "memory", "text": "The database version is PostgreSQL 16."}
+{"key": "m23", "kind": "memory", "text": "Every deploy waits for the unit test run."}
+{"key": "m24", "kind": "memory", "text": "매주 일요일 전체 백업을 따로 한다."}
+{"key": "m25", "kind": "memory", "text": "Monitor font scaling is 125%."}
+{"key": "m26", "kind": "memory", "text": "Coffee beans come from a local vendor."}
+{"key": "m29", "kind": "memory", "text": "서버 캐시는 Redis로 둔다."}
+{"key": "m30", "kind": "memory", "text": "Flight schedule for the offsite is in the shared calendar."}
+{"key": "n01", "kind": "note", "title": "Release checklist", "body": "Before each deploy: run the unit test suite and check server health."}
+{"key": "n02", "kind": "note", "title": "백업 복구 절차", "body": "데이터베이스 백업 파일로 복구하는 순서: 서비스 중지, 복원, 검증."}
+{"key": "n03", "kind": "note", "title": "Garden notes", "body": "Garden plant list and watering calendar."}
+{"key": "n04", "kind": "note", "title": "키보드 단축키", "body": "편집기 단축키와 키보드 매크로 정리."}
+{"key": "n05", "kind": "note", "title": "Travel policy", "body": "Hotel and flight budget rules for business travel."}
+{"key": "n06", "kind": "note", "title": "Coffee machine", "body": "커피 머신 청소 일정: 매주 금요일."}
