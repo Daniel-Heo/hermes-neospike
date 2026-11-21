@@ -21,7 +21,7 @@ Neospike is a memory provider plugin for Hermes Agent. The agent saves short fac
 
 On top of that storage:
 
-- **Automatic recall.** Before each turn, up to 8 matching memories and note sections (cosine 0.7 or more) are added to the agent's context. Items the conversation already contains are skipped.
+- **Automatic recall.** Before each turn, up to 8 matching memories and note sections (cosine 0.61 or more) are added to the agent's context. Items the conversation already contains are skipped.
 - **Preferences in context.** Preferences without a situation are shown once per conversation. Preferences tied to a situation are shown when the current message matches that situation, at most 3 per turn. A constraint always needs a situation, so it is never shown in every conversation.
 - **Dashboard tab** in the Hermes web dashboard: Map (a 3D view of memories, notes and topics, with folders), Notes, Docs, Memory, Preferences, Conversations, Config and Setup. The interface is English or Korean, following the dashboard language.
 - **MCP server** for Claude Code and other MCP clients: `mem_search`, `note_read`, `note_related`, `note_append_report`.
@@ -108,7 +108,7 @@ The agent gets these tools from the provider:
 
 | Tool | Purpose |
 |---|---|
-| `neospike_memory_save` | Save one memory, preference or constraint. |
+| `neospike_memory_save` | Save one memory, preference or constraint. It can also fix, in the same call, a recalled memory or automatic-note line that turned out wrong. |
 | `neospike_memory_update` | Correct an item in place, or supersede it when a decision changed. |
 | `neospike_memory_delete` | Remove one item. |
 | `neospike_memory_reconcile` | Settle the older, similar items returned by a save. |

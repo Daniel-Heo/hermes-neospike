@@ -285,6 +285,74 @@ def _parse_reconcile_changes(value: Any) -> list[tuple[str, int, str | None]]:
     return result
 
 
+# neospike_memory_save updates: the number a recalled line shows, id:N (memory) or note:N.C (automatic-note chunk C).
+_MEMORY_REF_PREFIX, _CHUNK_REF_PREFIX = "id:", "note:"
+_REF_EDGE_CHARS = " \t\r\n[]"
+_CONV_REF_PREFIXES = ("conv:", conversation_family.KIND + ":")
+_MSG_UPDATE_REF = "each update ref is id:N or note:N.C as shown on the recalled line"
+_MSG_PREF_REF = "pref:N is a preference; change it with neospike_memory_update and target=preference"
+_MSG_CONV_REF = "Conversation excerpts cannot be changed"
+_SAVE_UPDATES_SCHEMA = {
+    "type": "array", "minItems": 1, "maxItems": _RECONCILE_BATCH_MAX,
+    "description": "Corrections of recalled lines that proved wrong; each is changed in place, old text kept as history.",
+    "items": {"type": "object", "additionalProperties": False, "required": ["ref", "text"], "properties": {
+        "ref": {"type": "string", "description": "The line's number as shown: id:N or note:N.C."},
+        "text": {"type": "string", "minLength": 1, "description": "The full corrected text."}}},
+}
+_MSG_SAVE_NEEDS_TEXT ="neospike_memory_save needs text (a new item) or updates (corrections of recalled lines)"
+
+
+@dataclasses.dataclass(frozen=True)
+class _SaveUpdate:
+    """One parsed neospike_memory_save update: lane "id" or "chunk_id", its target, the note of a chunk."""
+    ref: str
+    lane: str
+    target: int
+    note_id: int
+    text: str
+
+
+def _ref_number(digits: str) -> int:
+    if not digits.isdigit() or not digits.isascii() or not 1 <= int(digits) <= _SQLITE_ID_MAX:
+        raise ValueError(_MSG_UPDATE_REF)
+    return int(digits)
+
+
+def _parse_save_updates(value: Any) -> list[_SaveUpdate]:
+    """neospike_memory_save updates -> parsed items; shape only (what each ref names is checked later)."""
+    if not isinstance(value, list) or not 1 <= len(value) <= _RECONCILE_BATCH_MAX:
+        raise ValueError(f"updates must be a list of 1 to {_RECONCILE_BATCH_MAX} items")
+    result: list[_SaveUpdate] = []
+    seen: set[tuple[str, int]] = set()
+    for update in value:
+        if not isinstance(update, dict) or update.keys() != {"ref", "text"}:
+            raise ValueError("each update is {ref, text}")
+        ref, text = update["ref"], update["text"]
+        if not isinstance(ref, str):
+            raise ValueError(_MSG_UPDATE_REF)
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("update text must be the full corrected text, not empty")
+        ref = ref.strip(_REF_EDGE_CHARS)
+        if ref.startswith(prefs.PREF_REF_PREFIX):
+            raise ValueError(_MSG_PREF_REF)
+        if ref.startswith(_CONV_REF_PREFIXES):
+            raise ValueError(_MSG_CONV_REF)
+        if ref.startswith(_MEMORY_REF_PREFIX):
+            parsed = _SaveUpdate(ref, "id", _ref_number(ref.removeprefix(_MEMORY_REF_PREFIX)), 0, text)
+        elif ref.startswith(_CHUNK_REF_PREFIX):
+            note_part, dot, chunk_part = ref.removeprefix(_CHUNK_REF_PREFIX).partition(".")
+            if not dot:
+                raise ValueError(_MSG_UPDATE_REF)
+            parsed = _SaveUpdate(ref, "chunk_id", _ref_number(chunk_part), _ref_number(note_part), text)
+        else:
+            raise ValueError(_MSG_UPDATE_REF)
+        if (parsed.lane, parsed.target) in seen:
+            raise ValueError("each item may appear once")
+        seen.add((parsed.lane, parsed.target))
+        result.append(parsed)
+    return result
+
+
 def one_chunk_per_note(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """One slot per note: chunks of a note collapse to the first (best-scored; input is score-descending)."""
     first: dict[Any, dict[str, Any]] = {}
@@ -494,8 +562,10 @@ class NeospikeProvider(HermesMemoryProvider):
             + "Put text over 2000 characters, text with two or more # headings, and work documents (TASK_, design, "
             "report, spec) in a note (neospike_note_write). Text the user wrote in the dashboard is a doc (a note the user wrote; neospike_doc_read / neospike_doc_write). "
             # Correct vs supersede.
-            "Change an item only through neospike_memory_update, passing its id and the exact retrieved expected_text; "
-            "never forget then remember. mode=correct repairs wording or a wrong value of the same fact. "
+            "A recalled line ([id:N ...] or [note:N.C ...]) proved wrong in this conversation: pass its number and the "
+            "full corrected text in neospike_memory_save updates. A changed decision, a fix to an item found by search "
+            "or a preference (pref:N): use neospike_memory_update, passing its id and the exact retrieved expected_text. "
+            "Never forget then remember. mode=correct repairs wording or a wrong value of the same fact. "
             "mode=supersede records a changed decision as a new item and keeps the old one as history. When only part "
             "of an old item changed, do not supersede: correct that part, or remember the changed fact separately. "
             "A one-off exception (\"just this once\") is no supersede. Apply a user correction in the same turn; the "
@@ -1087,13 +1157,17 @@ class NeospikeProvider(HermesMemoryProvider):
                 # What to save is the system prompt's save criteria only.
                 "Store one semantic memory item. Text over 2000 characters, or with two or more # headings, becomes an agent note named by subject plus a linked memory summary. Items in the reply's older list go to neospike_memory_reconcile. "
                 "kind preference/constraint is stored apart as pref:N with situation (a constraint always needs "
-                "one); scope is not used for it.",
+                "one); scope is not used for it. "
+                "If a recalled neospike line ([id:N ...] or [note:N.C ...]) proved wrong in this conversation, pass "
+                "its number and the full corrected text in updates; it is fixed in place. Add the usual fields "
+                f"({', '.join(_SAVE_REQUIRED)}) in the same call only for a separate new fact; "
+                "without updates the call only saves.",
                 {
                     **item_schema_fields(text_cap=None),
                     "scope": {"type": "string", "enum": _SCOPE_CHOICES},
                     "situation": _SITUATION_SCHEMA,
+                    "updates": _SAVE_UPDATES_SCHEMA,
                 },
-                _SAVE_REQUIRED,
             ),
             _tool_spec(
                 "neospike_note_read",
@@ -1221,9 +1295,85 @@ class NeospikeProvider(HermesMemoryProvider):
             raise ValueError(f"Memory ID must be an integer from 1 to {_SQLITE_ID_MAX}")
 
     def _tool_remember(self, tool_name: str, args: dict[str, Any], session_id: str, key: str) -> str:
+        """updates (recalled lines that proved wrong) are fixed in place first; text, when given, is then saved as
+        before. A refused update saves nothing."""
         refusal = self._refuse_write(key)
         if refusal:
             return refusal
+        if "updates" not in args:
+            if "text" not in args:
+                raise ValueError(_MSG_SAVE_NEEDS_TEXT)
+            return self._save_memory(args, session_id, key)
+        updates = _parse_save_updates(args["updates"])
+        try:
+            outcome = self._apply_save_updates(updates, session_id, key)
+        except (OSError, RuntimeError, _DB_ERROR):
+            self._turn_log.failure(key, "Update failed; change not confirmed")
+            return json.dumps({"error": "Update failed"})
+        if "error" in outcome or "text" not in args:
+            return json.dumps(outcome, ensure_ascii=False)
+        rest = {name: value for name, value in args.items() if name != "updates"}
+        try:
+            saved = json.loads(self._save_memory(rest, session_id, key))
+        except (ValueError, KeyError, TypeError) as exc:  # the updates are written; the reply says so
+            self._turn_log.failure(key, "Rejected: invalid arguments")
+            saved = {"error": f"{exc}"}
+        return json.dumps({**outcome, **saved}, ensure_ascii=False)
+
+    def _apply_save_updates(self, updates: list[_SaveUpdate], session_id: str, debug_key: str) -> dict:
+        """Each ref must name a memory visible here (an editable memory_item, not a builtin mirror) or a chunk
+        of a live automatic note N (not an agent note or a doc); then the reconcile write path applies them.
+        Returns {"updated": [{"ref", "now"?, "pieces"?}]} or an error reply (nothing written)."""
+        store = self._memory_db
+        for update in updates:
+            if update.lane == "id" and store.fetch_item_for_update(
+                    self._ns_label, update.target, project=self._project_dir, session_id=session_id) is None:
+                self._turn_log.failure(debug_key, "update refused: memory not editable here")
+                return {"error": "not_found", "ref": update.ref,
+                        "message": "No editable memory with this id here (builtin memory copies cannot be changed)"}
+        chunk_notes = {update.target: update.note_id for update in updates if update.lane == "chunk_id"}
+        with store._lock:
+            places = formula_chunk_places(store._conn, chunk_notes)
+        for update in updates:
+            if update.lane == "chunk_id" and places.get(update.target, (0, 0))[0] != update.note_id:
+                self._turn_log.failure(debug_key, "update refused: not an automatic-note chunk")
+                return {"error": "not_found", "ref": update.ref,
+                        "message": "Not a chunk of this automatic note (agent notes and docs are not changed here)"}
+        result, placed = self._write_changes([(update.lane, update.target, update.text) for update in updates],
+                                             session_id, debug_key)
+        if "error" in result:
+            refs = {(update.lane, update.target): update.ref for update in updates}
+            target = next((value for name, value in result.items() if name in ("id", "chunk_id")), None)
+            lane = "id" if "id" in result else "chunk_id"
+            failed = {**result, **({"ref": refs[(lane, target)]} if (lane, target) in refs else {})}
+            failed.pop(lane, None)
+            self._turn_log.failure(debug_key, f"update refused: {result['error']}")
+            return failed
+        allowed = self._reconcile_allowed(session_id)
+        done: list[dict[str, Any]] = []
+        missed: list[str] = []
+        for update in updates:
+            ids = placed.get((update.lane, update.target))
+            if not ids:
+                missed.append(update.ref)
+                continue
+            prefix = _MEMORY_REF_PREFIX if update.lane == "id" else f"{_CHUNK_REF_PREFIX}{update.note_id}."
+            entry: dict[str, Any] = {"ref": update.ref}
+            if ids[0] != update.target:
+                entry["now"] = f"{prefix}{ids[0]}"
+            if len(ids) > 1:
+                entry["pieces"] = [f"{prefix}{piece}" for piece in ids[1:]]
+            done.append(entry)
+            allowed[update.lane].update(ids)
+            if update.lane == "chunk_id":
+                self._turn_log.change(debug_key, update.text.strip(), "automatic note", action="Corrected")
+        if missed:
+            self._turn_log.failure(debug_key, f"update not confirmed: {missed}")
+            return {"error": "update_failed", "message": "These items were not changed", "refs": missed,
+                    "updated": done}
+        return {"updated": done}
+
+    def _save_memory(self, args: dict[str, Any], session_id: str, key: str) -> str:
         raw_text = args.get("text")
         if args.get("kind") in prefs.PREF_TYPES:
             return self._save_preference(args, session_id, key)
@@ -1629,6 +1779,14 @@ class NeospikeProvider(HermesMemoryProvider):
             self._turn_log.failure(debug_key, "reconcile refused: item not listed in this session")
             return {"error": "not_allowed", "message": "Only items listed in this session's save replies",
                     "items": outside}
+        return self._write_changes(changes, session_id, debug_key)[0]
+
+    def _write_changes(self, changes: list[tuple[str, int, str | None]], session_id: str,
+                       debug_key: str) -> tuple[dict, dict[tuple[str, int], list[int]]]:
+        """The write path of _apply_reconcile for already allowed items: (its reply, {(lane, target): the item's
+        ids now, first = its place, the rest = split pieces}) for each changed body."""
+        allowed = self._reconcile_allowed(session_id)
+        placed: dict[tuple[str, int], list[int]] = {}
         # A body over the item limit is split like neospike_memory_update (paragraph, sentence, limit);
         # every piece must pass the save policy before anything is written.
         pieces_of: dict[tuple[str, int], list[str]] = {}
@@ -1637,9 +1795,9 @@ class NeospikeProvider(HermesMemoryProvider):
                 continue
             pieces = cut_memory_text(text)
             if not pieces:
-                return {"error": "invalid", "message": "text must not be empty", key: target}
+                return {"error": "invalid", "message": "text must not be empty", key: target}, placed
             if any(screen_text(piece) is not AdmitVerdict.INDEX for piece in pieces):
-                return {"error": "policy", "message": "text was rejected by ingestion policy", key: target}
+                return {"error": "policy", "message": "text was rejected by ingestion policy", key: target}, placed
             pieces_of[(key, target)] = pieces
         store = self._memory_db
         rows = {}
@@ -1647,13 +1805,13 @@ class NeospikeProvider(HermesMemoryProvider):
             if key == "id":
                 row = store.fetch_item_for_update(self._ns_label, target, project=self._project_dir, session_id=session_id)
                 if row is None:
-                    return {"error": "not_found", "id": target}
+                    return {"error": "not_found", "id": target}, placed
                 rows[target] = row
         chunk_texts = {target: text for key, target, text in changes if key == "chunk_id"}
         with store._lock:
             places = formula_chunk_places(store._conn, chunk_texts)
         if chunk_texts.keys() - places.keys():
-            return {"error": "not_found", "chunk_ids": sorted(chunk_texts.keys() - places.keys())}
+            return {"error": "not_found", "chunk_ids": sorted(chunk_texts.keys() - places.keys())}, placed
         replace = {target: [(piece, normalize_rows(self._vectorizer.embed_document(piece)).tobytes())
                             for piece in pieces_of[("chunk_id", target)]]
                    for target, text in chunk_texts.items() if text is not None}
@@ -1676,6 +1834,7 @@ class NeospikeProvider(HermesMemoryProvider):
                 added = [piece for piece in done.get("ids", [])[1:]]
                 result["piece_ids"].extend(added)
                 allowed["id"].update(added)
+                placed[("id", target)] = [target, *added]
                 self._turn_log.change(debug_key, text.strip(), str(rows[target].get("scope") or "unknown"),
                                       action="Corrected")
         if chunk_texts:
@@ -1687,9 +1846,10 @@ class NeospikeProvider(HermesMemoryProvider):
             result["piece_chunk_ids"] = [piece for target in replace for piece in done["pieces"][target][1:]]
             result["deleted_chunk_ids"] = deleted_chunks
             allowed["chunk_id"].update(result["changed_chunk_ids"], result["piece_chunk_ids"])
+            placed.update({("chunk_id", target): list(done["pieces"][target]) for target in replace})
         if result["changed_ids"] or result["piece_ids"] or result.get("changed_chunk_ids"):
             self._mark_saved(session_id)
-        return {key: value for key, value in result.items() if value}
+        return {key: value for key, value in result.items() if value}, placed
 
     def _save_agent_note(self, subject: str, body: str, *, tags: list[str], project: str) -> dict:
         """Agent note titled by subject; a taken title gets ' (2)', ' (3)', ..."""

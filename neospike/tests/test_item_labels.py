@@ -109,7 +109,8 @@ def test_note_linked_memory_row_has_labels(provider):
 # 3. schema: save requires kind and basis; neither save nor update offers confidence.
 def test_tool_schemas(provider):
     save_params, update_params = schema(provider, "neospike_memory_save"), schema(provider, "neospike_memory_update")
-    assert save_params["required"] == ["text", "scope", "subject", "durability", "kind", "basis"]
+    # Nothing is required by the schema: a call may carry only updates; the save fields are checked when text is given.
+    assert "required" not in save_params and "updates" in save_params["properties"]
     for params in (save_params, update_params):
         assert "confidence" not in params["properties"]
         assert params["properties"]["kind"] == {"type": "string", "enum": ["fact", "decision", "preference",

@@ -81,9 +81,9 @@ def tools(tmp_path: Path) -> NeospikeTools:
         remember("memory of another project", 0.97, scope="project", project=OTHER_PROJECT)
         with store._conn:
             store._conn.execute("UPDATE items SET invalid_at=?, superseded_by=? WHERE id=?", (time.time(), new, old))
-            # Floor 0.7, so the chunks sit at 0.75 / 0.72 above it and 0.65 below it.
+            # Floor 0.61, so the chunks sit at 0.75 / 0.72 above it and 0.55 below it.
             _note(store, "auto A", FORMULA_AUTHOR, [("auto chunk 0.90", 0.90), ("auto chunk 0.72", 0.72)])
-            _note(store, "auto B", FORMULA_AUTHOR, [("auto chunk 0.75", 0.75), ("auto chunk 0.65", 0.65)])
+            _note(store, "auto B", FORMULA_AUTHOR, [("auto chunk 0.75", 0.75), ("auto chunk 0.55", 0.55)])
             _note(store, "auto trashed", FORMULA_AUTHOR, [("trashed auto chunk", 0.98)], trashed=True)
             _note(store, "human plan", "human", [("human chunk 0.99", 0.99)])
             _note(store, "TASK_900", "agent", [("agent chunk 0.85", 0.85)], tags_json='["task"]')
@@ -113,7 +113,7 @@ def test_memories_notes_and_docs_by_cosine_cut_to_limit(tools: NeospikeTools) ->
     every = _search(tools, limit=20)
     assert [item["text"] for item in every] == ["human chunk 0.99", "auto chunk 0.90", "agent chunk 0.85", "memory high",
                                                 "auto chunk 0.75", "auto chunk 0.72", "memory replacement"]
-    # just below, 0.65, trashed, other project: out
+    # just below, 0.55, trashed, other project: out
     assert [round(item["score"], 3) for item in every] == [0.99, 0.9, 0.85, 0.8, 0.75, 0.72,
                                                            round(MEMORY_SEARCH_COSINE_THRESHOLD, 3)]
     assert [item["kind"] for item in every] == [KIND_DOC, KIND_NOTE, KIND_NOTE, KIND_MEMORY, KIND_NOTE, KIND_NOTE,
