@@ -13,10 +13,14 @@ from neospike.tests.test_install_check import (HEALTHY_STATUS, REPO_ROOT, _FakeR
 NUMPY = "numpy>=2.0,<3"
 FAISS = "faiss-cpu>=1.16,<2"
 TOKENIZERS = "tokenizers>=0.22,<1"
-ONNXRUNTIME = "onnxruntime>=1.20,<2"
+# Both packages install the same onnxruntime module, so each platform gets exactly one of them.
+ONNXRUNTIME_DIRECTML = "onnxruntime-directml>=1.20,<2; sys_platform == 'win32'"
+ONNXRUNTIME = "onnxruntime>=1.20,<2; sys_platform != 'win32'"
 HUGGINGFACE_HUB = "huggingface-hub>=1.0,<2"
 DECLARATION = (b'python_dependencies:\n  - "numpy>=2.0,<3"\n  - "faiss-cpu>=1.16,<2"\n'
-               b'  - "tokenizers>=0.22,<1"\n  - "onnxruntime>=1.20,<2"\n'
+               b'  - "tokenizers>=0.22,<1"\n'
+               b'  - "onnxruntime-directml>=1.20,<2; sys_platform == \'win32\'"\n'
+               b'  - "onnxruntime>=1.20,<2; sys_platform != \'win32\'"\n'
                b'  - "huggingface-hub>=1.0,<2"\n')  # LF form
 
 
@@ -118,12 +122,13 @@ def test_dry_run_prints_the_enable_command(tmp_path, monkeypatch, capsys):
 def test_repository_plugin_yaml_declares_the_runtime_packages():
     assert _plugin_yaml_lf().endswith(DECLARATION)
     install = _install_module()
-    assert install.PLUGIN_PIP_REQUIREMENTS == (NUMPY, FAISS, TOKENIZERS, ONNXRUNTIME, HUGGINGFACE_HUB)
+    assert install.PLUGIN_PIP_REQUIREMENTS == (NUMPY, FAISS, TOKENIZERS, ONNXRUNTIME_DIRECTML, ONNXRUNTIME,
+                                               HUGGINGFACE_HUB)
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8-sig")
     assert re.findall(r'"(numpy[^"]*)"', pyproject) == [NUMPY]
     assert re.findall(r'"(faiss[^"]*)"', pyproject) == [FAISS]
     assert re.findall(r'"(tokenizers[^"]*)"', pyproject) == [TOKENIZERS]
-    assert re.findall(r'"(onnxruntime[^"]*)"', pyproject) == [ONNXRUNTIME]
+    assert re.findall(r'"(onnxruntime[^"]*)"', pyproject) == [ONNXRUNTIME_DIRECTML, ONNXRUNTIME]
     assert re.findall(r'"(huggingface-hub[^"]*)"', pyproject) == [HUGGINGFACE_HUB]
     assert "faiss" in install.IMPORT_CHECK[1:]  # the post-sync check fails when PM left faiss out
 

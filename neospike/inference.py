@@ -168,6 +168,25 @@ class LocalModelRunner:
         self.text = None
         self.warnings = []
 
+    @property
+    def device(self):
+        """Device the loaded model runs on ('cpu' or 'directml'); None before the model is loaded."""
+        return getattr(self.text, 'device', None)
+
+    @property
+    def device_note(self):
+        """Why DirectML was not taken ('' when it was); None before the model is loaded."""
+        return getattr(self.text, 'device_note', None)
+
+    def warm(self):
+        """Load the model (its load runs one short input, so the first real request pays no setup)."""
+        if self.text is None:
+            missing = missing_model_message()
+            if missing:
+                raise FileNotFoundError(missing)
+            from .embedder import OnnxDenseEmbedder
+            self.text = OnnxDenseEmbedder()
+
     def take_warnings(self):
         """Degradations of the most recent request (only the single worker thread calls this)."""
         drained, self.warnings = self.warnings, []
@@ -176,12 +195,7 @@ class LocalModelRunner:
     def __call__(self, op, value, *, title='none'):
         if op not in _OPS:
             raise ValueError(_ERR['bad_op'])
-        if self.text is None:
-            missing = missing_model_message()
-            if missing:
-                raise FileNotFoundError(missing)
-            from .embedder import OnnxDenseEmbedder
-            self.text = OnnxDenseEmbedder()
+        self.warm()
         if op == 'query':
             result = self.text.embed_query(value)
         else:
@@ -297,7 +311,8 @@ class EmbeddingDaemon:
             conn.settimeout(_CONN_IO_TIMEOUT)
             request = self._authenticated_request(conn)
             if request.get('op') == 'ping':
-                _write_frame(conn, {'result': {'pid': os.getpid()}})
+                # device: where the model runs; None until the model is loaded (the start-up warm-up).
+                _write_frame(conn, {'result': {'pid': os.getpid(), 'device': getattr(self.backend, 'device', None)}})
                 return
             if request.get('op') == SHUTDOWN_OP:
                 # Set before the answer, so a caller that got it knows the stop is under way; main() then
@@ -340,7 +355,22 @@ class EmbeddingDaemon:
         else:
             future.set_result((result, take_warnings() if callable(take_warnings) else []))
 
+    def _warm_backend(self):
+        """Load the model before the first request, on the worker thread: the daemon answers pings meanwhile
+        and requests queue behind it. A failure is left to the first request, which reports it to its caller."""
+        warm = getattr(self.backend, 'warm', None)
+        if not callable(warm):
+            return
+        try:
+            warm()
+        except Exception as error:
+            print(json.dumps({'warm_up_failed': f'{type(error).__name__}: {error}'}), flush=True)
+            return
+        print(json.dumps({'device': getattr(self.backend, 'device', None),
+                          'device_note': getattr(self.backend, 'device_note', None)}), flush=True)
+
     def _worker_loop(self):
+        self._warm_backend()
         while not self.stop_event.is_set():
             try:
                 _rank, _ticket, deadline, future, request = self.jobs.get(timeout=_JOB_TICK)
@@ -537,6 +567,11 @@ class EmbeddingClient:
                 raise EmbeddingUnavailable(PAUSED_MESSAGE)
             self.ensure_daemon()
         return self._exchange(op, value, priority=priority, **extra)
+
+    def device(self):
+        """Device the running daemon's model is on ('cpu' or 'directml'); None while it is still loading.
+        Never starts a daemon (FileNotFoundError / ConnectionRefusedError when none runs)."""
+        return self._exchange('ping', socket_timeout=self.startup_timeout).get('device')
 
     def request_shutdown(self):
         """Ask the running daemon to stop; True when it accepted, False when none runs. Never starts one."""

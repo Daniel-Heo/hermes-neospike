@@ -23,6 +23,17 @@ TOKEN_WINDOW = EMBEDDING_MAX_TOKENS
 ORT_INTRA_THREADS = 4
 _OUTPUT_TENSOR = "sentence_embedding"
 
+# Where the model runs. DirectML (Windows, any DirectX 12 GPU) is used when it works, otherwise the CPU.
+DEVICE_CPU = "cpu"
+DEVICE_DIRECTML = "directml"
+DEVICE_AUTO = "auto"  # DirectML when it works, otherwise the CPU
+DEVICE_CHOICES = (DEVICE_AUTO, DEVICE_CPU, DEVICE_DIRECTML)
+_CPU_PROVIDER = "CPUExecutionProvider"
+_DML_PROVIDER = "DmlExecutionProvider"
+_DML_DEVICE_ID = 0  # the default adapter
+# The first run on a device pays its setup (DirectML: about 1.2 s), so it is done once at load.
+_PROBE_TEXT = "warm-up"
+
 
 def resolve_model_dir() -> Path:
     override = os.environ.get("HERMES_BGE_M3_DIR")
@@ -32,8 +43,69 @@ def resolve_model_dir() -> Path:
     return shared_inference_home(default_hermes_home()) / "models" / MODEL_FOLDER
 
 
+def _feed(ids) -> dict:
+    return {"input_ids": np.asarray([ids], dtype=np.int64),
+            "attention_mask": np.ones((1, len(ids)), dtype=np.int64)}
+
+
+class DeviceUnavailable(RuntimeError):
+    """The requested device cannot run the model here."""
+
+
+def _cpu_session(model_path: str, intra_threads: int):
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = intra_threads
+    options.inter_op_num_threads = 1
+    return ort.InferenceSession(model_path, sess_options=options, providers=[_CPU_PROVIDER])
+
+
+def _directml_session(model_path: str, intra_threads: int):
+    """DirectML needs memory patterns off and sequential execution; nodes it cannot run go to the CPU."""
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = intra_threads
+    options.inter_op_num_threads = 1
+    options.enable_mem_pattern = False
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    session = ort.InferenceSession(model_path, sess_options=options,
+                                   providers=[(_DML_PROVIDER, {"device_id": _DML_DEVICE_ID}), _CPU_PROVIDER])
+    if _DML_PROVIDER not in session.get_providers():
+        raise DeviceUnavailable("the session did not take DirectML")
+    return session
+
+
+def directml_installed() -> bool:
+    """True when this onnxruntime build carries DirectML (the Windows onnxruntime-directml package)."""
+    return _DML_PROVIDER in ort.get_available_providers()
+
+
+def open_session(model_path: str, intra_threads: int, device: str, probe_feed: dict):
+    """(session, device, note) for the wanted device. auto: DirectML when the build has it and a session on
+    it runs the probe, otherwise the CPU with the reason in note. cpu/directml: that device or an error."""
+    if device not in DEVICE_CHOICES:
+        raise ValueError(f"Unknown embedding device: {device}")
+    note = ""
+    if device != DEVICE_CPU:
+        if directml_installed():
+            try:
+                session = _directml_session(model_path, intra_threads)
+                session.run([_OUTPUT_TENSOR], probe_feed)
+                return session, DEVICE_DIRECTML, note
+            except Exception as error:  # any driver or session failure means "not usable here"
+                note = f"DirectML failed ({type(error).__name__}: {str(error)[:200]})"
+        else:
+            note = "DirectML is not in this onnxruntime build"
+        if device == DEVICE_DIRECTML:
+            raise DeviceUnavailable(note)
+    session = _cpu_session(model_path, intra_threads)
+    session.run([_OUTPUT_TENSOR], probe_feed)
+    return session, DEVICE_CPU, note
+
+
 class OnnxDenseEmbedder:
-    """bge-m3 dense vectors (1024, L2-normalized) on onnxruntime CPU.
+    """bge-m3 dense vectors (1024, L2-normalized) on onnxruntime: DirectML when it works, otherwise the CPU.
+    self.device is the device in use; self.device_note says why DirectML was not taken (empty when it was,
+    or when the CPU was asked for). Vectors of the two devices differ slightly, so stored vectors and
+    queries must come from one device.
 
     Inputs run at their real length (dynamic axis, no padding, no prompt prefix).
     A document over TOKEN_WINDOW is an error, never a silent cut (callers chunk it). A query over the
@@ -44,16 +116,14 @@ class OnnxDenseEmbedder:
     sequence_length = TOKEN_WINDOW
     dimensions = EMBEDDING_DIMENSIONS
 
-    def __init__(self, *, intra_threads: int = ORT_INTRA_THREADS) -> None:
+    def __init__(self, *, intra_threads: int = ORT_INTRA_THREADS, device: str = DEVICE_AUTO) -> None:
         model_dir = resolve_model_dir()
         self._tokenizer = Tokenizer.from_file(str(model_dir / TOKENIZER_JSON))
         self._tokenizer.no_truncation()
         self._tokenizer.no_padding()
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = intra_threads
-        options.inter_op_num_threads = 1
-        self._session = ort.InferenceSession(str(model_dir / ONNX_MODEL_FILE), sess_options=options,
-                                             providers=["CPUExecutionProvider"])
+        probe_ids = self._tokenizer.encode(_PROBE_TEXT, add_special_tokens=True).ids
+        self._session, self.device, self.device_note = open_session(
+            str(model_dir / ONNX_MODEL_FILE), intra_threads, device, _feed(probe_ids))
         self._lock = threading.Lock()
         self._warnings: list[str] = []
 
@@ -80,10 +150,8 @@ class OnnxDenseEmbedder:
             ids = ids[:TOKEN_WINDOW - 1] + ids[-1:]  # keep the closing </s>
             with self._lock:
                 self._warnings.append(f"query cut to {TOKEN_WINDOW} tokens")
-        feed = {"input_ids": np.asarray([ids], dtype=np.int64),
-                "attention_mask": np.ones((1, len(ids)), dtype=np.int64)}
         with self._lock:
-            vector = self._session.run([_OUTPUT_TENSOR], feed)[0][0]
+            vector = self._session.run([_OUTPUT_TENSOR], _feed(ids))[0][0]
         if vector.shape[0] != EMBEDDING_DIMENSIONS:
             raise ValueError(f"Model returned {vector.shape[0]} dimensions, expected {EMBEDDING_DIMENSIONS}")
         norm = float(np.linalg.norm(vector))

@@ -46,6 +46,8 @@ Steps 3 and 4 are plain code. They run after a save and in the daily job; no LLM
 
 The embedding model is BAAI/bge-m3 as an int8 ONNX file from `Xenova/bge-m3`, pinned to one revision. It produces 1,024-dimension vectors and reads up to 2,048 tokens per input. It is MIT-licensed and not gated, so no Hugging Face account is needed. The plugin does not ship the model; the installer downloads it.
 
+On Windows the model runs on the graphics card through DirectML when that works, and on the CPU otherwise. macOS and Linux always use the CPU. No setting is needed: the embedding service tries the graphics card once when it starts and writes the result (`"device": "directml"` or `"cpu"`) to `$HERMES_HOME/neospike/.cache/inference.log`. On one test machine (RTX 3080) a 2,048-token text took about 0.4 seconds on the graphics card and about 2.9 seconds on the CPU. A short text takes about 0.3 seconds on the graphics card, which is slower than the CPU (under 0.1 seconds). Vectors from the two devices differ slightly (cosine similarity about 0.97 to 0.99); vectors already stored are kept and used as they are when the device changes.
+
 ## Install
 
 ```bash
@@ -68,7 +70,7 @@ Opening a new Desktop window is not enough: the running gateway keeps the old co
 1. finds the Hermes runtime Python and, if an earlier version installed the `neospike` package into the Hermes CLI environment (`hermes-agent/venv`), removes that package (only that one) with `uv pip uninstall`;
 2. copies the plugin to `$HERMES_HOME/plugins/neospike` (the new copy is staged in `$HERMES_HOME/neospike/.install/staging` and the existing copy is kept as `$HERMES_HOME/neospike/.install/previous`, outside `plugins`, because Hermes loads every folder there as a plugin; `neospike.previous` and `neospike.installing` folders an earlier version left in `plugins` are deleted) and adds it to `plugins.enabled`;
 3. creates `MEMORY_RULE.md` for each Hermes home that uses Neospike, unless the file already exists;
-4. enables the plugin so that the Hermes package manager installs `numpy`, `faiss-cpu`, `tokenizers`, `onnxruntime` and `huggingface-hub` into the Hermes runtime;
+4. enables the plugin so that the Hermes package manager installs `numpy`, `faiss-cpu`, `tokenizers`, `onnxruntime` (on Windows `onnxruntime-directml`, the same library with graphics card support) and `huggingface-hub` into the Hermes runtime;
 5. downloads the model;
 6. sets `memory.provider` to `neospike`;
 7. registers the daily cron job `neospike-daily` (every day at 12pm);
@@ -86,7 +88,7 @@ Opening a new Desktop window is not enough: the running gateway keeps the old co
 
 ### Uninstall
 
-To pause Neospike without removing it, turn it off in the dashboard Config tab (`enabled` below). To remove it:
+To pause Neospike without removing it, turn it off in the dashboard Setup tab (`enabled` below). To remove it:
 
 ```bash
 python install.py --uninstall --dry-run   # print the plan

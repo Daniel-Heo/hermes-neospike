@@ -32,6 +32,8 @@ NOT_DECLARED = {
     "mcp": "optional extra [mcp] for the Claude Code MCP server",
 }
 VERSION_MARKS = "<>=!~;[ "
+# A declared distribution that is another build of the same module (one per system) counts as that module's.
+SAME_MODULE_BUILD = {"onnxruntime-directml": "onnxruntime"}
 
 
 def _plugin_sources() -> list[Path]:
@@ -86,7 +88,8 @@ def declared_distributions(text: str) -> set[str]:
         if in_list and line.startswith("- "):
             item = line[2:].strip().strip('"').strip("'")
             cut = min((item.index(mark) for mark in VERSION_MARKS if mark in item), default=len(item))
-            names.add(item[:cut].lower())
+            name = item[:cut].lower()
+            names.add(SAME_MODULE_BUILD.get(name, name))
         elif in_list and line:
             in_list = False
     return names

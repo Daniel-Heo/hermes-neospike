@@ -45,11 +45,13 @@ IMPORT_CHECK = (runtime_check.CHECK_IMPORTS, "numpy", "faiss", "neospike", "neos
 # python_dependencies and installed by the Hermes package manager (tests tie it to plugin.yaml and pyproject).
 # faiss-cpu: the HNSW candidates of vector_index.py, used in the Hermes process by every vector search of the
 # database file (without it in the Hermes runtime every such search would fail).
-# tokenizers, onnxruntime: embedder.py; the embedding daemon runs in the same environment through hermes_launch.py
+# tokenizers, onnxruntime (on Windows the onnxruntime-directml build of the same module): embedder.py; the
+# embedding daemon runs in the same environment through hermes_launch.py
 # (_wincompat.inference_command), and a catalog install does not run this script.
 # huggingface-hub: the model download (`python -m huggingface_hub.cli.hf download`, here and in the Dashboard).
-PLUGIN_PIP_REQUIREMENTS = ("numpy>=2.0,<3", "faiss-cpu>=1.16,<2", "tokenizers>=0.22,<1", "onnxruntime>=1.20,<2",
-                           "huggingface-hub>=1.0,<2")
+PLUGIN_PIP_REQUIREMENTS = ("numpy>=2.0,<3", "faiss-cpu>=1.16,<2", "tokenizers>=0.22,<1",
+                           "onnxruntime-directml>=1.20,<2; sys_platform == 'win32'",
+                           "onnxruntime>=1.20,<2; sys_platform != 'win32'", "huggingface-hub>=1.0,<2")
 PLUGIN_REQS_KEY = "python_dependencies:"
 
 
