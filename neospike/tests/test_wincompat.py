@@ -122,7 +122,7 @@ def stop_gracefully(process):
         process.terminate()
 
 
-# --- default_hermes_home / inference_python -------------------------------
+# --- default_hermes_home ---------------------------------------------------
 
 def test_default_hermes_home_prefers_explicit_profile(monkeypatch, tmp_path):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -136,30 +136,6 @@ def test_default_hermes_home_uses_localappdata_on_windows(monkeypatch, tmp_path)
     assert wc.default_hermes_home() == os.path.join(str(tmp_path), 'hermes')
     monkeypatch.delenv('LOCALAPPDATA')
     assert wc.default_hermes_home() == os.path.join(os.path.expanduser('~'), '.hermes')
-
-
-@windows_only
-def test_inference_python_prefers_hermes_venv_on_windows(monkeypatch, tmp_path):
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    monkeypatch.delenv('HERMES_PYTHON', raising=False)
-    assert wc.inference_python() == sys.executable
-    venv = tmp_path / 'hermes-agent' / 'venv' / 'Scripts' / 'python.exe'
-    venv.parent.mkdir(parents=True)
-    venv.write_text('')
-    assert wc.inference_python() == str(venv)
-    explicit = tmp_path / 'explicit.exe'
-    explicit.write_text('')
-    monkeypatch.setenv('HERMES_PYTHON', str(explicit))
-    assert wc.inference_python() == str(explicit)
-    monkeypatch.setenv('HERMES_PYTHON', str(tmp_path / 'missing.exe'))
-    assert wc.inference_python() == str(venv)
-
-
-def test_inference_python_is_current_interpreter_on_posix(monkeypatch, tmp_path):
-    if IS_WINDOWS:
-        pytest.skip('POSIX branch')
-    monkeypatch.setenv('HERMES_PYTHON', str(tmp_path / 'ignored'))
-    assert wc.inference_python() == sys.executable
 
 
 # --- flock replacement ----------------------------------------------------
@@ -182,6 +158,27 @@ def test_flock_is_exclusive_nonblocking_and_keeps_file_usable(tmp_path):
         fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(second, fcntl.LOCK_UN)
     assert path.read_text() == '7'
+
+
+BLOCKING_WAIT_TEST_SECONDS = 0.2
+BLOCKING_WAIT_CEILING_SECONDS = 1.0
+
+
+@windows_only
+def test_blocking_flock_gives_up_with_timeout_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(fcntl, 'wait_seconds', BLOCKING_WAIT_TEST_SECONDS)
+    path = tmp_path / 'held.lock'
+    path.write_text('x')
+    with path.open('r+') as first, path.open('r+') as second:
+        fcntl.flock(first, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        began = time.monotonic()
+        with pytest.raises(TimeoutError):
+            fcntl.flock(second, fcntl.LOCK_EX)
+        assert time.monotonic() - began < BLOCKING_WAIT_CEILING_SECONDS
+        assert second.tell() == 0
+        fcntl.flock(first, fcntl.LOCK_UN)
+        fcntl.flock(second, fcntl.LOCK_EX)
+        fcntl.flock(second, fcntl.LOCK_UN)
 
 
 def test_flock_is_released_when_holder_process_exits(tmp_path):
@@ -354,8 +351,35 @@ def test_launch_fd_args_pass_os_handle_released_by_close_launch_fd(tmp_path):
     os.close(fd)
     with pytest.raises(BlockingIOError):
         wc.open_unshared(path)
-    wc.close_launch_fd(handle)
+    wc.close_launch_fd(handle, path)
     os.close(wc.open_unshared(path))
+
+
+@windows_only
+def test_close_launch_fd_ignores_a_value_that_names_no_handle_here(tmp_path):
+    # A relaunched interpreter inherits nothing: the guard's handle value is stale in it.
+    import _winapi
+    import msvcrt
+    path = tmp_path / 'launch.lock'
+    fd = wc.open_unshared(path)
+    process = _winapi.GetCurrentProcess()
+    stale = _winapi.DuplicateHandle(process, msvcrt.get_osfhandle(fd), process, 0, False,
+                                    _winapi.DUPLICATE_SAME_ACCESS)
+    _winapi.CloseHandle(stale)
+    wc.close_launch_fd(stale, path)
+    os.close(fd)
+
+
+@windows_only
+def test_close_launch_fd_keeps_an_unrelated_handle_with_the_same_value(tmp_path):
+    # There the value may also name a handle this process opened for something else.
+    import msvcrt
+    other = os.open(tmp_path / 'other.bin', os.O_RDWR | os.O_CREAT)
+    try:
+        wc.close_launch_fd(msvcrt.get_osfhandle(other), tmp_path / 'launch.lock')
+        os.write(other, b'still open')
+    finally:
+        os.close(other)
 
 
 # --- detached daemon interpreter (venv launcher bypass) ----------------------
@@ -416,36 +440,89 @@ def test_detached_interpreter_is_identity_on_posix():
     assert env == {'__PYVENV_LAUNCHER__': 'kept'}
 
 
-# --- host-runtime fallback of inference_python() --------------------------
+# --- the provider's inference probe and the daemon start alike -------------
 
 def _fallback_home(monkeypatch, tmp_path):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.delenv('HERMES_PYTHON', raising=False)
     monkeypatch.delenv('HERMES_BGE_M3_DIR', raising=False)
-    assert wc.inference_python() == sys.executable
+    monkeypatch.delenv('NEOSPIKE_INFERENCE_HOME', raising=False)
 
 
-@windows_only
-def test_fallback_runtime_without_dependencies_is_unavailable_with_reason(monkeypatch, tmp_path):
+def _model_home(monkeypatch, tmp_path):
+    """A home with the (empty) model files, children started on this interpreter and a fake checkout."""
     import neospike.provider as provider
+    from neospike.tests.support_embed_service import use_test_runtime
     _fallback_home(monkeypatch, tmp_path)
     model_dir = tmp_path / 'models' / provider._MODEL_DIR
     model_dir.mkdir(parents=True)
     for name in provider._MODEL_FILE_NAMES:
         (model_dir / name).write_bytes(b'')
-    # A missing module stands in for the Hermes bundled runtime lacking numpy/onnxruntime.
+    use_test_runtime(tmp_path / 'runtime', monkeypatch)
+
+
+class _RecordingRun:
+    """subprocess.run that remembers each command and then really runs it."""
+
+    def __init__(self, real_run):
+        self.real_run, self.commands = real_run, []
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        return self.real_run(command, **kwargs)
+
+
+def test_inference_probe_starts_like_the_daemon(monkeypatch, tmp_path):
+    import neospike.provider as provider
+    from neospike import runtime_check
+    _model_home(monkeypatch, tmp_path)
+    recorder = _RecordingRun(subprocess.run)
+    monkeypatch.setattr(subprocess, 'run', recorder)
+    assert provider._inference_stack_ready() is True
+    [probe] = recorder.commands
+    daemon = wc.inference_command(tmp_path, ['--home', str(tmp_path)], {})
+    assert probe[1:4] == daemon[1:4]  # -I, hermes_launch.py, checkout of the same home
+    assert probe[4:] == [runtime_check.MODULE, runtime_check.CHECK_PRESENT, *provider._INFERENCE_IMPORTS]
+    assert probe[0] == wc.launch_command(tmp_path, [])[0]
+
+
+def test_runtime_without_inference_dependencies_is_unavailable_with_reason(monkeypatch, tmp_path):
+    import neospike.provider as provider
+    _model_home(monkeypatch, tmp_path)
+    # A missing module stands in for a dependency environment lacking numpy/onnxruntime.
     monkeypatch.setattr(provider, '_INFERENCE_IMPORTS', (*provider._INFERENCE_IMPORTS, 'neospike_missing_dep'))
-    with pytest.warns(RuntimeWarning, match='HERMES_PYTHON'):
+    with pytest.warns(RuntimeWarning, match='hermes pm status'):
         assert provider.NeospikeProvider().is_available() is False
+
+
+def test_inference_probe_without_a_runtime_is_unavailable(monkeypatch, tmp_path):
+    import neospike.provider as provider
+    from neospike import hermes_runtime
+    _model_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(wc, 'launch_command', _NoRuntime(hermes_runtime.HermesRuntimeNotFound))
+    assert provider._inference_stack_ready() is False
+
+
+class _NoRuntime:
+    def __init__(self, error):
+        self.error = error
+
+    def __call__(self, *args, **kwargs):
+        raise self.error('no runtime python')
 
 
 @windows_only
 def test_fallback_runtime_import_failure_reports_clear_start_error(monkeypatch, tmp_path):
+    """The daemon starts as neospike.inference through hermes_launch.py; a runtime without its
+    dependencies ends in a clear start error."""
     import neospike.inference as inference
-    _fallback_home(monkeypatch, tmp_path)
+    from neospike import hermes_runtime
+    _model_home(monkeypatch, tmp_path)  # model files present, so the launch reaches the missing dependency
+    checkout = Path(os.environ[hermes_runtime.ENV_CHECKOUT])
     real_popen = subprocess.Popen
     def missing_dependency(argv, **kwargs):
         assert argv[0] == wc.detached_interpreter(sys.executable, {})
+        assert argv[1:5] == ['-I', str(hermes_runtime.launch_script()), str(checkout), wc.INFERENCE_MODULE]
         return real_popen([sys.executable, '-c', "raise ModuleNotFoundError(\"No module named 'onnxruntime'\")"],
                           **kwargs)
     monkeypatch.setattr(inference.subprocess, 'Popen', missing_dependency)

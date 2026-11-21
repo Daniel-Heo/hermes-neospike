@@ -108,6 +108,7 @@ class _Scenario:
     def __init__(self, home: Path, steps) -> None:
         self.home = home
         self.steps = steps
+        self.initialized = None  # the server's initialize result
 
     async def __call__(self):
         from mcp import ClientSession, StdioServerParameters
@@ -117,7 +118,7 @@ class _Scenario:
                                            env=_child_env(), cwd=str(REPO))
         async with stdio_client(parameters) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                self.initialized = await session.initialize()
                 return await self.steps(session)
 
 
@@ -167,6 +168,17 @@ def test_tool_list_is_exactly_the_four_tools_with_mem_search(home: Path) -> None
     names = _run(home, _list_tool_names)
     assert sorted(names) == sorted(EXPECTED_TOOLS) and len(names) == 4
     assert "mem_search" in names and not RETIRED_TOOLS & set(names)
+
+
+@needs_mcp
+def test_initialize_reports_the_plugin_version(home: Path) -> None:
+    import anyio
+    scenario = _Scenario(home, _list_tool_names)
+    anyio.run(scenario)
+    manifest = (REPO / "neospike" / "plugin.yaml").read_text(encoding="utf-8")
+    version = next(line.split(":", 1)[1].strip() for line in manifest.splitlines() if line.startswith("version:"))
+    assert version and scenario.initialized.server_info.name == "neospike"
+    assert scenario.initialized.server_info.version == version
 
 
 @needs_mcp

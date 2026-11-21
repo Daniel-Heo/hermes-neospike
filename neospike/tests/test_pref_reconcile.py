@@ -1,10 +1,8 @@
 ﻿"""Daily preference tidy-up: candidate pairs, LLM decisions (a fake LLM), keep memory, settings and the stage."""
 from __future__ import annotations
 
-import importlib.util
 import json
 import math
-import sys
 from pathlib import Path
 
 import pytest
@@ -18,7 +16,6 @@ from neospike.tests.test_setup_routes import FakeCompleted, FakeRun, FixedAnswer
 
 DIMENSIONS = 8
 OWNER, OTHER_OWNER, THIRD_OWNER = "alice", "bob", "carol"
-DAILY_SCRIPT = Path(__file__).resolve().parents[1] / "cron" / "neospike_daily.py"
 
 
 def unit(*parts: float) -> list[float]:
@@ -233,20 +230,6 @@ def test_dashboard_saves_and_shows_the_language(http) -> None:  # noqa: F811
     refused = http.post("/setup/config", json={"extraction_language": "fr"})
     assert refused.status_code == 422 and "extraction_language" in json.dumps(refused.json())
     assert NeospikeConfig.load(hermes_home()).extraction_language == "en"
-
-
-# batch stage --------------------------------------------------------------------------------------------------
-def test_daily_batch_runs_pref_reconcile_after_embed_pending() -> None:
-    sys.path.insert(0, str(DAILY_SCRIPT.parent))
-    try:
-        spec = importlib.util.spec_from_file_location("daily_pref_reconcile", DAILY_SCRIPT)
-        daily = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(daily)
-    finally:
-        sys.path.remove(str(DAILY_SCRIPT.parent))
-    names = [name for name, _ in daily.stages(Path("home"))]
-    assert names.index("pref-reconcile") == names.index("embed-pending") + 1
-    assert dict(daily.stages(Path("home")))["pref-reconcile"] == ["pref-reconcile"]
 
 
 def test_constraint_is_not_merged_into_a_common_row(store) -> None:

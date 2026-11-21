@@ -108,6 +108,6 @@
 .neospike-connected-kind { font-size: .7rem; font-weight: 600; color: var(--color-primary); }
 .neospike-connected-title { overflow-wrap: anywhere; }
 /* Config tab memory creation rules (MEMORY_RULE.md editor). */
-.neospike-criteria-editor { width: 100%; min-height: 24rem; resize: vertical; border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: .6rem; background: var(--color-background); color: var(--color-foreground); font-size: .82rem; }
+.neospike-criteria-editor { width: 100%; min-height: 12rem; resize: vertical; border: 1px solid var(--color-border); border-radius: var(--radius-sm); padding: .6rem; background: var(--color-background); color: var(--color-foreground); font-size: .82rem; }
 /* The bodies sit under a CardHeader like Setup's step cards, so no extra padding-top. */
 /* Weekly token limit card, two rows (left item | right item). */

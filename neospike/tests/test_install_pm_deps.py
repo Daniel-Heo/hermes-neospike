@@ -8,11 +8,21 @@ from pathlib import Path
 import pytest
 
 from neospike.tests.test_install_check import (HEALTHY_STATUS, REPO_ROOT, _FakeRunner, _install_module,
-                                               _runtime_venv)
+                                               _runtime_check_of, _runtime_venv)
 
 NUMPY = "numpy>=2.0,<3"
 FAISS = "faiss-cpu>=1.16,<2"
-DECLARATION = b'python_dependencies:\r\n  - "numpy>=2.0,<3"\r\n  - "faiss-cpu>=1.16,<2"\r\n'
+TOKENIZERS = "tokenizers>=0.22,<1"
+ONNXRUNTIME = "onnxruntime>=1.20,<2"
+HUGGINGFACE_HUB = "huggingface-hub>=1.0,<2"
+DECLARATION = (b'python_dependencies:\n  - "numpy>=2.0,<3"\n  - "faiss-cpu>=1.16,<2"\n'
+               b'  - "tokenizers>=0.22,<1"\n  - "onnxruntime>=1.20,<2"\n'
+               b'  - "huggingface-hub>=1.0,<2"\n')  # LF form
+
+
+def _plugin_yaml_lf() -> bytes:
+    """The repository plugin.yaml with CRLF folded to LF: a checkout may give either line ending."""
+    return (REPO_ROOT / "neospike" / "plugin.yaml").read_bytes().replace(b"\r\n", b"\n")
 
 
 class _PmRunner(_FakeRunner):
@@ -47,7 +57,8 @@ def _installer(tmp_path: Path, monkeypatch, import_code: int, *argv: str):
 
 
 def _is_provider_check(command: list[str]) -> bool:
-    return len(command) > 3 and "NeospikeProvider" in command[3]
+    """The post-sync import check or the --check provider check (not the environment probe)."""
+    return (_runtime_check_of(command) or ["sites"])[0] in ("imports", "provider")
 
 
 def test_install_enables_the_plugin_through_hermes_pm(tmp_path, monkeypatch):
@@ -60,9 +71,7 @@ def test_install_enables_the_plugin_through_hermes_pm(tmp_path, monkeypatch):
     assert env["HERMES_HOME"] == str(home) and env["PYTHONIOENCODING"] == "utf-8"
     assert (home / "plugins" / "neospike" / "plugin.yaml").is_file()  # copied before the PM sync
     assert any(_is_provider_check(command) for command in runner.commands[at + 1:])  # load check after enable
-    pip = [command for command in runner.commands if command[1:3] == ["pip", "install"]]
-    assert [command[3:5] for command in pip] == [["--python", str(home / "hermes-agent" / "venv" / "Scripts" / "python.exe")]]
-    assert not any(str(runtime_venv_python) in command for command in pip)
+    assert not any(command[1:3] == ["pip", "install"] for command in runner.commands)  # the PM installs
 
 
 def test_install_stops_when_the_provider_does_not_load_after_pm_sync(tmp_path, monkeypatch):
@@ -72,18 +81,17 @@ def test_install_stops_when_the_provider_does_not_load_after_pm_sync(tmp_path, m
     message = str(raised.value)
     assert "hermes pm status" in message and str(runtime_venv_python) in message and "numpy" in message
     assert not any(command[1:3] == ["config", "set"] for command in runner.commands)  # provider stays unset
-    assert not any(command[1:4] == ["pip", "install", "--python"] and str(runtime_venv_python) in command
-                   for command in runner.commands)
+    assert not any(command[1:3] == ["pip", "install"] for command in runner.commands)
 
 
 class _NoModelRunner(_PmRunner):
     """A new home without models: the imports work, is_available() is False."""
 
     def __call__(self, command: list[str], **kwargs) -> subprocess.CompletedProcess:
-        if _is_provider_check(command) and "is_available" in command[3]:
+        if _runtime_check_of(command) == ["provider"]:
             self.envs.append(kwargs.get("env") or {})
             self.commands.append(command)
-            return subprocess.CompletedProcess(command, 1, "", "AssertionError: NeospikeProvider().is_available() is False")
+            return subprocess.CompletedProcess(command, 1, "", "NeospikeProvider().is_available() is False")
         return super().__call__(command, **kwargs)
 
 
@@ -92,28 +100,32 @@ def test_skip_models_new_home_installs_to_the_end(tmp_path, monkeypatch):
     runner = _NoModelRunner(0, install.subprocess.run.sites)
     monkeypatch.setattr(install.subprocess, "run", runner)
     assert install.main() == 0
-    checks = [command[3] for command in runner.commands if _is_provider_check(command)]
-    assert checks and all("import numpy" in code and "is_available" not in code for code in checks)
+    checks = [_runtime_check_of(command) for command in runner.commands if _is_provider_check(command)]
+    assert checks and all(check[0] == "imports" and "numpy" in check for check in checks)
     assert ["hermes", "config", "set", "memory.provider", "neospike"] in runner.commands
 
 
 def test_dry_run_prints_the_enable_command(tmp_path, monkeypatch, capsys):
     install, _, runner, _ = _installer(tmp_path, monkeypatch, 0, "--dry-run")
     assert install.main() == 0
-    assert "hermes plugins enable neospike --no-allow-tool-override" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "hermes plugins enable neospike --no-allow-tool-override" in out
+    launch = str(install.installed_launch_script(install.Path(install.sys.argv[2])))
+    assert f"{launch} " in out and " neospike.runtime_check imports numpy faiss neospike neospike.provider" in out
     assert not any(command[1:3] == ["plugins", "enable"] for command in runner.commands)
 
 
-def test_repository_plugin_yaml_declares_numpy_and_faiss_with_crlf():
-    data = (REPO_ROOT / "neospike" / "plugin.yaml").read_bytes()
-    assert data.endswith(DECLARATION)
-    assert data.count(b"\n") == data.count(b"\r\n")
+def test_repository_plugin_yaml_declares_the_runtime_packages():
+    assert _plugin_yaml_lf().endswith(DECLARATION)
     install = _install_module()
-    assert install.PLUGIN_PIP_REQUIREMENTS == (NUMPY, FAISS)
+    assert install.PLUGIN_PIP_REQUIREMENTS == (NUMPY, FAISS, TOKENIZERS, ONNXRUNTIME, HUGGINGFACE_HUB)
     pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8-sig")
     assert re.findall(r'"(numpy[^"]*)"', pyproject) == [NUMPY]
     assert re.findall(r'"(faiss[^"]*)"', pyproject) == [FAISS]
-    assert "import faiss" in install._IMPORT_CHECK_SCRIPT  # the post-sync check fails when PM left faiss out
+    assert re.findall(r'"(tokenizers[^"]*)"', pyproject) == [TOKENIZERS]
+    assert re.findall(r'"(onnxruntime[^"]*)"', pyproject) == [ONNXRUNTIME]
+    assert re.findall(r'"(huggingface-hub[^"]*)"', pyproject) == [HUGGINGFACE_HUB]
+    assert "faiss" in install.IMPORT_CHECK[1:]  # the post-sync check fails when PM left faiss out
 
 
 def _no_installation_failures(home, hermes, required, runner=None) -> list[str]:
@@ -121,14 +133,17 @@ def _no_installation_failures(home, hermes, required, runner=None) -> list[str]:
     return []
 
 
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
 @pytest.mark.parametrize(("declared", "reported"), [(False, True), (True, False)])
-def test_check_reports_plugin_yaml_without_the_numpy_declaration(tmp_path, monkeypatch, declared, reported):
+def test_check_reports_plugin_yaml_without_the_numpy_declaration(tmp_path, monkeypatch, declared, reported, newline):
     install, home, _, _ = _installer(tmp_path, monkeypatch, 0, "--check")
     monkeypatch.setattr(install, "audit_installation", _no_installation_failures)
     plugin_yaml = home / "plugins" / "neospike" / "plugin.yaml"
     plugin_yaml.parent.mkdir(parents=True)
-    text = (REPO_ROOT / "neospike" / "plugin.yaml").read_bytes()
-    plugin_yaml.write_bytes(text if declared else text.replace(DECLARATION, b""))
+    text = _plugin_yaml_lf()
+    assert DECLARATION in text
+    text = text if declared else text.replace(DECLARATION, b"")
+    plugin_yaml.write_bytes(text.replace(b"\n", newline))
     with pytest.raises(SystemExit) as raised:  # other artifacts (models, crons) are missing in this fake home
         install.main()
     assert ("python_dependencies" in str(raised.value)) is reported

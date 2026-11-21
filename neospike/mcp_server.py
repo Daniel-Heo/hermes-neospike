@@ -1,8 +1,8 @@
 ﻿"""MCP stdio server for Claude Code: read notes and memories, append TASK reports.
 
 Run: python -m neospike.mcp_server [--home <HERMES_HOME>] [--owner <owner>]  (v21 --namespace: accepted with a warning)
-Register (Hermes does this, not this module):
-    claude mcp add --scope user neospike -- <venv python> -m neospike.mcp_server
+Register (install.py does this, not this module):
+    claude mcp add --scope user neospike -- <runtime python> -I <plugins>/neospike/hermes_launch.py <hermes checkout> neospike.mcp_server
 
 Reads open the database with mode=ro and never write (no access bookkeeping).
 Query embeddings come from the shared embedding daemon (EmbeddingClient). The
@@ -29,8 +29,9 @@ from pathlib import Path
 from typing import Any
 
 from ._wincompat import default_hermes_home
-from .config import EMBEDDING_DIMENSIONS, NeospikeConfig
+from .config import EMBEDDING_DIMENSIONS, PAUSED_MESSAGE, NeospikeConfig, read_enabled
 from .database import canonical_database_path
+from . import hermes_runtime
 from .inference import EmbeddingClient
 from .renames import forward_old_options
 from . import vector_index
@@ -55,9 +56,14 @@ MAX_RESULTS = 20
 DEFAULT_RESULTS = 5
 CLI_TIMEOUT_SECONDS = 180
 EXIT_MISSING_SDK = 2
-# Same copy of neospike for the CLI child; tests replace this prefix.
-CLI_PREFIX = [sys.executable, "-m", "neospike.cli"]
+CLI_MODULE = "neospike.cli"
+# None: the CLI child runs this same copy of neospike through hermes_launch.py (hermes_runtime.launch_command);
+# tests replace this prefix.
+CLI_PREFIX: list[str] | None = None
 _PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
+# The version the server reports at initialize: plugin.yaml's top-level `version:` (the copy installed with it).
+PLUGIN_MANIFEST = Path(__file__).resolve().with_name("plugin.yaml")
+_VERSION_KEY = "version:"
 # The store's admission floor; read from MemoryStore so the value lives in one place.
 SEMANTIC_THRESHOLD = float(inspect.signature(MemoryStore.__init__).parameters["semantic_threshold"].default)
 # mem_search keeps memories, note chunks and doc chunks with cosine >= this, highest cosine first, cut to
@@ -246,6 +252,12 @@ class NeospikeTools:
 
     # -- helpers -----------------------------------------------------------------------------
 
+    def _refuse_when_paused(self) -> None:
+        """The on/off switch, read at every call: a search or a write (both may start the embedding daemon) is
+        refused while it is off; reading a note still works."""
+        if not read_enabled(self.home):
+            raise _failure("paused", PAUSED_MESSAGE)
+
     def _query_embedding(self, query: str) -> list[float]:
         with self._embedder_lock:
             if self._embedder is None:
@@ -299,6 +311,7 @@ class NeospikeTools:
             raise _failure("invalid", "include_history must be a boolean")
         if tag is not None and not isinstance(tag, str):
             raise _failure("invalid", "tag must be a string")
+        self._refuse_when_paused()
         return self._guarded(self._mem_search, query, limit, include_history, tag or None)
 
     def _mem_search(self, connection: sqlite3.Connection, query: str, limit: int, include_history: bool,
@@ -311,6 +324,7 @@ class NeospikeTools:
         return {"results": results}
 
     def note_append_report(self, title: str, text: str) -> str:
+        self._refuse_when_paused()
         code, payload = self._cli(["note-append-report"], {"title": title, "text": text})
         if code or "error" in payload:
             raise ToolError(_json(payload))
@@ -318,7 +332,11 @@ class NeospikeTools:
 
     def _cli(self, arguments: list[str], payload: dict) -> tuple[int, dict]:
         """Run one CLI command with JSON on stdin; return (exit code, parsed JSON object)."""
-        command = [*CLI_PREFIX, "--home", str(self.home), "--owner", self.namespace, *arguments]
+        try:
+            prefix = CLI_PREFIX or hermes_runtime.launch_command(self.home, [CLI_MODULE])
+        except hermes_runtime.HermesRuntimeNotFound:
+            raise _failure("unavailable", "Neospike write command could not run: Hermes runtime not found") from None
+        command = [*prefix, "--home", str(self.home), "--owner", self.namespace, *arguments]
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONPATH"] = os.pathsep.join(filter(None, (_PACKAGE_PARENT, env.get("PYTHONPATH"))))
@@ -338,10 +356,22 @@ class NeospikeTools:
         raise _failure("unavailable", f"Neospike write command failed with status {result.returncode}")
 
 
+def server_version(manifest: Path = PLUGIN_MANIFEST) -> str:
+    """plugin.yaml's top-level version, unquoted; "" when the file or the key is missing."""
+    try:
+        lines = manifest.read_text(encoding="utf-8-sig").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        if line.startswith(_VERSION_KEY):
+            return line[len(_VERSION_KEY):].split("#", 1)[0].strip().strip("'\"")
+    return ""
+
+
 def build_server(tools: NeospikeTools) -> Any:
     if MCPServer is None:
         raise RuntimeError("The MCP SDK is not installed; install the extra: pip install 'neospike[mcp]'")
-    server = MCPServer(SERVER_NAME, instructions=(
+    server = MCPServer(SERVER_NAME, version=server_version(), instructions=(
         "Neospike second brain. TASK_NNN notes hold work orders; read them with note_read and report with "
         "note_append_report. Docs (notes the user wrote) are read-only. Before you decide, or ask the user, about anything that may already be "
         "decided (settings, thresholds, designs, fixes), search mem_search (memories, notes and docs, the notes "

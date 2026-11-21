@@ -176,17 +176,17 @@ def test_saving_config_discards_retired_keys_and_triggers_no_reindex(http):
 # --- setup actions ------------------------------------------------------------------------------
 
 def test_model_download_runs_only_the_pinned_repository_files(http, monkeypatch, tmp_path):
-    hf_stub = tmp_path / 'hf'
-    hf_stub.touch()
-    monkeypatch.setattr(api, '_hf_cli_path', FixedAnswer(hf_stub))
+    """`hf download` runs as the huggingface_hub module through hermes_launch.py on the runtime python."""
     log = CommandLog()
     monkeypatch.setattr(api, '_run_logged', log)
     reply = http.post('/setup/models', json={})
     assert reply.status_code == 202
     assert await_job(http, reply.json()['job_id'])['state'] == 'complete'
-    assert {command[2] for command in log.commands} == {api.MODEL_REPO}
+    assert {command[6] for command in log.commands} == {api.MODEL_REPO}
     first = log.commands[0]
-    assert first[3:5] == list(api.MODEL_DOWNLOADS)
+    assert first[0] == os.environ['HERMES_PYTHON'] and first[1] == '-I'
+    assert Path(first[2]).name == 'hermes_launch.py'
+    assert first[4:6] == [api.HF_CLI_MODULE, 'download'] and first[7:9] == list(api.MODEL_DOWNLOADS)
     assert first[first.index('--revision') + 1] == api.MODEL_REVISION
 
 
@@ -195,16 +195,38 @@ def test_activation_without_confirmation_is_refused(http):
     assert reply.status_code == 400
 
 
-def test_dependency_install_uses_the_managed_interpreter_and_pinned_packages(http, monkeypatch):
+def test_dashboard_never_installs_packages_itself(http, monkeypatch):
+    # Hermes's package manager installs plugin.yaml python_dependencies; the dashboard has no pip route.
     log = CommandLog()
     monkeypatch.setattr(api, '_run_logged', log)
-    reply = http.post('/setup/dependencies')
-    assert reply.status_code == 202
-    assert await_job(http, reply.json()['job_id'])['state'] == 'complete'
-    command = log.commands[0]
-    assert command[:4] == [str(api._cli_python_path()), '-m', 'pip', 'install']
-    assert command[-len(api.PIP_PACKAGES):] == api.PIP_PACKAGES
-    assert all(isinstance(part, str) for part in command)  # an argv list: no shell string
+    assert http.post('/setup/dependencies').status_code == 404
+    assert log.commands == []
+    assert not hasattr(api, 'PIP_PACKAGES')
+    assert '"pip"' not in Path(api.__file__).read_text(encoding='utf-8-sig')
+
+
+class ArgvLog:
+    """Replaces api._try_run: remembers each argv and answers success."""
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv, timeout, **options):
+        self.calls.append(argv)
+        return FakeCompleted(returncode=0)
+
+
+def test_dependency_check_imports_exactly_the_declared_python_dependencies(http, monkeypatch):
+    from neospike.tests.test_plugin_dependencies import DISTRIBUTION_OF, PLUGIN_YAML, declared_distributions
+    calls = ArgvLog()
+    monkeypatch.setattr(api, '_try_run', calls)
+    monkeypatch.setattr(api.shutil, 'which', FixedAnswer(None))
+    assert http.get('/setup/status').json()['dependencies_installed'] is True
+    # python -I hermes_launch.py checkout neospike.runtime_check imports <module>...
+    probe = next(argv for argv in calls.calls if argv[4:6] == ['neospike.runtime_check', 'imports'])
+    imported = set(probe[6:])
+    declared = declared_distributions(PLUGIN_YAML.read_text(encoding='utf-8-sig'))
+    assert {DISTRIBUTION_OF[name] for name in imported} == declared
 
 
 @pytest.mark.parametrize(('method', 'route', 'body'), [
@@ -245,6 +267,16 @@ def test_health_check_hides_what_the_probe_process_printed(http, monkeypatch):
     assert reply.json()['problems'] == [PROBE_FAIL_TEXT]
 
 
+def test_health_probe_runs_the_provider_check_module(http, monkeypatch):
+    """The availability probe is a module of the package started through hermes_launch.py, not a code string."""
+    calls = ArgvLog()
+    monkeypatch.setattr(api, '_collect_status', FixedAnswer(dict(HEALTHY_STATE)))
+    monkeypatch.setattr(api, '_try_run', calls)
+    assert http.post('/health').json()['healthy'] is True
+    assert [argv[4:] for argv in calls.calls] == [['neospike.runtime_check', 'provider']]
+    assert Path(calls.calls[0][2]).name == 'hermes_launch.py'
+
+
 @pytest.mark.parametrize('failure', [subprocess.TimeoutExpired('python', 90), OSError('private path')],
                          ids=['timeout', 'oserror'])
 def test_health_check_survives_probe_launch_errors_without_echoing_them(http, monkeypatch, failure):
@@ -259,9 +291,6 @@ def test_health_check_survives_probe_launch_errors_without_echoing_them(http, mo
 @pytest.mark.parametrize('failure', [subprocess.TimeoutExpired('probe', 20), OSError('private probe path')],
                          ids=['timeout', 'oserror'])
 def test_status_and_health_degrade_quietly_when_every_probe_fails(http, monkeypatch, tmp_path, failure):
-    hf_stub = tmp_path / 'hf'
-    hf_stub.touch()
-    monkeypatch.setattr(api, '_hf_cli_path', FixedAnswer(hf_stub))
     monkeypatch.setattr(api.shutil, 'which', FixedAnswer('/managed/hermes'))
     __import__('platform').system()  # Windows shells out for this; fill the cache before run() starts failing
     monkeypatch.setattr(api.subprocess, 'run', FakeRun(failure=failure))
@@ -288,18 +317,50 @@ def test_tab_bar_lists_the_expected_tabs_and_dropped_copy_is_gone():
 
 def test_bundle_talks_to_the_setup_routes_and_drops_retired_features():
     bundle = js_text(BUNDLE)
-    for route in ('/setup/status', '/setup/progress', '/setup/dependencies', '/setup/models',
-                  '/setup/config', '/setup/activate'):
+    for route in ('/setup/status', '/setup/progress', '/setup/models',
+                  '/setup/config', '/setup/activate', 'hermes gateway restart'):
         assert route in bundle, route
-    retired = ('/setup/backfill', 'Apply accepted memories', 'Sign in from a terminal', 'hf auth login',
+    retired = ('/setup/dependencies', 'setup.act.installDeps', 'setup.depsInstalled', '/setup/backfill', 'Apply accepted memories', 'Sign in from a terminal', 'hf auth login',
                'terms_accepted', 'acceptedTerms', 'Gemma', 'embedding_dimensions', '"setup.dimensions"',
                '/setup/auth', 'hfToken', 'setup.signIn', 'setup.tokenLabel',
                'huggingface.co/settings/tokens', 'visual_enabled', 'SHOW_VISUAL_SETUP',
                'neospike-retention', 'retention_days', 'ChoiceButton')
     for gone in retired:
         assert gone not in bundle, gone
-    for kept in ('turn_trace_enabled: debugOn', 'type: "radio"', 'name: "neospike-model-mode"'):
+    for kept in ('turn_trace_enabled: next', 'type: "radio"', 'name: "neospike-model-mode"'):
         assert kept in bundle, kept
+
+
+def test_diagnostics_setting_lives_in_config_tab_not_setup():
+    bundle = js_text(BUNDLE)
+    setup = bundle[bundle.index('function InstallView('):bundle.index('function SettingsView(')]
+    config = bundle[bundle.index('function SettingsView('):bundle.index('function enabledSavedText(')]
+    for gone in ('turn_trace_enabled', 'setup.debug', 'debugOn', 'commitSettings', 'setup.step3'):
+        assert gone not in setup, gone
+    assert 'h(PrefModelView, null), h(DiagnosticsView, null));' in config  # last Config card
+    card = bundle[bundle.index('function DiagnosticsView('):bundle.index('const EXTRACT_LANGS')]
+    for kept in ('h(Badge, null, "4")', 't("config.diagnostics.title")', 't("setup.debug")', 't("setup.debugCopy")', '"/setup/config"'):
+        assert kept in card, kept
+    for retired in ('"setup.step3"', '"setup.act.saveConfig"'):
+        assert retired not in bundle, retired
+
+
+def test_setup_tab_keeps_model_apply_and_switch_cards():
+    bundle = js_text(BUNDLE)
+    setup = bundle[bundle.index('function InstallView('):bundle.index('function SettingsView(')]
+    assert re.findall(r'h\(Badge, null, "(\d)"\), h\(CardTitle, null, t\("([\w.]+)"\)\)', setup) == [
+        ('1', 'setup.step2'), ('2', 'setup.step5')]
+    assert setup.count('h(EnabledSwitchView, null)') == 1  # the on/off card follows as step 3
+    config = bundle[bundle.index('function SettingsView('):bundle.index('function enabledSavedText(')]
+    assert 'EnabledSwitchView' not in config
+    switch = bundle[bundle.index('function EnabledSwitchView('):bundle.index('function DiagnosticsView(')]
+    assert 'h(Badge, null, "3"), h(CardTitle, null, t("config.enabled.title"))' in switch
+    assert 't("setup.chk.deps")' in setup  # status row stays
+    for retired in ('"setup.step1"', '"setup.step1Copy"', '"setup.depsEnable"', '"setup.depsSetup"',
+                    'PLUGIN_ENABLE_COMMAND', 'MEMORY_SETUP_COMMAND', 'hermes plugins enable neospike', 'hermes memory setup'):
+        assert retired not in bundle, retired
+    assert '"setup.step5": "Apply to memory handling and verify"' in bundle
+    assert '"setup.step5": "메모리 처리에 적용과 점검"' in bundle
 
 
 def test_built_bundle_is_identical_to_its_source():

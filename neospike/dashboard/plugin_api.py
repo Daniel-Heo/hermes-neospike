@@ -15,7 +15,6 @@ import sys
 import threading
 import uuid
 from contextlib import closing
-from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -29,11 +28,13 @@ if _PKG_PARENT_DIR not in sys.path:
     sys.path.insert(0, _PKG_PARENT_DIR)
 
 from neospike._wincompat import chmod as _win_chmod, default_hermes_home
-from neospike.config import (DEFAULT_SAVE_CRITERIA, EXTRACTION_LANGUAGE_DEFAULT, OLD_CONFIG_KEYS,
-                             REMOVED_CONFIG_KEYS, SaveCriteriaLimits, parse_extraction_language, read_memory_rule,
+from neospike.config import (DEFAULT_SAVE_CRITERIA, ENABLED_KEY, EXTRACTION_LANGUAGE_DEFAULT, OLD_CONFIG_KEYS,
+                             REMOVED_CONFIG_KEYS, SaveCriteriaLimits, parse_extraction_language, read_enabled, read_memory_rule,
                              write_memory_rule)
 from neospike.database import canonical_database_path
 from neospike import hermes_runtime
+from neospike import inference  # stdlib only at import; release_daemon for the on/off switch
+from neospike import runtime_check  # stdlib only; its checks run in the Hermes runtime
 from neospike.notes import (
     NoteError, head_row, list_notes, note_history, note_record, note_related, note_titles,
 )
@@ -57,23 +58,34 @@ MODEL_REVISION = "4de13258303883538bd53b696b452bf8099f0858"
 MODEL_ONNX_NAME = "sentence_transformers_int8.onnx"
 MODEL_DOWNLOADS = ["onnx/" + MODEL_ONNX_NAME, "tokenizer.json"]
 MODEL_FOLDER = "bge-m3-onnx"
-PIP_PACKAGES = ["numpy>=2.0,<3", "tokenizers>=0.22,<1", "onnxruntime>=1.20,<2", "huggingface-hub>=0.34,<2", "jsonschema>=4,<5"]
+# Import names of plugin.yaml python_dependencies (faiss-cpu imports as faiss, huggingface-hub as
+# huggingface_hub). Hermes's package manager installs them; the dashboard only checks that they import.
+DEPENDENCY_MODULES = ("numpy", "faiss", "tokenizers", "onnxruntime", "huggingface_hub")
 
 
 def _home_dir_path() -> Path:
     return Path(default_hermes_home()).expanduser().resolve()
 
 
-def _cli_python_path() -> Path:
-    """hermes_runtime.cli_python; when nothing exists, the (missing) checkout venv path so callers report it."""
+HF_CLI_MODULE = "huggingface_hub.cli.hf"  # the `hf` console script's module (plugin.yaml huggingface-hub)
+NEOSPIKE_CLI_MODULE = "neospike.cli"
+
+
+def _runtime_python_path() -> Path | None:
+    """The Hermes runtime python (hermes_runtime.current_runtime_python), None when there is none."""
     try:
-        return Path(hermes_runtime.cli_python(_home_dir_path()))
+        return Path(hermes_runtime.current_runtime_python(_home_dir_path()))
     except hermes_runtime.HermesRuntimeNotFound:
-        return hermes_runtime.checkout_python(_home_dir_path())
+        return None
 
 
-def _hf_cli_path() -> Path:
-    return _cli_python_path().parent / ("hf.exe" if os.name == "nt" else "hf")
+def _runtime_command(target: list[str]) -> list[str] | None:
+    """*target* (`module, args...`) through hermes_launch.py of this plugin copy on the
+    runtime python, so it imports from the Hermes package manager's environment; None without a runtime."""
+    python = _runtime_python_path()
+    if python is None or not python.is_file():
+        return None
+    return hermes_runtime.launch_command(_home_dir_path(), target, python=str(python))
 
 
 # Neospike settings read by child processes (CLI, inference daemon); dropping one makes the
@@ -81,11 +93,9 @@ def _hf_cli_path() -> Path:
 _PASSTHROUGH_ENV = ("HERMES_BGE_M3_DIR", "NEOSPIKE_INFERENCE_HOME", "NEOSPIKE_FORCE_TCP")
 
 
-def _subprocess_env(*, include_plugin: bool = False) -> dict[str, str]:
+def _subprocess_env() -> dict[str, str]:
     env = {key: os.environ[key] for key in ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "USERPROFILE", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP", "HF_HOME", "PYTHONUTF8", "HERMES_PYTHON", *_PASSTHROUGH_ENV) if key in os.environ}
     env["HERMES_HOME"] = str(_home_dir_path())
-    if include_plugin:
-        env["PYTHONPATH"] = str(_home_dir_path() / "plugins")
     return env
 
 
@@ -187,18 +197,18 @@ def _collect_status() -> dict[str, Any]:
         asked = _try_run([hermes_exe, "config", "get", "memory.provider"], 20, capture_output=True, text=True)
         if asked is not None and asked.returncode == 0:
             provider = asked.stdout.strip().strip('"')
-    python_path = _cli_python_path()
+    import_check = _runtime_command([runtime_check.MODULE, runtime_check.CHECK_IMPORTS, *DEPENDENCY_MODULES])
     # A path can exist but still be an invalid or stale executable, so the import is actually tried.
-    imported = _try_run([str(python_path), "-c", "import numpy, tokenizers, onnxruntime, huggingface_hub"],
-                               30, capture_output=True) if python_path.is_file() else None
+    imported = _try_run(import_check, 30, capture_output=True) if import_check else None
     platform_module = __import__("platform")
     return {
         "platform": {"system": platform_module.system(), "machine": platform_module.machine()},
-        "hermes_found": bool(hermes_exe), "python_found": python_path.is_file(),
+        "hermes_found": bool(hermes_exe), "python_found": import_check is not None,
         "dependencies_installed": imported is not None and imported.returncode == 0,
         "text_model_downloaded": model_ready, "text_model_ready": model_ready,
         "provider": provider, "active": provider == "neospike",
         "config": {
+            ENABLED_KEY: read_enabled(home),
             "turn_trace_enabled": _saved_setting(saved, "turn_trace_enabled", False),
             "extraction_language": _saved_setting(saved, "extraction_language", EXTRACTION_LANGUAGE_DEFAULT),
         },
@@ -215,6 +225,8 @@ class ConfigBody(BaseModel):
     # None (omitted): the saved value stays. Setup saves only the debug switch, Config only the language.
     turn_trace_enabled: bool | None = None
     extraction_language: str | None = None
+    # The on/off switch (Config tab); false pauses Neospike in this home and asks the shared daemon to stop.
+    enabled: bool | None = None
 
 
 def _saved_setting(saved: dict[str, Any], key: str, default: Any = None) -> Any:
@@ -254,26 +266,16 @@ def progress_route(job_id: str | None = None):
         return dict(_JOB_TABLE[job_id])
 
 
-@router.post("/setup/dependencies", status_code=202)
-def install_deps_route():
-    python_path = _cli_python_path()
-    if not python_path.is_file():
-        raise HTTPException(409, "Hermes Python environment was not found")
-    pip_argv = [str(python_path), "-m", "pip", "install", *PIP_PACKAGES]
-    return _start_job("dependencies", partial(_run_logged, pip_argv))
-
-
 @router.post("/setup/models", status_code=202)
 def models_route(request: ModelsBody):
-    hf_cli = _hf_cli_path()
-    if not hf_cli.is_file():
-        raise HTTPException(409, "Hugging Face CLI is unavailable; install dependencies first")
+    if _runtime_command([HF_CLI_MODULE]) is None:
+        raise HTTPException(409, "Hermes Python environment was not found")
 
     def worker(job):
         target_dir = _home_dir_path() / "models" / MODEL_FOLDER
         target_dir.mkdir(exist_ok=True, parents=True)
-        _run_logged([str(hf_cli), "download", MODEL_REPO, *MODEL_DOWNLOADS,
-                     "--revision", MODEL_REVISION, "--local-dir", str(target_dir)], job)
+        _run_logged(_runtime_command([HF_CLI_MODULE, "download", MODEL_REPO, *MODEL_DOWNLOADS,
+                                      "--revision", MODEL_REVISION, "--local-dir", str(target_dir)]), job)
         _flatten_model_file(target_dir)
     return _start_job("download", worker)
 
@@ -297,7 +299,20 @@ def config_route(request: ConfigBody):
         except ValueError as exc:
             raise HTTPException(422, {"error": "invalid", "message": str(exc)}) from exc
     _save_config_overlay(_home_dir_path() / "neospike" / "config.json", payload)
-    return {"saved": True, "config": payload, "reindex_performed": False}
+    reply = {"saved": True, "config": payload, "reindex_performed": False}
+    if payload.get(ENABLED_KEY) is False:
+        reply["daemon"] = _release_daemon(_home_dir_path())
+    return reply
+
+
+def _release_daemon(home: Path) -> dict[str, Any]:
+    """inference.release_daemon for the switch turned off: {"state": stopped | not_running | in_use | error,
+    "users": the homes that still use the daemon, "message": why it could not be reached}."""
+    try:
+        state, users = inference.release_daemon(home)
+    except OSError as exc:
+        return {"state": "error", "users": [], "message": str(exc)}
+    return {"state": state, "users": [str(user) for user in users]}
 
 
 def _save_config_overlay(path: Path, payload: dict[str, Any]) -> None:
@@ -335,6 +350,40 @@ def rule_put_route(request: RuleBody):
     return {"saved": True, **_rule_payload()}
 
 
+# Model picker " API" mark. agent.credential_pool (public plugin API) gives each credential an auth_type; it turns an
+# anthropic Claude subscription token (sk-ant-oat...) into "oauth" although that provider also takes API keys.
+AUTH_TYPE_API_KEY = "api_key"  # agent.credential_pool.AUTH_TYPE_API_KEY
+SUBSCRIPTION_PROVIDERS = frozenset({"openai-codex"})  # ChatGPT subscription: never an API key
+PROVIDER_LIST_SEPARATOR = ","
+MAX_PROVIDER_QUERY = 200  # slugs per request; the Hermes picker lists far fewer
+
+
+def api_key_authenticated(provider: str, auth_types: list[str]) -> bool:
+    """True only when every credential Hermes holds for *provider* is an API key (any OAuth token wins)."""
+    if provider in SUBSCRIPTION_PROVIDERS or not auth_types:
+        return False
+    return all(kind == AUTH_TYPE_API_KEY for kind in auth_types)
+
+
+def _pool_auth_types(provider: str) -> list[str]:
+    from agent.credential_pool import load_pool  # Hermes process only (public plugin API module)
+    return [str(entry.auth_type) for entry in load_pool(provider).entries()]
+
+
+@router.get("/config/api-key-providers")
+def api_key_providers_route(providers: str = ""):
+    slugs = [slug.strip() for slug in providers.split(PROVIDER_LIST_SEPARATOR) if slug.strip()][:MAX_PROVIDER_QUERY]
+    marked = []
+    for slug in dict.fromkeys(slugs):
+        try:
+            auth_types = _pool_auth_types(slug)
+        except Exception:  # no pool for this slug or no Hermes runtime: shown without the mark
+            continue
+        if api_key_authenticated(slug, auth_types):
+            marked.append(slug)
+    return {"providers": marked}
+
+
 def _activate_provider():
     launcher = shutil.which("hermes")
     if not launcher:
@@ -353,9 +402,6 @@ def activate_route(request: ConfirmBody):
     return _activate_provider()
 
 
-_PROVIDER_PROBE = "from neospike import NeospikeProvider; assert NeospikeProvider().is_available()"
-
-
 @router.post("/health")
 def health_route():
     state = _collect_status()
@@ -368,8 +414,8 @@ def health_route():
         problems.append("memory.provider is not neospike")
     provider_ok = False
     if not problems:
-        probed = _try_run([str(_cli_python_path()), "-c", _PROVIDER_PROBE], 90, capture_output=True,
-                                 text=True, env=_subprocess_env(include_plugin=True))
+        probe = _runtime_command([runtime_check.MODULE, runtime_check.CHECK_PROVIDER])
+        probed = _try_run(probe, 90, capture_output=True, text=True, env=_subprocess_env()) if probe else None
         provider_ok = probed is not None and probed.returncode == 0
         if not provider_ok:
             problems.append("Provider availability check failed; inspect local Dashboard logs")
@@ -391,9 +437,10 @@ _NOTE_HTTP_CODES = {"not_found": 404, "conflict": 409, "forbidden": 403, "policy
 
 
 def _cli_argv_base() -> list[str]:
-    if not _cli_python_path().is_file():
+    command = _runtime_command([NEOSPIKE_CLI_MODULE])
+    if command is None:
         raise HTTPException(409, "Hermes Python environment was not found")
-    return [str(_cli_python_path()), "-m", "neospike.cli"]
+    return command
 
 
 def _cli_call(arguments: list[str], payload: dict[str, Any] | None = None, *, namespace: str | None = None) -> tuple[int, dict[str, Any]]:
@@ -402,8 +449,7 @@ def _cli_call(arguments: list[str], payload: dict[str, Any] | None = None, *, na
     if namespace is not None:
         command += ["--owner", namespace]
     env = _subprocess_env()
-    # The CLI must import this same neospike copy, and write JSON as UTF-8 on every console code page.
-    env["PYTHONPATH"] = _PKG_PARENT_DIR
+    # hermes_launch.py of this copy puts its plugins folder on sys.path; JSON is UTF-8 on every console code page.
     env["PYTHONIOENCODING"] = "utf-8"
     stdin = b"" if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:

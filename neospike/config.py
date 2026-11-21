@@ -80,8 +80,28 @@ def _pick_current(values: dict[str, Any], key: str, default: Any = None) -> Any:
     return default
 
 
+ENABLED_KEY = "enabled"
+# Error text of every tool call (agent tools and MCP searches) while the switch is off.
+PAUSED_MESSAGE = ("Neospike is paused (\"enabled\": false in neospike/config.json); "
+                  "turn it back on in the dashboard Config tab")
+
+
+def read_enabled(hermes_home: str | Path | None) -> bool:
+    """The on/off switch of one home, read from config.json at every call (no restart needed). A missing or
+    unreadable file, or a value that is no boolean, counts as on: only an explicit false pauses Neospike."""
+    if hermes_home is None:
+        return True
+    try:
+        values = json.loads(_config_file(hermes_home).read_text(encoding="utf-8-sig"))
+        return _parse_flag(values.get(ENABLED_KEY, True), ENABLED_KEY) if isinstance(values, dict) else True
+    except (OSError, ValueError):
+        return True
+
+
 @dataclass(frozen=True)
 class NeospikeConfig:
+    # Off: no automatic recall, no conversation capture, no save follow-up; tools return PAUSED_MESSAGE.
+    enabled: bool = field(default=True)
     turn_trace_enabled: bool = field(default=False)
     recall_log_enabled: bool = field(default=True)
     recall_log_months: int = field(default=12)
@@ -105,6 +125,7 @@ class NeospikeConfig:
     def from_values(cls, values: dict[str, Any]) -> "NeospikeConfig":
         pick = values.get
         return cls(
+            enabled=_parse_flag(pick(ENABLED_KEY, True), ENABLED_KEY),
             turn_trace_enabled=_parse_flag(_pick_current(values, "turn_trace_enabled", False), "turn_trace_enabled"),
             recall_log_enabled=_parse_flag(pick("recall_log_enabled", True), "recall_log_enabled"),
             recall_log_months=_parse_log_months(pick("recall_log_months", 12)),

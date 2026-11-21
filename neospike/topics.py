@@ -32,6 +32,7 @@ except ImportError as error:  # no slow fallback; the provider load fails with t
 from .store import (FORMULA_AUTHOR, ITEM_MEMORY, NOTE_CHUNKS_SQL, RELATION_TOPIC, note_head_sql,
                     vector_present_sql)
 from .store import topic_order as store_topic_order
+from .threads import background_thread
 
 TOPIC_TITLE_PREFIX = "TOPIC: "
 
@@ -868,7 +869,7 @@ class SaveFollowUp:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="neospike-save-follow-up", daemon=True)
+        self._thread = background_thread(self._run, "neospike-save-follow-up")
         self._thread.start()
 
     def notify(self) -> None:

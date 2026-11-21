@@ -15,6 +15,7 @@ import pytest
 
 from neospike.config import EMBEDDING_DIMENSIONS, NeospikeConfig
 from neospike.store import DEFAULT_NAMESPACE, MemoryStore
+from neospike.tests.support_embed_service import fake_hermes_checkout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_TIMEOUT_SECONDS = 600
@@ -57,7 +58,9 @@ def _state_db(home: Path) -> None:
 
 
 def _run_script(home: Path, name: str) -> subprocess.CompletedProcess:
-    env = {**os.environ, "HERMES_PYTHON": sys.executable, "PYTHONIOENCODING": "utf-8"}
+    # The CLI child starts through hermes_launch.py on this interpreter and a fake checkout, never Hermes.
+    env = {**os.environ, "HERMES_PYTHON": sys.executable, "PYTHONIOENCODING": "utf-8",
+           "NEOSPIKE_HERMES_CHECKOUT": str(fake_hermes_checkout(home.parent))}
     env.pop("HERMES_HOME", None)  # the script must take its home from its own location
     return subprocess.run([sys.executable, str(home / "scripts" / name)], capture_output=True, text=True,
                           encoding="utf-8", errors="replace", timeout=SCRIPT_TIMEOUT_SECONDS, env=env,
@@ -93,7 +96,7 @@ def test_daily_backup_failure_is_listed_first(home, monkeypatch, capsys):
     assert daily.main() == 1
     # topic-to-note after topic-discover; embed-pending first (it runs the save follow-up, so
     # note-absorb and topic-assign are no stages). Inbox-maintain, lint and inbox-review-code are gone.
-    assert stages.order == ["backup", "link-prune", "conv-import", "conv-index", "embed-pending", "pref-reconcile",
+    assert stages.order == ["backup", "link-prune", "conv-import", "conv-index", "embed-pending",
                             "topic-discover", "topic-to-note"]
     assert capsys.readouterr().out.splitlines() == [f"{home}: FAILED backup | FAILED topic-to-note"]
 

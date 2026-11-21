@@ -13,10 +13,13 @@ import zipfile
 from pathlib import Path
 
 from neospike import hermes_runtime
+from neospike import inference
+from neospike import runtime_check
 from neospike._wincompat import shared_inference_home
 from neospike.config import read_memory_rule, memory_rule_file_path, write_memory_rule
-from neospike.cron.neospike_cron_common import target_homes
+from neospike.cron.neospike_cron_common import configured_memory_provider, target_homes
 from neospike.cron.neospike_cron_common import yaml_scalar as _scalar_of
+from neospike.cron.neospike_cron_common import _yaml_data
 from neospike.store import memory_db_path, pick_namespace
 
 
@@ -30,34 +33,23 @@ MODEL_FOLDER = "bge-m3-onnx"  # embedder.MODEL_FOLDER
 
 STATUS_MARKERS = ("Plugin:    installed ✓", "Status:    available ✓")
 PROBE_TIMEOUT_S = 120
-# The gateway imports `hermes_bootstrap`, which swaps sys.path to the PM environment venv
-# (installs/<id>/environments/<hash>/venv). Probes mirror the launcher's -c prologue so they see that sys.path.
-# argv = [hermes-agent root, plugins dir]; argv is cleared before the import because bootstrap parses it as a command.
-_BOOT_PREFIX = (
-    "import os, sys; roots = sys.argv[1:3]; del sys.argv[1:]; "
-    "[os.environ.pop(name, None) for name in ('PYTHONHOME', 'PYTHONPATH', 'VIRTUAL_ENV')]; "
-    "sys.path.insert(0, roots[0]); import hermes_bootstrap; "
-)
-_LOAD_CHECK_SCRIPT = _BOOT_PREFIX + (
-    "sys.path.insert(0, roots[1]); "
-    "from neospike import NeospikeProvider; import neospike.provider; "
-    "assert NeospikeProvider().is_available(), 'NeospikeProvider().is_available() is False'"
-)
+# The probes run neospike.runtime_check through the installed copy's hermes_launch.py, which starts Python the way
+# the Hermes launcher does (hermes_bootstrap selects the PM environment venv, installs/<id>/environments/<hash>/venv),
+# so they see the same sys.path as the daemon, the MCP server and the cron job.
+SITE_CHECK = (runtime_check.CHECK_SITES,)
+LOAD_CHECK = (runtime_check.CHECK_PROVIDER,)
 # Right after the PM sync only the imports are checked; is_available() also needs the model files,
-# which --skip-models leaves out, so that assertion stays in --check (_LOAD_CHECK_SCRIPT).
-_IMPORT_CHECK_SCRIPT = _BOOT_PREFIX + (
-    "sys.path.insert(0, roots[1]); "
-    "import numpy; import faiss; from neospike import NeospikeProvider; import neospike.provider"
-)
-_SITE_PROBE_SCRIPT = _BOOT_PREFIX + (
-    "import json; from pathlib import Path; "
-    "print(json.dumps([p for p in sys.path if Path(p).name in ('site-packages', 'dist-packages')]))"
-)
+# which --skip-models leaves out, so that check stays in --check (LOAD_CHECK).
+IMPORT_CHECK = (runtime_check.CHECK_IMPORTS, "numpy", "faiss", "neospike", "neospike.provider")
 # What the Hermes process itself imports from this package. Declared in neospike/plugin.yaml
 # python_dependencies and installed by the Hermes package manager (tests tie it to plugin.yaml and pyproject).
 # faiss-cpu: the HNSW candidates of vector_index.py, used in the Hermes process by every vector search of the
 # database file (without it in the Hermes runtime every such search would fail).
-PLUGIN_PIP_REQUIREMENTS = ("numpy>=2.0,<3", "faiss-cpu>=1.16,<2")
+# tokenizers, onnxruntime: embedder.py; the embedding daemon runs in the same environment through hermes_launch.py
+# (_wincompat.inference_command), and a catalog install does not run this script.
+# huggingface-hub: the model download (`python -m huggingface_hub.cli.hf download`, here and in the Dashboard).
+PLUGIN_PIP_REQUIREMENTS = ("numpy>=2.0,<3", "faiss-cpu>=1.16,<2", "tokenizers>=0.22,<1", "onnxruntime>=1.20,<2",
+                           "huggingface-hub>=1.0,<2")
 PLUGIN_REQS_KEY = "python_dependencies:"
 
 
@@ -70,8 +62,23 @@ DELIVER_OK = "local"
 DELIVER_FAIL = "bot-chat"
 # Claude Code MCP registration (user scope).
 MCP_SERVER_NAME, MCP_REG_SCOPE = "neospike", "user"
-DAILY_JOB_NAME, DAILY_JOB_WHEN = "neospike-daily", "every day at 4am"
+MCP_MODULE = "neospike.mcp_server"
+HF_CLI_MODULE = "huggingface_hub.cli.hf"  # the `hf` console script's module
+# An earlier install.py ran `uv pip install` of this package into the Hermes CLI venv (hermes-agent/venv);
+# that copy is removed (this distribution only), since every Neospike process now runs the plugin folder.
+OLD_DISTRIBUTION = "neospike"
+OLD_DIST_GLOBS = ("Lib/site-packages/neospike-*.dist-info", "lib/python*/site-packages/neospike-*.dist-info")
+# runtime.json keys an earlier install.py wrote and nothing reads any more; removed on install.
+OLD_CACHE_KEYS = ("cli_python",)
+DRY_RUN_PYTHON = "<hermes runtime python>"
+DAILY_JOB_NAME, DAILY_JOB_WHEN = "neospike-daily", "every day at 12pm"
 DATA_FOLDER, PLUGIN_FOLDER, PROVIDER_ID = "neospike", "neospike", "neospike"
+# Hermes loads every folder in <home>/plugins as a plugin, and a second copy with the same manifest name
+# shadows plugins/neospike. So the install copy and the previous plugin live in <home>/neospike/.install
+# (same volume as plugins/, so Path.replace is a rename); one previous copy is kept, --uninstall removes it.
+INSTALL_SCRATCH_FOLDER, STAGING_FOLDER, PREVIOUS_FOLDER = ".install", "staging", "previous"
+# Folders an earlier install.py left in <home>/plugins: install and --uninstall remove them, --check fails on them.
+PLUGIN_LEFTOVERS = ("neospike.previous", "neospike.installing")
 
 # Jobs and files of the retired weekly LLM review; removed on install (the daily job calls no LLM).
 DROPPED_JOBS = ("neospike-weekly-review",)
@@ -89,6 +96,10 @@ SKILL_REWRITES = (
     (re.compile(r"\b(?:memory|note)_search\b"), "mem_search"),
 )
 BOM_BYTES = b"\xef\xbb\xbf"
+# The preference/constraint cleanup model: Hermes auxiliary slot of pref_reconcile.LLM_TASK. "auto" follows the chat model.
+AUXILIARY_SECTION = "auxiliary"
+PREF_MODEL_TASK = "neospike_pref_reconcile"  # pref_reconcile.LLM_TASK (a test keeps them equal)
+PREF_MODEL_DEFAULT = "auto"
 
 
 def _runner_or_default(runner=None):
@@ -137,7 +148,7 @@ def owning_venv_python(site_packages: Path) -> Path | None:
 def probe_runtime_env(python: str, home: Path, runner=None) -> tuple[Path | None, str]:
     """(venv python whose site-packages the bootstrapped Hermes process imports from, what was seen)."""
     runner = _runner_or_default(runner)
-    command = [python, "-I", "-c", _SITE_PROBE_SCRIPT, str(hermes_runtime.hermes_agent_dir(home)), str(home / "plugins")]
+    command = runtime_check_command(python, home, SITE_CHECK)
     env = hermes_process_env(home)
     try:
         done = runner(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -184,10 +195,15 @@ def hermes_process_env(home: Path) -> dict:
     return {**os.environ, "HERMES_HOME": str(home), "PYTHONIOENCODING": "utf-8"}
 
 
-def provider_import_error(python: str, home: Path, runner=None, check: str = _LOAD_CHECK_SCRIPT) -> str | None:
-    """Run *check* (default _LOAD_CHECK_SCRIPT) in the bootstrapped runtime python; the failure text, or None."""
+def runtime_check_command(python: str, home: Path, check: tuple[str, ...]) -> list[str]:
+    """neospike.runtime_check *check* through the installed plugin's hermes_launch.py."""
+    return runtime_target_command(python, home, [runtime_check.MODULE, *check])
+
+
+def provider_import_error(python: str, home: Path, runner=None, check: tuple[str, ...] = LOAD_CHECK) -> str | None:
+    """Run *check* (default LOAD_CHECK) in the bootstrapped runtime python; the failure text, or None."""
     runner = _runner_or_default(runner)
-    command = [python, "-I", "-c", check, str(hermes_runtime.hermes_agent_dir(home)), str(home / "plugins")]
+    command = runtime_check_command(python, home, check)
     try:
         loaded = runner(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
                         timeout=PROBE_TIMEOUT_S, env=hermes_process_env(home))
@@ -226,7 +242,7 @@ def confirm_runtime_after_sync(hermes: str, home: Path, runner=None) -> str:
                          "Check the PM receipt with `hermes pm status`.")
     environment, seen = probe_runtime_env(python, home, runner)
     print(f"Hermes runtime environment after PM sync: {environment} ({seen})")
-    failure = provider_import_error(python, home, runner, _IMPORT_CHECK_SCRIPT)
+    failure = provider_import_error(python, home, runner, IMPORT_CHECK)
     if failure:
         raise SystemExit(
             "neospike provider import check failed after install.\n"
@@ -237,12 +253,38 @@ def confirm_runtime_after_sync(hermes: str, home: Path, runner=None) -> str:
     return python
 
 
-def neospike_cli_python(home: Path) -> str:
-    """The python the Dashboard, the cron scripts and the MCP server run the CLI with (hermes_runtime.cli_python)."""
-    try:
-        return hermes_runtime.cli_python(home)
-    except hermes_runtime.HermesRuntimeNotFound:
-        return str(hermes_runtime.checkout_python(home))
+def old_cli_distributions(home: Path) -> list[Path]:
+    """dist-info folders of the neospike package an earlier install.py put into the Hermes CLI venv."""
+    venv = hermes_runtime.hermes_agent_dir(home) / "venv"
+    return sorted(path for pattern in OLD_DIST_GLOBS for path in venv.glob(pattern))
+
+
+def old_cli_uninstall_argv(uv: str, home: Path) -> list[str] | None:
+    """`uv pip uninstall` of OLD_DISTRIBUTION alone from the Hermes CLI venv; None when nothing is there."""
+    if not old_cli_distributions(home):
+        return None
+    return [uv, "pip", "uninstall", "--python", str(hermes_runtime.checkout_python(home)), OLD_DISTRIBUTION]
+
+
+def remove_old_cli_install(home: Path) -> None:
+    """Uninstall the old package copy from the Hermes CLI venv (no other package is touched)."""
+    if not old_cli_distributions(home):
+        return
+    uv = shutil.which("uv")
+    if not uv:
+        raise SystemExit("uv is required to remove the old neospike package from the Hermes CLI venv "
+                         f"({hermes_runtime.checkout_python(home)})")
+    echo_and_run(old_cli_uninstall_argv(uv, home))
+
+
+def installed_launch_script(home: Path) -> Path:
+    """hermes_launch.py of the installed plugin copy (<home>/plugins/neospike)."""
+    return home / "plugins" / PLUGIN_FOLDER / hermes_runtime.LAUNCH_SCRIPT
+
+
+def runtime_target_command(python: str, home: Path, target: list[str]) -> list[str]:
+    """*target* through the installed plugin's hermes_launch.py on the Hermes runtime *python*."""
+    return hermes_runtime.launch_command(home, target, python=python, script=installed_launch_script(home))
 
 
 def copy_cron_scripts(home: Path) -> Path:
@@ -260,6 +302,49 @@ def seed_memory_rule(home: Path) -> Path:
     if not path.exists():
         write_memory_rule(home, read_memory_rule(home))
     return path
+
+
+def _top_level_block(text: str, name: str) -> list[str]:
+    """Indented lines under the top-level `<name>:` key of a YAML text (no PyYAML needed)."""
+    block, inside = [], False
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if not line[0].isspace():
+            inside = re.match(re.escape(name) + r":\s*(#.*)?$", line) is not None
+            continue
+        if inside:
+            block.append(line)
+    return block
+
+
+def pref_model_configured(home: Path) -> bool:
+    """True when <home>/config.yaml already has auxiliary.<PREF_MODEL_TASK> (any value, set by the user or earlier)."""
+    try:
+        text = (home / "config.yaml").read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return False
+    data = _yaml_data(text)
+    if isinstance(data, dict):
+        auxiliary = data.get(AUXILIARY_SECTION)
+        return isinstance(auxiliary, dict) and PREF_MODEL_TASK in auxiliary
+    child = re.compile(r"\s+['\"]?" + re.escape(PREF_MODEL_TASK) + r"['\"]?\s*:")
+    return any(child.match(line) for line in _top_level_block(text, AUXILIARY_SECTION))
+
+
+def pref_model_default_argv(hermes: str) -> list[str]:
+    return [hermes, "config", "set", f"{AUXILIARY_SECTION}.{PREF_MODEL_TASK}.provider", PREF_MODEL_DEFAULT]
+
+
+def homes_without_pref_model(home: Path) -> list[Path]:
+    return [owner for owner in target_homes(home) if not pref_model_configured(owner)]
+
+
+def apply_pref_model_default(hermes: str, home: Path) -> None:
+    """auxiliary.<PREF_MODEL_TASK>.provider = auto (follow the chat model) in every home that has no such key yet;
+    a value already there is never overwritten. HERMES_HOME pins each write to its home."""
+    for owner in homes_without_pref_model(home):
+        echo_and_run(pref_model_default_argv(hermes), env=hermes_process_env(owner))
 
 
 def read_cron_jobs(home: Path) -> dict[str, dict]:
@@ -331,18 +416,20 @@ def flatten_model_file(text_target: Path) -> None:
 
 
 def mcp_server_entry(python: str, home: Path) -> dict:
-    """The neospike MCP server entry, same shape as the hand-made registration."""
+    """The neospike MCP server entry, same shape as the hand-made registration. The Hermes runtime *python*
+    starts the installed plugin's hermes_launch.py (-I: no launch folder, PYTHONPATH or user site on
+    sys.path), which selects the current dependency environment at every start; no environment folder is
+    written here."""
     namespace = pick_namespace(None, memory_db_path(home))
+    command = runtime_target_command(python, home, [MCP_MODULE, "--home", str(home), "--owner", namespace])
     return {
         "type": "stdio",
-        "command": python,
-        # -P: keep the launch folder off sys.path so a same-named package there is never imported.
-        "args": ["-P", "-m", "neospike.mcp_server", "--home", str(home), "--owner", namespace],
+        "command": command[0],
+        "args": command[1:],
         "env": {
             "HERMES_HOME": str(home),
             "HERMES_BGE_M3_DIR": str(shared_inference_home(home) / "models" / MODEL_FOLDER),
             "PYTHONIOENCODING": "utf-8",
-            "PYTHONPATH": str(home / "plugins"),
         },
     }
 
@@ -569,7 +656,28 @@ def old_install_traces(home: Path) -> list[str]:
     traces += [f"Old cron script remains: {home / 'scripts' / name}" for name in DROPPED_FILES
                if (home / "scripts" / name).is_file()]
     traces += [f"Old names remain in skill file: {path}" for path in skills_with_old_names(home)]
+    traces += [f"Old neospike package remains in the Hermes CLI venv: {path} (rerun install.py)"
+               for path in old_cli_distributions(home)]
+    traces += [f"Old install folder remains: {path} (Hermes's plugin discovery takes it for the neospike plugin "
+               "and skips the real one; rerun install.py)" for path in plugin_leftovers(home)]
     return traces
+
+
+def install_scratch(home: Path) -> Path:
+    """Where install.py stages the new plugin copy and keeps the previous one (outside <home>/plugins)."""
+    return home / DATA_FOLDER / INSTALL_SCRATCH_FOLDER
+
+
+def plugin_leftovers(home: Path) -> list[Path]:
+    """PLUGIN_LEFTOVERS present in <home>/plugins."""
+    plugins = home / "plugins"
+    return [plugins / name for name in PLUGIN_LEFTOVERS if (plugins / name).exists() or (plugins / name).is_symlink()]
+
+
+def old_cache_keys(home: Path) -> list[str]:
+    """OLD_CACHE_KEYS still present in runtime.json."""
+    cached = hermes_runtime.read_cache(home)
+    return [key for key in OLD_CACHE_KEYS if key in cached]
 
 
 def migration_preview(hermes: str, home: Path) -> list[str]:
@@ -577,8 +685,170 @@ def migration_preview(hermes: str, home: Path) -> list[str]:
     lines = [subprocess.list2cmdline(command) for command in old_cron_remove_argv(hermes, home)]
     lines += [f"remove {home / 'scripts' / name}" for name in DROPPED_FILES if (home / "scripts" / name).is_file()]
     lines += [f"rename old names in {path} (copy in the backup zip first)" for path in skills_with_old_names(home)]
+    uninstall = old_cli_uninstall_argv(shutil.which("uv") or "uv", home)
+    lines += [subprocess.list2cmdline(uninstall)] if uninstall else []
+    lines += [f"remove {key} from {hermes_runtime.cache_file(home)}" for key in old_cache_keys(home)]
+    lines += [f"remove {path}" for path in plugin_leftovers(home)]
     return lines
 
+
+# ---- --uninstall: what install.py made outside the plugin folder goes too; the user's data and the model stay.
+# Every step skips what is already gone, so a rerun (or a run after a partial uninstall) is safe.
+def _plan_or_run(command: list[str], dry_run: bool, env: dict | None = None) -> None:
+    """Print *command* as a '+' line; run it (check=True) unless *dry_run*."""
+    if dry_run:
+        print("+", subprocess.list2cmdline(command))
+        return
+    echo_and_run(command, **({"env": env} if env is not None else {}))
+
+
+def _plan_or_remove(path: Path, dry_run: bool) -> None:
+    """'+ remove <path>'; the file or folder is deleted unless *dry_run*."""
+    print("+ remove", path)
+    if dry_run:
+        return
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def uninstall_cron(hermes: str, home: Path, dry_run: bool) -> None:
+    """Step 1 (root home only; a profile install registers no job): `hermes cron remove` of the daily job, then
+    the cron scripts in <home>/scripts."""
+    if skip_cron_for_profile(home):
+        return
+    profiles = target_homes(home)[1:]
+    if profiles:
+        print(f"The daily job also served {', '.join(map(str, profiles))}; reinstall in the root home to keep it.")
+    record = read_cron_jobs(home).get(DAILY_JOB_NAME)
+    if record is None:
+        print(f"Cron job {DAILY_JOB_NAME}: not registered (skipped)")
+    else:
+        _plan_or_run([hermes, "cron", "remove", str(record.get("id") or record.get("name"))], dry_run,
+                     hermes_process_env(home))
+    for name in CRON_FILES:
+        script = home / "scripts" / name
+        if script.is_file():
+            _plan_or_remove(script, dry_run)
+
+
+def mcp_points_at(claude: str, home: Path, runner=None) -> bool:
+    """True when Claude Code has the neospike MCP server and its entry names *home* (`claude mcp get`, read only)."""
+    runner = _runner_or_default(runner)
+    try:
+        shown = runner([claude, "mcp", "get", MCP_SERVER_NAME], capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", timeout=PROBE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return shown.returncode == 0 and os.path.normcase(str(home)) in os.path.normcase(shown.stdout or "")
+
+
+def uninstall_mcp(home: Path, dry_run: bool, runner=None) -> None:
+    """Step 2: `claude mcp remove`, only when the user-scope entry points at *home* (never for a profile home)."""
+    if skip_mcp_for_profile(home):
+        return
+    claude = shutil.which("claude")
+    if not claude:
+        print(f"Claude Code (claude) not found; MCP server {MCP_SERVER_NAME} left as it is.")
+        return
+    if not mcp_points_at(claude, home, runner):
+        print(f"Claude Code MCP server {MCP_SERVER_NAME}: not registered for {home} (skipped)")
+        return
+    _plan_or_run([claude, "mcp", "remove", "-s", MCP_REG_SCOPE, MCP_SERVER_NAME], dry_run)
+
+
+def uninstall_daemon(home: Path, dry_run: bool) -> None:
+    """Step 3: ask the shared embedding service to stop, unless another home still uses Neospike."""
+    shared = shared_inference_home(home)
+    users = inference.daemon_users(home)
+    if users:
+        print(f"Embedding service of {shared} left running: still used by {', '.join(map(str, users))}")
+        return
+    if dry_run:
+        print(f"+ ask the embedding service of {shared} to stop (when it runs)")
+        return
+    try:
+        state, _users = inference.release_daemon(home)
+    except OSError as exc:
+        print(f"Embedding service of {shared} could not be asked to stop: {exc}")
+        return
+    print(f"Embedding service of {shared}: {'asked to stop' if state == inference.DAEMON_STOPPED else 'not running'}")
+
+
+def unlist_plugin_enabled(home: Path, dry_run: bool = False) -> bool:
+    """Remove PLUGIN_FOLDER from plugins.enabled in <home>/config.yaml (True = it was listed). Only for a home
+    whose plugin folder is already gone (`hermes plugins remove` does it otherwise). Edited as text, like
+    list_plugin_enabled."""
+    path = home / "config.yaml"
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return False
+    lines = raw.decode("utf-8-sig").splitlines(keepends=True)
+    key, items = _find_enabled_lines(lines)
+    if key is None:
+        return False
+    flow = re.match(r"(\s*enabled:\s*\[)([^\]]*)(\].*)$", lines[key], re.S)
+    if flow:
+        names = [part for part in flow.group(2).split(",") if part.strip()]
+        kept = [part.strip() for part in names if _scalar_of(part) != PLUGIN_FOLDER]
+        if len(kept) == len(names):
+            return False
+        lines[key] = flow.group(1) + ", ".join(kept) + flow.group(3)
+    else:
+        listed = [index for index in items if _scalar_of(lines[index].lstrip()[2:]) == PLUGIN_FOLDER]
+        if not listed:
+            return False
+        for index in reversed(listed):
+            del lines[index]
+    if not dry_run:
+        path.write_bytes((BOM_BYTES if raw.startswith(BOM_BYTES) else b"") + "".join(lines).encode("utf-8"))
+    print(f"{'+ remove' if dry_run else 'Removed'} {PLUGIN_FOLDER} from plugins.enabled in {path}")
+    return True
+
+
+def uninstall_plugin(hermes: str, home: Path, dry_run: bool) -> None:
+    """Step 4: `hermes plugins remove neospike` deletes <home>/plugins/neospike and clears plugins.enabled /
+    plugins.disabled and a memory.provider naming it (hermes_cli/plugins_cmd.py _forget_plugin_config). With the
+    folder already gone: `hermes memory off` when memory.provider is still neospike, and plugins.enabled edited.
+    Then the install scratch (the previous plugin copy) and what an earlier install left in <home>/plugins."""
+    env = hermes_process_env(home)
+    target = home / "plugins" / PLUGIN_FOLDER
+    if target.exists() or target.is_symlink():
+        _plan_or_run([hermes, "plugins", "remove", PLUGIN_FOLDER], dry_run, env)
+    else:
+        print(f"Plugin folder {target}: not there (skipped)")
+        if configured_memory_provider(home) == PROVIDER_ID:
+            _plan_or_run([hermes, "memory", "off"], dry_run, env)
+        unlist_plugin_enabled(home, dry_run)
+    for leftover in plugin_leftovers(home):
+        _plan_or_remove(leftover, dry_run)
+    if install_scratch(home).exists():
+        _plan_or_remove(install_scratch(home), dry_run)
+
+
+def print_kept_data(home: Path) -> None:
+    """Step 5: the user's data and the model stay; where they are and how to delete them."""
+    data = home / DATA_FOLDER
+    model = shared_inference_home(home) / "models" / MODEL_FOLDER
+    print(f"Kept your Neospike data (memories, notes, conversations, backups): {data}")
+    print(f"Kept the model{' (shared with the root home)' if is_profile(home) else ''}: {model}")
+    print("To delete them for good, delete those folders yourself; the model folder is shared by every Neospike "
+          "home, so delete it only when no home uses Neospike any more.")
+
+
+def run_uninstall(hermes: str, home: Path, dry_run: bool) -> int:
+    """--uninstall (with --dry-run: the plan only, nothing changed)."""
+    print(f"Neospike uninstall of {home}{' (dry run: nothing is changed)' if dry_run else ''}")
+    uninstall_cron(hermes, home, dry_run)
+    uninstall_mcp(home, dry_run)
+    uninstall_daemon(home, dry_run)
+    uninstall_plugin(hermes, home, dry_run)
+    print_kept_data(home)
+    if not dry_run:
+        print("Uninstalled. Restart the Hermes gateway (hermes gateway restart) so it stops loading Neospike.")
+    return 0
 
 
 def _parse_args() -> argparse.Namespace:
@@ -589,7 +859,16 @@ def _parse_args() -> argparse.Namespace:
     cli.add_argument("--check", action="store_true", help="Only verify an existing installation")
     cli.add_argument("--dry-run", action="store_true",
                      help="Print the cron scripts and cron commands; change nothing")
+    cli.add_argument("--uninstall", action="store_true",
+                     help="Remove Neospike from --home (cron job, Claude Code MCP entry, plugin folder); "
+                          "your data and the model stay. With --dry-run: print the plan only")
     return cli.parse_args()
+
+
+def _dry_run_python(home: Path) -> str:
+    """The cached runtime python for the --dry-run lines (no launcher run), else a placeholder."""
+    cached = hermes_runtime.read_cache(home).get(hermes_runtime.CACHE_RUNTIME)
+    return cached if isinstance(cached, str) and cached else DRY_RUN_PYTHON
 
 
 def _print_dry_run(hermes: str, home: Path) -> None:
@@ -597,16 +876,19 @@ def _print_dry_run(hermes: str, home: Path) -> None:
     for step in migration_preview(hermes, home):
         print("+", step)
     print("+", subprocess.list2cmdline(enable_plugin_argv(hermes)))
+    print("+", subprocess.list2cmdline(runtime_check_command(_dry_run_python(home), home, IMPORT_CHECK)))
     for owner in target_homes(home):
         if not memory_rule_file_path(owner).exists():
             print("+ create", memory_rule_file_path(owner))
+    for owner in homes_without_pref_model(home):
+        print("+", f"HERMES_HOME={owner}", subprocess.list2cmdline(pref_model_default_argv(hermes)))
     if not skip_cron_for_profile(home):
         for name in CRON_FILES:
             print("+ copy", CRON_SRC_DIR / name, "->", home / "scripts" / name)
         for argv in cron_argv_list(hermes, home):
             print("+", subprocess.list2cmdline(argv))
     if not skip_mcp_for_profile(home):
-        for argv in mcp_argv_list(shutil.which("claude") or "claude", neospike_cli_python(home), home):
+        for argv in mcp_argv_list(shutil.which("claude") or "claude", _dry_run_python(home), home):
             print("+", subprocess.list2cmdline(argv))
 
 
@@ -626,44 +908,54 @@ def _run_check(home: Path, hermes: str, required: list[Path], plugin_yaml: Path)
     return 0
 
 
-def _pick_cli_python(hermes: str, home: Path) -> tuple[Path, str | None]:
-    """(CLI python, runtime python). The gateway imports from the PM environment venv, not the
-    checkout venv."""
+def _pick_runtime_python(hermes: str, home: Path) -> str:
+    """The Hermes runtime python every Neospike process outside the gateway starts with (hermes_launch.py)."""
     runtime, source = find_runtime_python(hermes, home, subprocess.run)
-    environment, seen = probe_runtime_env(runtime, home, subprocess.run) if runtime else (None, source)
-    if environment is None:
-        raise SystemExit(f"Hermes runtime environment not found ({seen}).")
-    print(f"Hermes runtime environment: {environment} ({seen})")
-    # HERMES_PYTHON / runtime.json / checkout venv; without one (macOS Desktop) the PM venv.
-    try:
-        chosen = Path(hermes_runtime.cli_python(home))
-    except hermes_runtime.HermesRuntimeNotFound as exc:
-        print(f"{exc}\nUsing the Hermes runtime environment for the Neospike CLI: {environment}")
-        chosen = environment
-    if not chosen.is_file():
-        raise SystemExit(f"Neospike CLI python not found: {chosen}. Set HERMES_PYTHON to the Hermes venv python.")
-    return chosen, runtime
+    if runtime is None:
+        raise SystemExit(f"Hermes runtime python not found ({source}).")
+    print(f"Hermes runtime python: {runtime} ({source})")
+    return runtime
 
 
-def _swap_in_plugin(source_dir: Path, plugin_target: Path) -> None:
-    """Copy the package next to the target, then move it into place; the old copy stays as neospike.previous."""
-    staging = plugin_target.with_name("neospike.installing")
-    shutil.rmtree(staging, ignore_errors=True)
+def _remove_tree(path: Path) -> None:
+    """Delete a folder (or a link to one) if it is there."""
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _swap_in_plugin(source_dir: Path, plugin_target: Path, scratch: Path) -> None:
+    """Copy the package to scratch/staging, move the installed copy to scratch/previous (replacing the one
+    kept there), then move staging into place; if that last move fails, the installed copy goes back.
+    Folders an earlier install left in <home>/plugins are deleted first."""
+    for name in PLUGIN_LEFTOVERS:
+        leftover = plugin_target.with_name(name)
+        if leftover.exists() or leftover.is_symlink():
+            _remove_tree(leftover)
+            print(f"Removed {leftover} (it shadowed the plugin in Hermes's plugin discovery)")
+    staging, previous = scratch / STAGING_FOLDER, scratch / PREVIOUS_FOLDER
+    scratch.mkdir(parents=True, exist_ok=True)
+    _remove_tree(staging)
     shutil.copytree(source_dir, staging, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    if plugin_target.exists():
-        previous = plugin_target.with_name("neospike.previous")
-        shutil.rmtree(previous, ignore_errors=True)
+    moved_old = plugin_target.exists()
+    if moved_old:
+        _remove_tree(previous)
         plugin_target.replace(previous)
-    staging.replace(plugin_target)
+    try:
+        staging.replace(plugin_target)
+    except OSError:
+        if moved_old:
+            previous.replace(plugin_target)
+        raise
 
 
-def _download_models(python: Path, model_dir: Path) -> None:
-    hf_cli = python.parent / ("hf.exe" if os.name == "nt" else "hf")
-    if not hf_cli.is_file():
-        raise SystemExit("Hugging Face CLI was not installed into the Hermes venv")
+def _download_models(python: str, home: Path, model_dir: Path) -> None:
+    """`hf download` as a module of the PM environment (plugin.yaml huggingface-hub), so no hf executable
+    path of an environment folder is needed."""
     model_dir.mkdir(parents=True, exist_ok=True)
-    fetch = [str(hf_cli), "download", MODEL_REPO, *MODEL_DOWNLOADS,
-             "--revision", MODEL_REVISION, "--local-dir", str(model_dir)]
+    fetch = runtime_target_command(python, home, [HF_CLI_MODULE, "download", MODEL_REPO, *MODEL_DOWNLOADS,
+                                                  "--revision", MODEL_REVISION, "--local-dir", str(model_dir)])
     try:
         echo_and_run(fetch)
         flatten_model_file(model_dir)
@@ -681,6 +973,8 @@ def main() -> int:
 
     plugin_target = home / "plugins" / "neospike"
     model_dir = shared_inference_home(home) / "models" / MODEL_FOLDER
+    if args.uninstall:
+        return run_uninstall(hermes, home, args.dry_run)
     if args.dry_run:
         # The venv's own hermes script is bound to a build-time snapshot; cron goes through the user's launcher.
         _print_dry_run(hermes, home)
@@ -689,24 +983,21 @@ def main() -> int:
         needed = [plugin_target / "plugin.yaml", model_dir / MODEL_ONNX_NAME, model_dir / "tokenizer.json"]
         return _run_check(home, hermes, needed, plugin_target / "plugin.yaml")
 
-    uv_exe = shutil.which("uv")
-    if not uv_exe:
-        raise SystemExit("uv is required because Hermes venvs may not include pip")
     repo_root = Path(__file__).resolve().parent
     migrate_skill_names(home)
-    python, runtime = _pick_cli_python(hermes, home)
-    echo_and_run([uv_exe, "pip", "install", "--python", str(python), str(repo_root)])
-    hermes_runtime.write_cache(home, {hermes_runtime.CACHE_RUNTIME: runtime, hermes_runtime.CACHE_CLI: str(python)})
+    runtime = _pick_runtime_python(hermes, home)
+    hermes_runtime.write_cache(home, {hermes_runtime.CACHE_RUNTIME: runtime}, drop=OLD_CACHE_KEYS)
+    remove_old_cli_install(home)
 
     plugin_target.parent.mkdir(exist_ok=True, parents=True)
-    _swap_in_plugin(repo_root / "neospike", plugin_target)
+    _swap_in_plugin(repo_root / "neospike", plugin_target, install_scratch(home))
     list_plugin_enabled(home)
     for owner in target_homes(home):  # the root and every profile (bot) that uses neospike
         seed_memory_rule(owner)
-    # numpy comes from plugin.yaml python_dependencies through the Hermes PM, never a direct pip install.
+    # PLUGIN_PIP_REQUIREMENTS come from plugin.yaml python_dependencies through the Hermes PM, never a direct pip install.
     echo_and_run(enable_plugin_argv(hermes), env=hermes_process_env(home))
     if not args.skip_models:
-        _download_models(python, model_dir)
+        _download_models(runtime, home, model_dir)
 
     # imports only (not is_available), before memory.provider points at neospike.
     runtime = confirm_runtime_after_sync(hermes, home, subprocess.run)
@@ -714,11 +1005,12 @@ def main() -> int:
 
     # HERMES_HOME pins the write to --home (without it Hermes picks its default home).
     echo_and_run([hermes, "config", "set", "memory.provider", PROVIDER_ID], env=hermes_process_env(home))
+    apply_pref_model_default(hermes, home)
     purge_old_crons(hermes, home)
     if not skip_cron_for_profile(home):
         copy_cron_scripts(home)
         apply_cron_jobs(hermes, home)
-    apply_mcp_registration(str(python), home)
+    apply_mcp_registration(runtime, home)
     print("Installed. Restart the Hermes gateway (hermes gateway restart), then run: python install.py --check")
     return 0
 

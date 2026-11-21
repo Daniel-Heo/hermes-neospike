@@ -15,6 +15,14 @@ HEALTHY_STATUS = "  Provider:  neospike\n\n  Plugin:    installed ✓\n  Status:
 BROKEN_STATUS = "  Provider:  neospike\n\n  Plugin:    NOT installed ✗\n"
 IMPORT_ERROR = ("ImportError: neospike needs numpy. Environment without numpy: x\\Lib\\site-packages. "
                 "Run `python install.py` again from the neospike repository.")
+CHECK_MODULE = "neospike.runtime_check"
+
+
+def _runtime_check_of(command: list[str]) -> list[str] | None:
+    """`<check> [names...]` of a neospike.runtime_check run through hermes_launch.py, else None."""
+    if len(command) > 5 and Path(command[2]).name == "hermes_launch.py" and command[4] == CHECK_MODULE:
+        return command[5:]
+    return None
 
 
 def _install_module():
@@ -57,7 +65,7 @@ class _FakeRunner:
             return subprocess.CompletedProcess(command, 0, self.status, "")
         if command[1:] == ["--print-runtime-command"]:
             return subprocess.CompletedProcess(command, 0, json.dumps([RUNTIME_PYTHON, "-I", "-c", "..."]), "")
-        if len(command) > 3 and "json.dumps" in command[3]:  # the environment probe
+        if _runtime_check_of(command) == ["sites"]:  # the environment probe
             return subprocess.CompletedProcess(command, 0, "bootstrap noise\n" + json.dumps(self.sites), "")
         if command[1:3] == ["config", "set"]:  # what `hermes config set memory.provider X` leaves in config.yaml
             config = Path(kwargs.get("env", {}).get("HERMES_HOME", "")) / "config.yaml"
@@ -66,7 +74,7 @@ class _FakeRunner:
                 config.write_text(re.sub(r"(?m)^  provider: .*$", f"  provider: {command[4]}", text, count=1),
                                   encoding="utf-8")
             return subprocess.CompletedProcess(command, 0, "", "")
-        if command[1:4] == ["pip", "install", "--python"]:
+        if command[1:4] in (["pip", "install", "--python"], ["pip", "uninstall", "--python"]):
             return subprocess.CompletedProcess(command, 0, "", "")
         if command[1:3] == ["cron", "remove"]:  # removal of the dropped weekly job
             _remove_job(Path(kwargs["env"]["HERMES_HOME"]), command[3])
@@ -90,7 +98,7 @@ def test_check_fails_on_status_or_import(tmp_path, monkeypatch, status, import_c
     runner = _FakeRunner(status, import_code)
     failures = install.audit_installation(tmp_path, "hermes", [], runner)
     assert runner.commands[-1][0] == RUNTIME_PYTHON  # the import ran in the launcher's python, not the venv
-    assert "is_available()" in runner.commands[-1][3]  # --check keeps the is_available assertion
+    assert _runtime_check_of(runner.commands[-1]) == ["provider"]  # --check keeps the is_available assertion
     if expected is None:
         assert failures == []
     else:
@@ -115,15 +123,20 @@ def _runtime_venv(root: Path) -> tuple[Path, Path]:
     return venv / "Lib" / "site-packages", venv / "Scripts" / "python.exe"
 
 
-def test_checks_run_through_hermes_bootstrap(tmp_path, monkeypatch):
-    """The provider import and the environment probe see the bootstrapped sys.path."""
+def test_checks_run_through_the_installed_launch_script(tmp_path, monkeypatch):
+    """The provider check and the environment probe start like every other Neospike process:
+    the installed copy's hermes_launch.py on the runtime python, with the Hermes checkout."""
     monkeypatch.delenv("HERMES_PYTHON", raising=False)
+    monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
     install = _install_module()
     site, _ = _runtime_venv(tmp_path)
     runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
     assert install.audit_installation(tmp_path, "hermes", [], runner) == []
-    assert "import hermes_bootstrap" in runner.commands[-1][3]
-    assert runner.commands[-1][4:] == [str(tmp_path / "hermes-agent"), str(tmp_path / "plugins")]
+    launched = [RUNTIME_PYTHON, "-I", str(tmp_path / "plugins" / "neospike" / "hermes_launch.py"),
+                str(tmp_path / "hermes-agent"), CHECK_MODULE]
+    checks = [command for command in runner.commands if _runtime_check_of(command)]
+    assert [command[:5] for command in checks] == [launched, launched]
+    assert [_runtime_check_of(command) for command in checks] == [["sites"], ["provider"]]
 
 
 def test_runtime_environment_is_the_venv_owning_site_packages(tmp_path):
@@ -132,38 +145,48 @@ def test_runtime_environment_is_the_venv_owning_site_packages(tmp_path):
     runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
     environment, seen = install.probe_runtime_env(RUNTIME_PYTHON, tmp_path, runner)
     assert environment == python and str(site) in seen
-    assert runner.commands[0][0] == RUNTIME_PYTHON and "import hermes_bootstrap" in runner.commands[0][3]
+    assert runner.commands[0][0] == RUNTIME_PYTHON and _runtime_check_of(runner.commands[0]) == ["sites"]
     environment, _ = install.probe_runtime_env(RUNTIME_PYTHON, tmp_path, _FakeRunner(HEALTHY_STATUS, 0, []))
     assert environment is None
 
 
-def test_profile_home_probes_the_root_hermes_agent(tmp_path):
+def test_profile_home_probes_the_root_hermes_agent(tmp_path, monkeypatch):
     """hermes-agent lives only in the root home; plugins stay the profile's own."""
+    monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
     install = _install_module()
     profile = tmp_path / "profiles" / "design"
     runner = _FakeRunner(HEALTHY_STATUS, 0, [])
     install.probe_runtime_env(RUNTIME_PYTHON, profile, runner)
-    assert runner.commands[0][4:] == [str(tmp_path / "hermes-agent"), str(profile / "plugins")]
+    assert runner.commands[0][2:4] == [str(profile / "plugins" / "neospike" / "hermes_launch.py"),
+                                       str(tmp_path / "hermes-agent")]
 
 
-def test_install_leaves_numpy_to_the_hermes_pm(tmp_path, monkeypatch):
-    """install.py keeps the checkout-venv install; numpy reaches the gateway's PM environment through
-    plugin.yaml python_dependencies, never a direct pip install (test_install_pm_deps.py)."""
+def _old_cli_copy(home: Path) -> Path:
+    """The dist-info an earlier install.py's `uv pip install` left in the Hermes CLI venv."""
+    dist = home / "hermes-agent" / "venv" / "Lib" / "site-packages" / "neospike-1.6.0+multios.1.dist-info"
+    dist.mkdir(parents=True)
+    return dist
+
+
+def test_install_never_pip_installs_and_removes_the_old_cli_copy(tmp_path, monkeypatch):
+    """numpy and the rest reach the PM environment through plugin.yaml python_dependencies only; the package
+    copy an earlier install put into the Hermes CLI venv is uninstalled, that one distribution alone."""
     install = _install_module()
     home = tmp_path / "home"
     checkout = home / "hermes-agent" / "venv" / "Scripts" / "python.exe"
     checkout.parent.mkdir(parents=True)
     checkout.write_text("", encoding="utf-8")
-    site, runtime_venv_python = _runtime_venv(home)
+    _old_cli_copy(home)
+    site, _ = _runtime_venv(home)
     runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
     monkeypatch.setenv("HERMES_PYTHON", str(checkout))
     monkeypatch.setattr(install.subprocess, "run", runner)
     monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes", "uv": "uv"}.get)
     monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
     assert install.main() == 0
-    installs = [command for command in runner.commands if command[1:3] == ["pip", "install"]]
-    assert len(installs) == 1 and installs[0][3:5] == ["--python", str(checkout)]
-    assert not any(str(runtime_venv_python) in command for command in installs)
+    assert not any(command[1:3] == ["pip", "install"] for command in runner.commands)
+    removals = [command for command in runner.commands if command[1:3] == ["pip", "uninstall"]]
+    assert removals == [["uv", "pip", "uninstall", "--python", str(checkout), "neospike"]]
     assert set(install.cron_name_set(home)) == {install.DAILY_JOB_NAME}  # a new install has no weekly job
     assert (home / "neospike" / "MEMORY_RULE.md").read_text(encoding="utf-8").startswith("Store with high recall")
     assert not any("update_job" in " ".join(command) for command in runner.commands)
@@ -197,6 +220,30 @@ def test_install_removes_the_weekly_job_and_scripts(tmp_path, monkeypatch):
     assert [command[3] for command in edits] == [install.DAILY_JOB_NAME]
 
 
+def test_install_without_an_old_cli_copy_needs_no_uv(tmp_path, monkeypatch):
+    install = _install_module()
+    home = tmp_path / "home"
+    site, _ = _runtime_venv(home)
+    runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
+    monkeypatch.delenv("HERMES_PYTHON", raising=False)
+    monkeypatch.setattr(install.subprocess, "run", runner)
+    monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes"}.get)
+    monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
+    assert install.main() == 0
+    assert not any(command[1:2] == ["pip"] for command in runner.commands)
+
+
+def test_check_and_dry_run_report_the_old_cli_copy(tmp_path, monkeypatch):
+    install = _install_module()
+    dist = _old_cli_copy(tmp_path)
+    assert f"Old neospike package remains in the Hermes CLI venv: {dist} (rerun install.py)" in \
+        install.old_install_traces(tmp_path)
+    monkeypatch.setattr(install.shutil, "which", {"uv": "uv"}.get)
+    python = tmp_path / "hermes-agent" / "venv" / "Scripts" / "python.exe"
+    expected = subprocess.list2cmdline(["uv", "pip", "uninstall", "--python", str(python), "neospike"])
+    assert expected in install.migration_preview("hermes", tmp_path)
+
+
 def test_check_reports_a_left_over_weekly_job(tmp_path):
     install = _install_module()
     _add_job(tmp_path, "neospike-weekly-review")
@@ -204,7 +251,8 @@ def test_check_reports_a_left_over_weekly_job(tmp_path):
 
 
 # macOS layout (no checkout venv) and the Claude Code MCP registration ------------------------------
-def test_install_without_checkout_venv_uses_the_runtime_environment(tmp_path, monkeypatch):
+def test_install_without_checkout_venv_caches_only_the_runtime_python(tmp_path, monkeypatch):
+    """runtime.json keeps the launcher's runtime python, never an environment folder."""
     install = _install_module()
     home = tmp_path / "home"
     site, runtime_venv_python = _runtime_venv(home)
@@ -215,10 +263,73 @@ def test_install_without_checkout_venv_uses_the_runtime_environment(tmp_path, mo
     monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes", "uv": "uv"}.get)
     monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
     assert install.main() == 0
-    installs = [command for command in runner.commands if command[1:3] == ["pip", "install"]]
-    assert len(installs) == 1 and installs[0][3:5] == ["--python", str(runtime_venv_python)]
     cache = json.loads((home / "neospike" / "runtime.json").read_text(encoding="utf-8"))
-    assert cache == {"runtime_python": RUNTIME_PYTHON, "cli_python": str(runtime_venv_python)}
+    assert cache == {"runtime_python": RUNTIME_PYTHON}
+
+
+def _old_runtime_cache(home: Path) -> Path:
+    """runtime.json as an earlier install left it: the retired cli_python key next to a key kept as it is."""
+    cache = home / "neospike" / "runtime.json"
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"cli_python": r"C:\old\venv\Scripts\python.exe", "kept": 1}), encoding="utf-8")
+    return cache
+
+
+def test_install_removes_the_old_cli_python_key_and_keeps_the_rest(tmp_path, monkeypatch):
+    install = _install_module()
+    home = tmp_path / "home"
+    site, runtime_venv_python = _runtime_venv(home)
+    runtime_venv_python.write_text("", encoding="utf-8")
+    cache = _old_runtime_cache(home)
+    runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
+    monkeypatch.delenv("HERMES_PYTHON", raising=False)
+    monkeypatch.setattr(install.subprocess, "run", runner)
+    monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes", "uv": "uv"}.get)
+    monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
+    assert install.main() == 0
+    assert json.loads(cache.read_text(encoding="utf-8")) == {"kept": 1, "runtime_python": RUNTIME_PYTHON}
+
+
+def test_dry_run_only_prints_the_old_cli_python_removal(tmp_path, monkeypatch, capsys):
+    install = _install_module()
+    home = tmp_path / "home"
+    cache = _old_runtime_cache(home)
+    before = cache.read_bytes()
+    monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes"}.get)
+    monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--dry-run"])
+    monkeypatch.setattr(install, "locate_launcher", _FixedLauncher())
+    assert install.main() == 0
+    assert f"+ remove cli_python from {cache}" in capsys.readouterr().out.splitlines()
+    assert cache.read_bytes() == before
+
+
+class _FixedLauncher:
+    def __call__(self, home: Path) -> str:
+        return "hermes"
+
+
+def test_mcp_registration_names_no_dependency_environment(tmp_path, monkeypatch):
+    """The registered MCP command survives a PM environment change: runtime python + hermes_launch.py of the
+    installed plugin + checkout, and no installs/<id>/environments/<hash> path anywhere in it."""
+    install = _install_module()
+    home = tmp_path / "home"
+    site, runtime_venv_python = _runtime_venv(home)
+    runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
+    monkeypatch.delenv("HERMES_PYTHON", raising=False)
+    monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
+    monkeypatch.setattr(install.subprocess, "run", runner)
+    monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes", "claude": "claude"}.get)
+    monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
+    assert install.main() == 0
+    adds = [command for command in runner.commands if command[1:3] == ["mcp", "add-json"]]
+    assert len(adds) == 1
+    entry = json.loads(adds[0][6])
+    assert entry["command"] == RUNTIME_PYTHON
+    assert entry["args"][:4] == ["-I", str(home / "plugins" / "neospike" / "hermes_launch.py"),
+                                 str(home / "hermes-agent"), "neospike.mcp_server"]
+    assert (home / "plugins" / "neospike" / "hermes_launch.py").is_file()
+    for forbidden in ("environments", str(runtime_venv_python.parent.parent), "PYTHONPATH"):
+        assert forbidden not in adds[0][6], forbidden
 
 
 def test_mcp_registration_overwrites_with_the_hand_made_shape(tmp_path, monkeypatch):
@@ -230,16 +341,18 @@ def test_mcp_registration_overwrites_with_the_hand_made_shape(tmp_path, monkeypa
         return subprocess.CompletedProcess(command, 1, "", "No MCP server named neospike")
 
     monkeypatch.setattr(install.shutil, "which", {"claude": "claude"}.get)
-    install.apply_mcp_registration("/venv/python", tmp_path, runner)
+    monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
+    install.apply_mcp_registration("/runtime/python", tmp_path, runner)
     (remove, remove_check), (add, add_check) = calls
     assert remove == ["claude", "mcp", "remove", "-s", "user", "neospike"] and remove_check is False
     assert add[:6] == ["claude", "mcp", "add-json", "-s", "user", "neospike"] and add_check is True
     assert json.loads(add[6]) == {
-        "type": "stdio", "command": "/venv/python",
-        "args": ["-P", "-m", "neospike.mcp_server", "--home", str(tmp_path), "--owner", "default:local"],
+        "type": "stdio", "command": "/runtime/python",
+        "args": ["-I", str(tmp_path / "plugins" / "neospike" / "hermes_launch.py"), str(tmp_path / "hermes-agent"),
+                 "neospike.mcp_server", "--home", str(tmp_path), "--owner", "default:local"],
         "env": {"HERMES_HOME": str(tmp_path),
                 "HERMES_BGE_M3_DIR": str(tmp_path / "models" / "bge-m3-onnx"),
-                "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(tmp_path / "plugins")}}
+                "PYTHONIOENCODING": "utf-8"}}
     assert " " not in add[6]  # compact: survives claude.cmd / cmd.exe
 
 
@@ -249,13 +362,14 @@ def test_profile_home_models_are_the_root_models(tmp_path, monkeypatch):
     monkeypatch.delenv("NEOSPIKE_INFERENCE_HOME", raising=False)
     root = tmp_path.resolve()
     profile = root / "profiles" / "design"
-    env = install.mcp_server_entry("/venv/python", profile)["env"]
-    assert env["HERMES_BGE_M3_DIR"] == str(root / "models" / "bge-m3-onnx")
-    assert env["PYTHONPATH"] == str(profile / "plugins")
+    entry = install.mcp_server_entry("/runtime/python", profile)
+    assert entry["env"]["HERMES_BGE_M3_DIR"] == str(root / "models" / "bge-m3-onnx")
+    assert entry["args"][1] == str(profile / "plugins" / "neospike" / "hermes_launch.py")  # plugins: the profile's
 
 
-def test_mcp_server_entry_starts_with_safe_path_flag(tmp_path):
-    assert _install_module().mcp_server_entry("/venv/python", tmp_path)["args"][0] == "-P"
+def test_mcp_server_entry_starts_isolated(tmp_path):
+    """-I: no launch folder, PYTHONPATH or user site on sys.path, as in the Hermes launcher."""
+    assert _install_module().mcp_server_entry("/runtime/python", tmp_path)["args"][0] == "-I"
 
 
 def test_mcp_registration_is_skipped_without_claude(tmp_path, monkeypatch, capsys):
@@ -401,3 +515,70 @@ def test_install_writes_memory_rule_into_every_neospike_profile(tmp_path, monkey
         install.seed_memory_rule(target)
     assert (tmp_path / "neospike" / "MEMORY_RULE.md").is_file() and (bot / "neospike" / "MEMORY_RULE.md").is_file()
     assert not (other / "neospike").exists()
+
+
+# Hermes scans every folder in <home>/plugins as a plugin: a stray copy with the same manifest name
+# shadows the real folder, so install scratch lives in the data folder ------------------------------
+def _neospike_folders(plugins: Path) -> list[str]:
+    return sorted(path.name for path in plugins.iterdir() if path.name.startswith("neospike"))
+
+
+def _old_plugin(plugins: Path) -> Path:
+    """An installed plugin plus the folders an earlier install.py left next to it."""
+    target = plugins / "neospike"
+    target.mkdir(parents=True)
+    (target / "old_marker.txt").write_text("old\n", encoding="utf-8")
+    for name in ("neospike.previous", "neospike.installing"):
+        (plugins / name).mkdir()
+        (plugins / name / "plugin.yaml").write_text("name: neospike\n", encoding="utf-8")
+    return target
+
+
+def test_install_leaves_only_the_plugin_folder_in_plugins(tmp_path, monkeypatch):
+    install = _install_module()
+    home = tmp_path / "home"
+    _old_plugin(home / "plugins")
+    site, _ = _runtime_venv(home)
+    runner = _FakeRunner(HEALTHY_STATUS, 0, [str(site)])
+    monkeypatch.delenv("HERMES_PYTHON", raising=False)
+    monkeypatch.setattr(install.subprocess, "run", runner)
+    monkeypatch.setattr(install.shutil, "which", {"hermes": "hermes"}.get)
+    monkeypatch.setattr(install.sys, "argv", ["install.py", "--home", str(home), "--skip-models"])
+    assert install.main() == 0
+    assert _neospike_folders(home / "plugins") == ["neospike"]
+    assert (home / "plugins" / "neospike" / "plugin.yaml").is_file()
+    assert not (home / "plugins" / "neospike" / "old_marker.txt").exists()
+    scratch = install.install_scratch(home)
+    assert (scratch / "previous" / "old_marker.txt").is_file() and not (scratch / "staging").exists()
+    assert install.old_install_traces(home) == []
+
+
+def test_check_and_dry_run_report_a_leftover_in_plugins(tmp_path, monkeypatch):
+    install = _install_module()
+    _old_plugin(tmp_path / "plugins")
+    traces = install.old_install_traces(tmp_path)
+    for name in ("neospike.previous", "neospike.installing"):
+        leftover = tmp_path / "plugins" / name
+        assert any(str(leftover) in trace and "plugin discovery" in trace for trace in traces), name
+        assert f"remove {leftover}" in install.migration_preview("hermes", tmp_path)
+
+
+def test_failed_swap_puts_the_old_copy_back(tmp_path, monkeypatch):
+    install = _install_module()
+    home = tmp_path / "home"
+    target = _old_plugin(home / "plugins")
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "plugin.yaml").write_text("name: neospike\n", encoding="utf-8")
+    real_replace = Path.replace
+
+    def failing_replace(self, destination):
+        if Path(destination) == target and self.name == "staging":
+            raise OSError("simulated failure")
+        return real_replace(self, destination)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    with pytest.raises(OSError, match="simulated failure"):
+        install._swap_in_plugin(source, target, install.install_scratch(home))
+    assert (target / "old_marker.txt").is_file() and not (target / "plugin.yaml").exists()
+    assert _neospike_folders(home / "plugins") == ["neospike"]

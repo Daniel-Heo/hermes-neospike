@@ -22,11 +22,12 @@ import os
 import signal
 import socket
 import stat
-import sys
 import time
 from pathlib import Path
 
-from .hermes_runtime import hermes_agent_dir, hermes_root_home
+from .hermes_runtime import hermes_root_home, launch_command
+
+INFERENCE_MODULE = "neospike.inference"
 
 IS_WINDOWS = os.name == "nt"
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
@@ -104,6 +105,11 @@ def open_nofollow(path, flags: int, mode: int = 0o777) -> int:
     return fd
 
 
+# A blocking flock (no LOCK_NB) on Windows retries every FLOCK_RETRY_SECONDS and gives up after
+# FLOCK_WAIT_SECONDS with TimeoutError; POSIX flock keeps its own unbounded wait.
+FLOCK_WAIT_SECONDS = 30.0
+FLOCK_RETRY_SECONDS = 0.05
+
 if IS_WINDOWS:
     import msvcrt
 
@@ -113,6 +119,9 @@ if IS_WINDOWS:
         LOCK_NB = 4
         LOCK_UN = 8
         _OFFSET = 0x7FFFFFFF
+
+        def __init__(self, wait_seconds: float = FLOCK_WAIT_SECONDS) -> None:
+            self.wait_seconds = wait_seconds
 
         def flock(self, target, operation: int) -> None:
             fd = target if isinstance(target, int) else target.fileno()
@@ -125,6 +134,7 @@ if IS_WINDOWS:
                     except OSError:
                         pass
                     return
+                deadline = time.monotonic() + self.wait_seconds
                 while True:
                     try:
                         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
@@ -132,7 +142,11 @@ if IS_WINDOWS:
                     except OSError as exc:
                         if operation & self.LOCK_NB:
                             raise BlockingIOError(exc.errno, "Lock is held by another process") from None
-                        time.sleep(0.05)
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            raise TimeoutError(
+                                f"Lock still held by another process after {self.wait_seconds:g} s") from None
+                        time.sleep(min(FLOCK_RETRY_SECONDS, left))
             finally:
                 os.lseek(fd, current, os.SEEK_SET)
 
@@ -213,20 +227,13 @@ def shared_inference_home(home) -> Path:
     return path if configured else hermes_root_home(path)
 
 
-def inference_python() -> str:
-    """Interpreter for the inference child.
-
-    On Windows the Hermes gateway runs inside a bundled runtime that does not
-    have the Neospike dependencies, so prefer the Hermes venv (HERMES_PYTHON).
-    """
-    if IS_WINDOWS:
-        candidates = [os.environ.get("HERMES_PYTHON")]
-        home = default_hermes_home()
-        candidates.append(str(hermes_agent_dir(home) / "venv" / "Scripts" / "python.exe"))
-        for candidate in candidates:
-            if candidate and Path(candidate).is_file():
-                return candidate
-    return sys.executable
+def inference_command(home, args: list[str], env: dict) -> list[str]:
+    """Command of the inference daemon: neospike.inference through hermes_launch.py on the Hermes runtime
+    python, so it imports from the dependency environment the Hermes package manager prepared.
+    Updates env in place (detached_interpreter)."""
+    command = launch_command(home, [INFERENCE_MODULE, *args])
+    command[0] = detached_interpreter(command[0], env)
+    return command
 
 
 def detached_interpreter(python: str, env: dict) -> str:
@@ -310,12 +317,51 @@ def launch_fd_args(fd: int) -> list[str]:
     return ["--launch-fd", str(fd)]
 
 
-def close_launch_fd(value: int) -> None:
+def close_launch_fd(value: int, guard_path) -> None:
+    """Release the launch guard that this process inherited as *value* (the --launch-fd argument).
+
+    On Windows a launcher between the starter and this process may have restarted the interpreter
+    through a new process (the Hermes bootstrap does so with subprocess when it switches interpreters),
+    which inherits no handle. There *value* names nothing, or an unrelated handle of this process, and
+    the ancestor that did inherit the guard releases it when it exits. So the handle is closed only
+    when it is the guard file itself.
+    """
     if IS_WINDOWS:
-        import _winapi
-        _winapi.CloseHandle(value)
+        if _handle_names_file(value, guard_path):
+            _CloseHandle(value)
     else:
         os.close(value)
+
+
+def _handle_names_file(handle: int, path) -> bool:
+    """True when *handle* is a valid disk-file handle of this process opened on *path*."""
+    # Only disk files are asked for a name: a query on a synchronous pipe handle can block.
+    if _GetFileType(handle) != _FILE_TYPE_DISK:
+        return False
+    size = _FINAL_PATH_CHARS
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        length = _GetFinalPathNameByHandleW(handle, buffer, size, 0)
+        if length == 0:
+            return False
+        if length < size:
+            break
+        size = length + 1
+    path = Path(path)
+    expected = os.path.join(os.path.realpath(path.parent), path.name)
+    return os.path.normcase(_strip_long_prefix(buffer.value)) == os.path.normcase(expected)
+
+
+def _strip_long_prefix(name: str) -> str:
+    if name.startswith(_LONG_UNC_PREFIX):
+        return "\\\\" + name[len(_LONG_UNC_PREFIX):]
+    return name[len(_LONG_PREFIX):] if name.startswith(_LONG_PREFIX) else name
+
+
+_FILE_TYPE_DISK = 0x0001
+_FINAL_PATH_CHARS = 512
+_LONG_PREFIX = "\\\\?\\"
+_LONG_UNC_PREFIX = "\\\\?\\UNC\\"
 
 
 def detached_popen_kwargs(fd: int) -> dict:
@@ -416,6 +462,9 @@ if IS_WINDOWS:
                                  _VOIDP, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD))
     _GetCurrentProcess = _bind(_kernel32, "GetCurrentProcess", wintypes.HANDLE)
     _CloseHandle = _bind(_kernel32, "CloseHandle", wintypes.BOOL, wintypes.HANDLE)
+    _GetFileType = _bind(_kernel32, "GetFileType", wintypes.DWORD, wintypes.HANDLE)
+    _GetFinalPathNameByHandleW = _bind(_kernel32, "GetFinalPathNameByHandleW", wintypes.DWORD, wintypes.HANDLE,
+                                       wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
     _LocalFree = _bind(_kernel32, "LocalFree", _VOIDP, _VOIDP)
     _CreateFileW = _bind(_kernel32, "CreateFileW", wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD,
                          wintypes.DWORD, ctypes.POINTER(_SecurityAttributes), wintypes.DWORD, wintypes.DWORD,

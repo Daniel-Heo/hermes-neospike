@@ -1,4 +1,5 @@
-﻿"""One place finds the Hermes launcher, its runtime python and the CLI python (tmp homes only)."""
+﻿"""One place finds the Hermes launcher and its runtime python, and builds the command that runs a Neospike module
+there through hermes_launch.py (tmp homes only)."""
 from __future__ import annotations
 
 import json
@@ -35,21 +36,70 @@ class _PrintRuntime:
         return subprocess.CompletedProcess(command, 0, json.dumps([self.python, "-I", "-c", "..."]), "")
 
 
-@pytest.mark.parametrize(("windows", "launcher", "venv"), LAYOUTS)
-def test_hermes_python_is_first_for_the_cli(tmp_path, windows, launcher, venv):
+class _NoLauncherRun:
+    """Runner that fails the test if a library caller runs the Hermes launcher."""
+
+    def __init__(self) -> None:
+        self.commands = []
+
+    def __call__(self, command, **_kwargs):
+        self.commands.append(command)
+        raise AssertionError(f"launcher run: {command}")
+
+
+@pytest.fixture
+def outside_hermes(monkeypatch):
+    """This test process is not a bootstrapped Hermes process, and no checkout override is set."""
+    monkeypatch.delitem(sys.modules, hr.BOOTSTRAP_MODULE, raising=False)
+    monkeypatch.delenv(hr.ENV_CHECKOUT, raising=False)
+
+
+def test_launch_command_is_runtime_python_launch_script_checkout_and_target(tmp_path, outside_hermes):
     home = tmp_path / "home"
-    _touch(home / "hermes-agent" / "venv" / venv)
-    hr.write_cache(home, {hr.CACHE_CLI: str(_touch(tmp_path / "cached-python"))})
-    assert hr.cli_python(home, environ={"HERMES_PYTHON": "/chosen/python"}, windows=windows) == "/chosen/python"
-    assert hr.cli_python(home, environ={}, windows=windows) == str(tmp_path / "cached-python")
+    runtime = str(_touch(tmp_path / "runtime" / "python.exe"))
+    hr.write_cache(home, {hr.CACHE_RUNTIME: runtime})
+    command = hr.launch_command(home, ["neospike.cli", "--help"], environ={})
+    assert command == [runtime, "-I", str(hr.launch_script()), str(home / "hermes-agent"), "neospike.cli", "--help"]
+    assert hr.launch_script() == Path(hr.__file__).resolve().with_name("hermes_launch.py")
+    assert hr.launch_script().is_file()
+
+
+def test_launch_command_never_runs_the_launcher(tmp_path, outside_hermes):
+    """Outside install.py no launcher runs (it may finish a pending Hermes update): HERMES_PYTHON follows."""
+    home, runner = tmp_path / "home", _NoLauncherRun()
+    launcher = str(_touch(home / "bin" / "hermes.exe"))
+    command = hr.launch_command(home, ["neospike.cli"], environ={"HERMES_PYTHON": "/chosen/python"},
+                                which={"hermes": launcher}.get, runner=runner)
+    assert command[0] == "/chosen/python" and runner.commands == []
+    assert not hr.cache_file(home).exists()
+
+
+def test_bootstrapped_process_launches_with_its_own_interpreter(tmp_path, outside_hermes, monkeypatch):
+    monkeypatch.setitem(sys.modules, hr.BOOTSTRAP_MODULE, object())
+    command = hr.launch_command(tmp_path / "home", ["neospike.inference"], runner=_NoLauncherRun())
+    assert command[0] == sys.executable
+
+
+def test_profile_without_its_own_cache_uses_the_root_runtime_python(tmp_path, outside_hermes):
+    root = tmp_path / "home"
+    profile = root / "profiles" / "design"
+    runtime = str(_touch(tmp_path / "runtime" / "python.exe"))
+    hr.write_cache(root, {hr.CACHE_RUNTIME: runtime})
+    command = hr.launch_command(profile, ["neospike.cli"], environ={}, runner=_NoLauncherRun())
+    assert command[0] == runtime and command[3] == str(root / "hermes-agent")
+
+
+def test_checkout_override_names_the_bootstrap_folder(tmp_path, outside_hermes, monkeypatch):
+    monkeypatch.setenv(hr.ENV_CHECKOUT, str(tmp_path / "checkout"))
+    command = hr.launch_command(tmp_path / "home", ["neospike.cli"], python="/runtime/python")
+    assert command[:4] == ["/runtime/python", "-I", str(hr.launch_script()), str(tmp_path / "checkout")]
 
 
 @pytest.mark.parametrize(("windows", "launcher", "venv"), LAYOUTS)
 def test_vanished_cache_entries_are_ignored(tmp_path, windows, launcher, venv):
     home = tmp_path / "home"
     checkout = _touch(home / "hermes-agent" / "venv" / venv)
-    hr.write_cache(home, {hr.CACHE_CLI: str(tmp_path / "gone"), hr.CACHE_RUNTIME: str(tmp_path / "gone")})
-    assert hr.cli_python(home, environ={}, windows=windows) == str(checkout)
+    hr.write_cache(home, {hr.CACHE_RUNTIME: str(tmp_path / "gone")})
     python, source = hr.runtime_python(home, environ={}, windows=windows, user_home=tmp_path / "user",
                                        which=_no_path, runner=_PrintRuntime("unused"))
     assert (python, source) == (str(checkout), "checkout venv")
@@ -111,9 +161,6 @@ def test_nothing_found_names_every_place_and_hermes_python(tmp_path, windows, la
                   home / "hermes-agent" / "venv" / venv):
         assert str(place) in message, message
     assert "Set HERMES_PYTHON" in message
-    with pytest.raises(hr.HermesRuntimeNotFound) as cli_error:
-        hr.cli_python(home, environ={}, windows=windows)
-    assert str(home / "hermes-agent" / "venv" / venv) in str(cli_error.value) and "Set HERMES_PYTHON" in str(cli_error.value)
     assert not hr.cache_file(home).exists()  # a failed lookup writes nothing
 
 

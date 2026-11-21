@@ -1,13 +1,13 @@
-﻿"""Where the Hermes launcher and its pythons are. Stdlib only, no package-relative imports:
-the cron wrapper loads this file by path from <home>/plugins/neospike/.
+﻿"""Where the Hermes launcher and its runtime python are, and the command that runs a Neospike module there.
+Stdlib only, no package-relative imports: the cron wrapper loads this file by path from <home>/plugins/neospike/.
 
-Two different interpreters (measured on native Windows):
-- runtime python: command[0] of `hermes --print-runtime-command`, a bare interpreter that becomes Hermes only
-  through the hermes_bootstrap -c prologue. install.py runs its probes there.
-- CLI python: a venv that has the Neospike dependencies (tokenizers, onnxruntime, ...). The Dashboard,
-  the cron scripts and the MCP server run `-m neospike.*` with it. The runtime python lacks them.
-
-Both are cached in <home>/neospike/runtime.json; a cached path is used only while the file exists.
+The runtime python is command[0] of `hermes --print-runtime-command`, a bare interpreter that becomes Hermes
+only through the hermes_bootstrap prologue, which selects the dependency environment the Hermes package
+manager prepared (plugin.yaml python_dependencies). Every process outside the gateway (MCP server, cron
+scripts, embedding daemon, Dashboard CLI calls, model download) runs through hermes_launch.py with it
+(launch_command), so no package is installed into any Hermes environment and no environment folder is
+written into a command. The runtime python is cached in <home>/neospike/runtime.json; a cached path is used
+only while the file exists.
 """
 from __future__ import annotations
 
@@ -15,12 +15,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 CACHE_PARTS = ("neospike", "runtime.json")
-CACHE_RUNTIME, CACHE_CLI = "runtime_python", "cli_python"
+CACHE_RUNTIME = "runtime_python"
+LAUNCH_SCRIPT = "hermes_launch.py"
+ISOLATED_FLAG = "-I"
+BOOTSTRAP_MODULE = "hermes_bootstrap"
 ENV_PYTHON = "HERMES_PYTHON"
+ENV_CHECKOUT = "NEOSPIKE_HERMES_CHECKOUT"
 LAUNCHER_TIMEOUT_SECONDS = 120
 PROFILES_DIR, AGENT_DIR = "profiles", "hermes-agent"
 WINDOWS_LAUNCHERS = ("hermes.exe", "hermes.cmd")
@@ -68,11 +73,13 @@ def read_cache(home: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def write_cache(home: Path, values: dict) -> None:
-    """Merge *values* into runtime.json atomically (temp file in the same folder + os.replace)."""
+def write_cache(home: Path, values: dict, drop: tuple[str, ...] = ()) -> None:
+    """Merge *values* into runtime.json and remove the *drop* keys, atomically (temp file in the same
+    folder + os.replace). Every other key stays as it is."""
     target = cache_file(home)
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = {**read_cache(home), **values}
+    data = {key: value for key, value in read_cache(home).items() if key not in drop}
+    data.update(values)
     descriptor, temporary = tempfile.mkstemp(prefix=".runtime-", suffix=".json", dir=target.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -127,12 +134,14 @@ def _not_found(what: str, tried: list[str]) -> HermesRuntimeNotFound:
 
 
 def runtime_python(home: Path, *, launcher: str | None = None, environ=None, windows: bool | None = None,
-                   user_home: Path | None = None, which=None, runner=None, cache: bool = True) -> tuple[str, str]:
+                   user_home: Path | None = None, which=None, runner=None, cache: bool = True,
+                   run_launcher: bool = True) -> tuple[str, str]:
     """(python Hermes really starts, where it came from).
 
     runtime.json -> launcher --print-runtime-command (cached on success) -> HERMES_PYTHON -> checkout venv.
     HERMES_PYTHON names the CLI venv, a different interpreter from the gateway's, so it follows the launcher
-    cache=False neither reads nor writes runtime.json (--check, --dry-run).
+    cache=False neither reads nor writes runtime.json (--check, --dry-run). run_launcher=False skips the
+    launcher (it may finish a pending Hermes update when it starts), for every caller but install.py.
     """
     home = Path(home)
     environ = os.environ if environ is None else environ
@@ -142,8 +151,11 @@ def runtime_python(home: Path, *, launcher: str | None = None, environ=None, win
         if cached:
             return cached, f"{cache_file(home)}"
         tried.append(f"{cache_file(home)} ({CACHE_RUNTIME})")
-    launcher = launcher or find_launcher(home, windows=windows, user_home=user_home, which=which)
-    if launcher:
+    launcher = launcher or (find_launcher(home, windows=windows, user_home=user_home, which=which)
+                            if run_launcher else None)
+    if not run_launcher:
+        tried.append("launcher (not run outside install.py)")
+    elif launcher:
         python = launcher_python(launcher, runner)
         if python:
             if cache:
@@ -164,21 +176,36 @@ def runtime_python(home: Path, *, launcher: str | None = None, environ=None, win
     raise _not_found("runtime python", tried)
 
 
-def cli_python(home: Path, *, environ=None, windows: bool | None = None) -> str:
-    """The venv python with the Neospike dependencies: HERMES_PYTHON -> runtime.json -> checkout venv.
+def current_runtime_python(home: Path, **runtime_options) -> str:
+    """This interpreter when the Hermes bootstrap already runs in this process (the gateway, or a module
+    started by hermes_launch.py), else runtime_python(home) without running the launcher (runtime.json
+    that install.py wrote, a profile's own and then its root home's -> HERMES_PYTHON -> checkout venv)."""
+    if BOOTSTRAP_MODULE in sys.modules:
+        return sys.executable
+    home, root = Path(home), hermes_root_home(home)
+    if root != home.expanduser() and not _cached(home, CACHE_RUNTIME):
+        shared = _cached(root, CACHE_RUNTIME)
+        if shared:
+            return shared
+    return runtime_python(home, **{"run_launcher": False, **runtime_options})[0]
 
-    install.py records its choice in runtime.json (on macOS the PM environment venv when there is no checkout
-    venv), so later callers find it without running the launcher.
-    """
-    home = Path(home)
-    environ = os.environ if environ is None else environ
-    configured = environ.get(ENV_PYTHON)
-    if configured:
-        return configured
-    cached = _cached(home, CACHE_CLI)
-    if cached:
-        return cached
-    venv = checkout_python(home, windows=windows)
-    if venv.is_file():
-        return str(venv)
-    raise _not_found("CLI python", [f"{ENV_PYTHON} (unset)", f"{cache_file(home)} ({CACHE_CLI})", str(venv)])
+
+def launch_script() -> Path:
+    """hermes_launch.py next to this file: the copy of the plugin that is running."""
+    return Path(__file__).resolve().with_name(LAUNCH_SCRIPT)
+
+
+def launch_command(home: Path, target, *, python: str | None = None, script: Path | None = None,
+                   **runtime_options) -> list[str]:
+    """[runtime python, -I, hermes_launch.py, <hermes checkout>, *target]; *target* is `module, args...`.
+    *python* defaults to current_runtime_python(home, **runtime_options)
+    (HermesRuntimeNotFound when there is none). The command names no dependency environment folder: the
+    bootstrap picks the current one at every start."""
+    python = python or current_runtime_python(home, **runtime_options)
+    return [str(python), ISOLATED_FLAG, str(script or launch_script()), str(hermes_checkout(home)), *target]
+
+
+def hermes_checkout(home: Path) -> Path:
+    """The Hermes checkout hermes_bootstrap is imported from: NEOSPIKE_HERMES_CHECKOUT, else hermes_agent_dir."""
+    configured = os.environ.get(ENV_CHECKOUT)
+    return Path(configured).expanduser() if configured else hermes_agent_dir(home)

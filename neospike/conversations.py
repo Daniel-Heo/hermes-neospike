@@ -33,6 +33,7 @@ from .chunking import (MESSAGE_JOINER, CONTEXT_TOKEN_BUDGET, ConversationChunk, 
 from .notes import CHUNK_OVERLAP_TOKENS, NOTE_IMPORTANCE, TokenCounter, default_token_counter, note_chunk_max_tokens
 from .store import (CHUNK_CHAIN_FIELD, SOURCE_LAST_ID_FIELD, SYNCED_UPTO_FIELD, MemoryStore, dot_similarities, freshness,
                     blend_score, chain_message_chunks, normalize_rows)
+from .threads import background_thread
 
 KIND = "conversation"
 SOURCE_PREFIX = "conv"
@@ -898,7 +899,7 @@ class ConversationIndexer:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="neospike-conversation-indexer", daemon=True)
+        self._thread = background_thread(self._run, "neospike-conversation-indexer")
         self._thread.start()
 
     def notify(self) -> None:

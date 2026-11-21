@@ -2,8 +2,8 @@
 
 install.py copies this file next to the scripts into <HERMES_HOME>/scripts/ (the only folder Hermes cron
 runs scripts from), so a script's home is the parent of its folder. The CLI runs the way the Dashboard
-runs it (plugin_api.py): hermes_runtime.cli_python (HERMES_PYTHON, runtime.json, checkout venv), PYTHONPATH=<home>/plugins,
-HERMES_HOME, HERMES_BGE_M3_DIR=<home>/models/bge-m3-onnx.
+runs it (plugin_api.py): hermes_runtime.launch_command (the Hermes runtime python and hermes_launch.py of the
+plugin in <home>/plugins/neospike), HERMES_HOME, HERMES_BGE_M3_DIR=<home>/models/bge-m3-onnx.
 
 Run directly, it is a CLI wrapper `<python> neospike_cron_common.py [--home <home>] <cli args>`
 (without --home: the root home), and `--list-homes` prints target_homes() one per line.
@@ -14,6 +14,7 @@ memory.provider to neospike and that has a <profile>/neospike folder.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -25,6 +26,7 @@ CLI_MODULE = "neospike.cli"
 _FOREIGN_ENV = ("PYTHONHOME", "VIRTUAL_ENV", "PYTHONSTARTUP")
 PROFILES_DIR, DATA_DIR, PROVIDER_NAME = "profiles", "neospike", "neospike"
 HOME_OPTION, LIST_HOMES_OPTION = "--home", "--list-homes"
+CONFIG_FILE, ENABLED_KEY = "config.json", "enabled"
 
 
 def home_dir() -> Path:
@@ -84,8 +86,24 @@ def target_homes(root: Path) -> list[Path]:
                      if (path / DATA_DIR).is_dir() and configured_memory_provider(path) == PROVIDER_NAME]
 
 
+def home_enabled(home: Path) -> bool:
+    """The on/off switch of <home>/neospike/config.json (same rule as config.read_enabled: only an explicit false,
+    or the text "false", pauses; a missing or unreadable file counts as on)."""
+    try:
+        values = json.loads((home / DATA_DIR / CONFIG_FILE).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return True
+    flag = values.get(ENABLED_KEY, True) if isinstance(values, dict) else True
+    return not (flag is False or (isinstance(flag, str) and flag.lower() == "false"))
+
+
+def active_homes(root: Path) -> list[Path]:
+    """target_homes(root) without the homes whose switch is off (the daily job skips a paused home)."""
+    return [home for home in target_homes(root) if home_enabled(home)]
+
+
 def _hermes_runtime(home: Path):
-    """neospike/hermes_runtime.py loaded by path: the cron python cannot import the package (no PYTHONPATH)."""
+    """neospike/hermes_runtime.py loaded by path: the cron python cannot import the package."""
     path = home / "plugins" / "neospike" / "hermes_runtime.py"
     spec = importlib.util.spec_from_file_location("neospike_hermes_runtime", path)
     module = importlib.util.module_from_spec(spec)
@@ -93,16 +111,10 @@ def _hermes_runtime(home: Path):
     return module
 
 
-def cli_python(home: Path) -> str:
-    """Same choice as the Dashboard (hermes_runtime.cli_python)."""
-    return _hermes_runtime(home).cli_python(home)
-
-
 def cli_env(home: Path) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items() if key not in _FOREIGN_ENV}
     env.update({
         "HERMES_HOME": str(home),
-        "PYTHONPATH": str(home / "plugins"),
         "HERMES_BGE_M3_DIR": str(home / "models" / "bge-m3-onnx"),
         "PYTHONIOENCODING": "utf-8",
     })
@@ -110,7 +122,8 @@ def cli_env(home: Path) -> dict[str, str]:
 
 
 def cli_command(home: Path, args: list[str]) -> list[str]:
-    return [cli_python(home), "-m", CLI_MODULE, "--home", str(home), *args]
+    """Same command as the Dashboard's (hermes_runtime.launch_command)."""
+    return _hermes_runtime(home).launch_command(home, [CLI_MODULE, "--home", str(home), *args])
 
 
 def run_cli(home: Path, args: list[str], timeout: float) -> subprocess.CompletedProcess:

@@ -38,8 +38,6 @@
         "map.loadFailed": "Could not load the map: {error}", "map.empty": "No memories or notes with embeddings yet.",
         "setup.loadFailed": "Could not load setup status: {error}", "setup.opDone": "Operation completed successfully.",
         "setup.starting": "Starting…", "setup.actionDone": "{label} completed.",
-        "setup.act.saveConfig": "Save configuration",
-        "setup.act.installDeps": "Install dependencies",
         "setup.act.download": "Download models", "setup.act.activate": "Activate Neospike", "setup.act.health": "Health check",
         "setup.checking": "Checking Neospike setup…",
         "setup.heroCopy": "Private, on-device text memory. Complete each step, then run the health check.",
@@ -47,22 +45,30 @@
         "setup.found": "Found", "setup.notFound": "Not found", "setup.chk.deps": "Runtime dependencies",
         "setup.chk.textModel": "Text embedding model",
         "setup.chk.config": "Configuration", "setup.chk.provider": "Memory provider active",
-        "setup.current": "Current: {name}", "setup.step1": "Dependencies",
-        "setup.step1Copy": "Install the runtime dependencies. The models are not gated, so no Hugging Face account is needed.",
-        "setup.depsInstalled": "Dependencies installed",
+        "setup.current": "Current: {name}",
         "setup.step2": "Choose and download models", "setup.modeText": "Text only",
         "setup.modeTextCopy": "BAAI bge-m3 (1024 dimensions, up to 2048 tokens) for messages, summaries, and files.",
         "setup.downloading": "Downloading…",
         "setup.downloadSelected": "Download selected models", "setup.downloadProgress": "Download in progress",
-        "setup.step3": "Configure memory",
-        "setup.debug": "Append Neospike diagnostics to chat responses",
+        "config.diagnostics.title": "Diagnostics settings",
+        "setup.debug": "Append Neospike diagnostics to chat responses (developer mode)",
         "setup.debugCopy": "Off by default. Shows memory excerpts in this profile's chats; normal chat history may retain them. No extra model calls.",
         "config.extractLang": "Language of extracted memories", "config.extractLang.ko": "한국어", "config.extractLang.en": "English", "config.extractLangCopy": "The language Neospike uses when it extracts memories from conversations. Default: English.",
-        "setup.step5": "Activate and verify",
+        "setup.step5": "Apply to memory handling and verify",
         "setup.step5Copy": "Activation updates memory.provider. Restart the gateway afterward (hermes gateway restart).",
         "setup.step5Example": "e.g. hermes gateway restart",
         "setup.ragActive": "Neospike active", "setup.runHealth": "Run health check",
         "config.criteria.title": "Memory creation rules", "config.criteria.default": "Default",
+        "config.enabled.title": "Neospike on/off", "config.enabled.label": "Neospike is on",
+        "config.enabled.copy": "Off pauses Neospike in this home without uninstalling it: no automatic recall, no conversation saving, no save follow-up, tool calls return an error and the daily job skips this home. Turn it back on to resume from the next turn; no restart is needed.",
+        "config.enabled.stopped": "Paused. The embedding service was asked to stop.",
+        "config.enabled.not_running": "Paused. The embedding service was not running.",
+        "config.enabled.in_use": "Paused. The embedding service keeps running for: {homes}",
+        "config.enabled.error": "Paused, but the embedding service could not be reached: {message}",
+        "config.prefModel.title": "Preference and constraint cleanup model", "config.prefModel.auto": "Follow the chat default model (auto)",
+        "config.prefModel.copy": "The model Neospike uses to merge and tidy saved preferences and constraints. Saved in the Hermes config.yaml (auxiliary.neospike_pref_reconcile), the same setting the Hermes auxiliary model screen shows. \"API\" marks a model reached with an API key.",
+        "config.prefModel.current": "{name} (current)", "config.prefModel.listFailed": "Could not load the model list: {message}",
+        "config.prefModel.unchanged": "Not changed.",
         "config.criteria.chars": "{n} / {max} characters",
         "config.criteria.editorLabel": "Memory creation rules (MEMORY_RULE.md)",
         "connected.rel.refers": "refers", "connected.rel.referencedBy": "referenced by", "connected.rel.supersedes": "supersedes",
@@ -155,8 +161,6 @@
         "map.loadFailed": "지도를 불러오지 못했습니다: {error}", "map.empty": "아직 임베딩된 기억이나 노트가 없습니다.",
         "setup.loadFailed": "설치 상태를 불러오지 못했습니다: {error}", "setup.opDone": "작업을 마쳤습니다.",
         "setup.starting": "시작하는 중…", "setup.actionDone": "{label}: 완료했습니다.",
-        "setup.act.saveConfig": "설정 저장",
-        "setup.act.installDeps": "의존성 설치",
         "setup.act.download": "모델 내려받기", "setup.act.activate": "Neospike 활성화", "setup.act.health": "상태 점검",
         "setup.checking": "Neospike 설치 상태를 확인하는 중…",
         "setup.heroCopy": "이 기기 안에서만 쓰는 비공개 텍스트 기억입니다. 단계를 차례로 마친 뒤 상태 점검을 실행하세요.",
@@ -164,22 +168,30 @@
         "setup.found": "찾음", "setup.notFound": "없음", "setup.chk.deps": "실행 의존성",
         "setup.chk.textModel": "텍스트 임베딩 모델",
         "setup.chk.config": "설정", "setup.chk.provider": "메모리 제공자 활성",
-        "setup.current": "현재: {name}", "setup.step1": "의존성",
-        "setup.step1Copy": "실행 의존성을 설치하세요. 모델은 승인이 필요 없어 Hugging Face 계정이 필요 없습니다.",
-        "setup.depsInstalled": "의존성 설치됨",
+        "setup.current": "현재: {name}",
         "setup.step2": "모델 고르기와 내려받기", "setup.modeText": "텍스트만",
         "setup.modeTextCopy": "메시지, 요약, 파일에 BAAI bge-m3(1024차원, 최대 2048토큰)를 씁니다.",
         "setup.downloading": "내려받는 중…",
         "setup.downloadSelected": "고른 모델 내려받기", "setup.downloadProgress": "내려받는 중",
-        "setup.step3": "기억 설정",
-        "setup.debug": "채팅 답변에 Neospike 진단 정보 붙이기",
+        "config.diagnostics.title": "진단 정보 설정",
+        "setup.debug": "채팅 답변에 Neospike 진단 정보 붙이기 (개발모드)",
         "setup.debugCopy": "기본은 꺼져 있습니다. 켜면 이 프로필의 채팅에 기억 발췌가 보이고, 채팅 기록에 남을 수 있습니다. 모델 호출은 늘지 않습니다.",
         "config.extractLang": "기억 추출 결과 언어", "config.extractLang.ko": "한국어", "config.extractLang.en": "English", "config.extractLangCopy": "Neospike가 대화에서 기억을 추출할 때 쓰는 언어입니다. 기본은 영어입니다.",
-        "setup.step5": "활성화와 점검",
+        "setup.step5": "메모리 처리에 적용과 점검",
         "setup.step5Copy": "활성화하면 memory.provider가 바뀝니다. 그다음 게이트웨이를 다시 시작하세요(hermes gateway restart).",
         "setup.step5Example": "예) hermes gateway restart",
         "setup.ragActive": "Neospike 활성", "setup.runHealth": "상태 점검 실행",
         "config.criteria.title": "기억 생성 규칙", "config.criteria.default": "디폴트",
+        "config.enabled.title": "Neospike 켜기/끄기", "config.enabled.label": "Neospike 켜짐",
+        "config.enabled.copy": "끄면 제거하지 않고 이 홈에서 Neospike를 멈춥니다. 자동 회상, 대화 저장, 저장 후속 작업을 하지 않고, 도구 호출은 오류를 돌려주며, 일별 작업은 이 홈을 건너뜁니다. 다시 켜면 재시작 없이 다음 턴부터 동작합니다.",
+        "config.enabled.stopped": "멈췄습니다. 임베딩 서비스에 종료를 요청했습니다.",
+        "config.enabled.not_running": "멈췄습니다. 임베딩 서비스는 실행 중이 아니었습니다.",
+        "config.enabled.in_use": "멈췄습니다. 임베딩 서비스는 다음 홈이 쓰고 있어 계속 실행됩니다: {homes}",
+        "config.enabled.error": "멈췄지만 임베딩 서비스에 연결하지 못했습니다: {message}",
+        "config.prefModel.title": "선호·제약 정리 모델", "config.prefModel.auto": "채팅 기본 모델 따라가기(auto)",
+        "config.prefModel.copy": "Neospike가 저장된 선호·제약을 합치고 정리할 때 쓰는 모델입니다. Hermes config.yaml(auxiliary.neospike_pref_reconcile)에 저장되며, Hermes 보조 모델 화면과 같은 설정입니다. \"API\"는 API 키로 쓰는 모델입니다.",
+        "config.prefModel.current": "{name} (현재)", "config.prefModel.listFailed": "모델 목록을 불러오지 못했습니다: {message}",
+        "config.prefModel.unchanged": "변경하지 않았습니다.",
         "config.criteria.chars": "글자 수: {n} / {max}",
         "config.criteria.editorLabel": "기억 생성 규칙 (MEMORY_RULE.md)",
         "connected.rel.refers": "참조", "connected.rel.referencedBy": "참조됨", "connected.rel.supersedes": "대체함",
@@ -591,18 +603,10 @@
     const [busyKey, setBusyKey] = useState(null);
     const [runJob, setRunJob] = useState(null);
     const [banner, setBanner] = useState(null);
-    const [debugOn, setDebugOn] = useState(false);
-
-    const formSeeded = useRef(false);
 
     const reloadStatus = useCallback(function () {
       return SDK.fetchJSON(API + "/setup/status").then(function (data) {
         setSetupInfo(data);
-        if (!formSeeded.current) {
-          formSeeded.current = true;
-          const savedCfg = data.config || {};
-          setDebugOn(Boolean(savedCfg.turn_trace_enabled));
-        }
         return data;
       }).catch(function (e) { setBanner({ ok: false, text: t("setup.loadFailed", { error: failureMessage(e) }) }); });
     }, []);
@@ -629,12 +633,6 @@
         if (result.job_id) setRunJob({ id: result.job_id, state: "running", detail: t("setup.starting"), log: "" });
         else { setBusyKey(null); setBanner({ ok: true, text: t("setup.actionDone", { label: t(actionKey) }) }); reloadStatus(); }
       }).catch(function (e) { setBusyKey(null); setBanner({ ok: false, text: failureMessage(e) }); });
-    }
-
-    function commitSettings() {
-      // The extraction language is saved by the Config tab; omitted here, the saved value stays.
-      const formBody = { turn_trace_enabled: debugOn };
-      return action("setup.act.saveConfig", "/setup/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(formBody) });
     }
 
     if (!setupInfo) return h("div", { className: "neospike-page" },
@@ -664,15 +662,7 @@
           )
         ),
         h("div", { className: "neospike-steps" },
-          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "1"), h(CardTitle, null, t("setup.step1")))),
-            h(CardContent, { className: "neospike-stack" },
-              h("p", { className: "text-sm text-muted-foreground" }, t("setup.step1Copy")),
-              h("div", { className: "neospike-actions" },
-                h(Button, { type: "button", onClick: function () { action("setup.act.installDeps", "/setup/dependencies"); }, disabled: !!busyKey || setupInfo.dependencies_installed }, setupInfo.dependencies_installed ? t("setup.depsInstalled") : t("setup.act.installDeps"))
-              )
-            )
-          ),
-          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "2"), h(CardTitle, null, t("setup.step2")))),
+          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "1"), h(CardTitle, null, t("setup.step2")))),
             h(CardContent, { className: "neospike-stack" },
               h("div", { className: "neospike-choices" },
                 h(OptionRadio, { name: "neospike-model-mode", value: "text", checked: true, title: t("setup.modeText"), copy: t("setup.modeTextCopy"), onChange: function () {} })
@@ -684,14 +674,7 @@
               ) : null
             )
           ),
-          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "3"), h(CardTitle, null, t("setup.step3")))),
-            h(CardContent, { className: "neospike-stack" },
-              h("label", { className: "neospike-consent" }, h("input", { type: "checkbox", checked: debugOn, onChange: function (e) { setDebugOn(e.target.checked); } }), h("span", null, t("setup.debug"))),
-              h("p", { className: "text-xs text-muted-foreground" }, t("setup.debugCopy")),
-              h(Button, { onClick: commitSettings, disabled: !!busyKey }, t("setup.act.saveConfig"))
-            )
-          ),
-          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "4"), h(CardTitle, null, t("setup.step5")))),
+          h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "2"), h(CardTitle, null, t("setup.step5")))),
             h(CardContent, { className: "neospike-stack" },
               h("p", { className: "text-sm text-muted-foreground" }, t("setup.step5Copy")),
               h(CmdSample, { text: t("setup.step5Example"), command: GATEWAY_RESTART_COMMAND }),
@@ -700,7 +683,8 @@
                 h(Button, { variant: "outline", disabled: !!busyKey, onClick: function () { action("setup.act.health", "/health"); } }, t("setup.runHealth"))
               )
             )
-          )
+          ),
+          h(EnabledSwitchView, null)
         )
       )
     );
@@ -710,7 +694,74 @@
   // "memory creation rules" (a page heading like Setup's, not a small card actionKey).
   function SettingsView(props) {
     // Numbered step cards wrapped like Setup's steps.
-    return h("div", { className: "neospike-steps" }, h(CommitCriteriaView, null), h(ExtractLangView, null));
+    return h("div", { className: "neospike-steps" }, h(CommitCriteriaView, null), h(ExtractLangView, null), h(PrefModelView, null), h(DiagnosticsView, null));
+  }
+
+  // The on/off switch (config.json "enabled", default on). Saved at once through /setup/config with only that key;
+  // turning it off reports what happened to the shared embedding service (reply.daemon).
+  function enabledSavedText(reply, on) {
+    const daemon = reply && reply.daemon;
+    if (on || !daemon) return t("common.saved");
+    return t("config.enabled." + daemon.state, { homes: (daemon.users || []).join(", "), message: daemon.message || "" });
+  }
+
+  function EnabledSwitchView() {
+    const [on, setOn] = useState(true);
+    const [loaded, setLoaded] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState(null);
+
+    useEffect(function () {
+      SDK.fetchJSON(API + "/setup/status").then(function (data) {
+        setOn((data.config || {}).enabled !== false); setLoaded(true);
+      }).catch(function (e) { setMessage({ ok: false, text: apiFault(e).text }); });
+    }, []);
+
+    function toggle(e) {
+      const next = e.target.checked;
+      setBusy(true); setMessage(null);
+      SDK.fetchJSON(API + "/setup/config", jsonInit("POST", { enabled: next })).then(function (reply) {
+        setBusy(false); setOn(next); setMessage({ ok: true, text: enabledSavedText(reply, next) });
+      }).catch(function (err) { setBusy(false); setMessage({ ok: false, text: apiFault(err).text }); });
+    }
+
+    return h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "3"), h(CardTitle, null, t("config.enabled.title")))),
+      h(CardContent, { className: "neospike-stack" },
+        h("label", { className: "neospike-consent" },
+          h("input", { type: "checkbox", checked: on, disabled: busy || !loaded, onChange: toggle }),
+          h("span", null, t("config.enabled.label"))),
+        h("p", { className: "text-xs text-muted-foreground" }, t("config.enabled.copy")),
+        message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));
+  }
+
+  // Chat diagnostics (config.json "turn_trace_enabled", default off). Saved at once through /setup/config with only that key.
+  function DiagnosticsView() {
+    const [on, setOn] = useState(false);
+    const [loaded, setLoaded] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState(null);
+
+    useEffect(function () {
+      SDK.fetchJSON(API + "/setup/status").then(function (data) {
+        setOn(Boolean((data.config || {}).turn_trace_enabled)); setLoaded(true);
+      }).catch(function (e) { setMessage({ ok: false, text: apiFault(e).text }); });
+    }, []);
+
+    function toggle(e) {
+      const next = e.target.checked;
+      setBusy(true); setMessage(null);
+      SDK.fetchJSON(API + "/setup/config", jsonInit("POST", { turn_trace_enabled: next })).then(function () {
+        setBusy(false); setOn(next); setMessage({ ok: true, text: t("common.saved") });
+      }).catch(function (err) { setBusy(false); setMessage({ ok: false, text: apiFault(err).text }); });
+    }
+
+    return h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "4"), h(CardTitle, null, t("config.diagnostics.title")))),
+      h(CardContent, { className: "neospike-stack" },
+        h("label", { className: "neospike-consent" },
+          h("input", { type: "checkbox", checked: on, disabled: busy || !loaded, onChange: toggle }),
+          h("span", null, t("setup.debug"))),
+        h("p", { className: "text-xs text-muted-foreground" }, t("setup.debugCopy")),
+        message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));
   }
 
   const EXTRACT_LANGS = ["ko", "en"];  // config.py EXTRACTION_LANGUAGES
@@ -720,7 +771,7 @@
   function renderLangOption(code) { return h("option", { key: code, value: code }, t("config.extractLang." + code)); }
 
   // The extraction language lives in Config, not Setup. Saved through /setup/config
-  // with only extraction_language, so the Setup tab's debug setting stays as saved.
+  // with only extraction_language, so the other saved settings stay as they are.
   function ExtractLangView() {
     const [lang, setLang] = useState(EXTRACT_LANG_DEFAULT);
     const [loaded, setLoaded] = useState(false);
@@ -750,7 +801,130 @@
         message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));
   }
 
-  const CRITERIA_EDITOR_ROWS = 20;  // Tall editor for the criteria list
+  // The preference/constraint cleanup model is the Hermes auxiliary slot of pref_reconcile.py LLM_TASK. It is read,
+  // listed and saved through the Hermes model routes, so this card and the Hermes auxiliary model screen show one value.
+  const PREF_MODEL_TASK = "neospike_pref_reconcile";  // pref_reconcile.py LLM_TASK
+  const PREF_MODEL_AUTO = "auto";
+  const HERMES_MODEL_OPTIONS = "/api/model/options";
+  const HERMES_MODEL_AUXILIARY = "/api/model/auxiliary";
+  const HERMES_MODEL_SET = "/api/model/set";
+  const API_KEY_SUFFIX = " API";  // plugin_api.py marks the providers reached with an API key
+
+  function prefModelLabel(model, apiKey) { return apiKey ? model + API_KEY_SUFFIX : model; }
+
+  // [{provider, model, label, group}]; index 0 is auto. A current pin missing from the list is kept as its own entry.
+  function prefModelChoices(providers, apiKeySlugs, current) {
+    const choices = [{ provider: PREF_MODEL_AUTO, model: "", label: t("config.prefModel.auto"), group: "" }];
+    for (let p = 0; p < providers.length; p += 1) {
+      const row = providers[p] || {};
+      const slug = String(row.slug || "");
+      const apiKey = apiKeySlugs.indexOf(slug) >= 0;
+      const models = row.models || [];
+      for (let m = 0; m < models.length; m += 1) {
+        choices.push({ provider: slug, model: String(models[m]), label: prefModelLabel(String(models[m]), apiKey), group: String(row.name || slug) });
+      }
+    }
+    if (current && current.provider !== PREF_MODEL_AUTO && prefModelIndex(choices, current) < 0) {
+      const name = current.provider + (current.model ? " / " + current.model : "");
+      choices.push({ provider: current.provider, model: current.model, label: t("config.prefModel.current", { name: name }), group: "" });
+    }
+    return choices;
+  }
+
+  function prefModelIndex(choices, current) {
+    if (!current || current.provider === PREF_MODEL_AUTO) return 0;
+    for (let index = 1; index < choices.length; index += 1) {
+      if (choices[index].provider === current.provider && choices[index].model === current.model) return index;
+    }
+    return -1;
+  }
+
+  function prefModelCurrent(auxiliary) {
+    const tasks = (auxiliary && auxiliary.tasks) || [];
+    for (let index = 0; index < tasks.length; index += 1) {
+      if (tasks[index].task === PREF_MODEL_TASK) return { provider: String(tasks[index].provider || PREF_MODEL_AUTO), model: String(tasks[index].model || "") };
+    }
+    return { provider: PREF_MODEL_AUTO, model: "" };
+  }
+
+  // <option>s, grouped by provider name in list order.
+  function renderPrefModelOptions(choices) {
+    const nodes = [];
+    let group = null;
+    let members = [];
+    function flush() {
+      if (!members.length) return;
+      nodes.push(group ? h("optgroup", { key: "g" + nodes.length, label: group }, members) : members);
+      members = [];
+    }
+    for (let index = 0; index < choices.length; index += 1) {
+      if (choices[index].group !== group) { flush(); group = choices[index].group; }
+      members.push(h("option", { key: index, value: String(index) }, choices[index].label));
+    }
+    flush();
+    return nodes;
+  }
+
+  function PrefModelView() {
+    const [choices, setChoices] = useState([]);
+    const [selected, setSelected] = useState(-1);
+    const [busy, setBusy] = useState(true);
+    const [message, setMessage] = useState(null);
+
+    useEffect(function () {
+      let current = null;
+      function showCurrentOnly(e) {
+        const kept = current ? prefModelChoices([], [], current) : [];  // unknown current value: nothing to pick
+        setChoices(kept); setSelected(current ? prefModelIndex(kept, current) : -1);
+        setBusy(false); setMessage({ ok: false, text: t("config.prefModel.listFailed", { message: apiFault(e).text }) });
+      }
+      function withApiKeys(options, apiKeys) {
+        const built = prefModelChoices(options.providers || [], apiKeys.providers || [], current);
+        setChoices(built); setSelected(prefModelIndex(built, current)); setBusy(false);
+      }
+      function withOptions(options) {
+        const slugs = (options.providers || []).map(function (row) { return String(row.slug || ""); });
+        return SDK.fetchJSON(API + "/config/api-key-providers?providers=" + encodeURIComponent(slugs.join(",")))
+          .catch(function () { return { providers: [] }; })  // no " API" marks rather than no list
+          .then(function (apiKeys) { withApiKeys(options, apiKeys); });
+      }
+      SDK.fetchJSON(HERMES_MODEL_AUXILIARY).then(function (auxiliary) {
+        current = prefModelCurrent(auxiliary);
+        return SDK.fetchJSON(HERMES_MODEL_OPTIONS).then(withOptions);
+      }).catch(showCurrentOnly);
+    }, []);
+
+    function send(choice, confirmed) {
+      const body = { scope: "auxiliary", task: PREF_MODEL_TASK, provider: choice.provider, model: choice.model };
+      if (confirmed) body.confirm_expensive_model = true;
+      return SDK.fetchJSON(HERMES_MODEL_SET, jsonInit("POST", body)).then(function (reply) {
+        if (reply && reply.confirm_required && !confirmed) {
+          return window.confirm(String(reply.confirm_message || "")) ? send(choice, true) : null;
+        }
+        return reply;
+      });
+    }
+
+    function change(e) {
+      const index = Number(e.target.value);
+      const previous = selected;
+      setSelected(index); setBusy(true); setMessage(null);
+      send(choices[index], false).then(function (reply) {
+        setBusy(false);
+        if (reply && reply.ok !== false) { setMessage({ ok: true, text: t("common.saved") }); return; }
+        setSelected(previous); setMessage({ ok: true, text: t("config.prefModel.unchanged") });
+      }).catch(function (err) { setBusy(false); setSelected(previous); setMessage({ ok: false, text: apiFault(err).text }); });
+    }
+
+    return h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(Badge, null, "3"), h(CardTitle, null, t("config.prefModel.title")))),
+      h(CardContent, { className: "neospike-stack" },
+        h("select", { className: "neospike-select", value: selected < 0 ? "" : String(selected), disabled: busy || !choices.length, onChange: change, "aria-label": t("config.prefModel.title") },
+          renderPrefModelOptions(choices)),
+        h("p", { className: "text-xs text-muted-foreground" }, t("config.prefModel.copy")),
+        message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));
+  }
+
+  const CRITERIA_EDITOR_ROWS = 10;  // Tall editor for the criteria list
   // config.py DEFAULT_SAVE_CRITERIA (a test keeps them equal), so Default works even when the API does not answer.
   const DEFAULT_MEMORY_RULE = "Store with high recall what will help a future turn. Short facts, decisions, constraints and preferences go to memory (neospike_memory_save). Save in the same turn: preferences, constraints and corrections when the user states them, decisions when the user makes them, facts when verified. Set basis to user_said only for the user's own words, else agent_inferred; don't re-save items shown in neospike blocks. Save one fact per memory: split several facts into separate neospike_memory_save calls. Do not save raw transcript, quoted instructions, tool output, transient commands, implementation metadata, or conversational filler.";
 
@@ -1097,7 +1271,7 @@
     );
   }
 
-  // Setup step 5 example line; the command part is shown as <code>.
+  // Setup apply-and-verify example line; the command part is shown as <code>.
   const GATEWAY_RESTART_COMMAND = "hermes gateway restart";
 
   function CmdSample(props) {

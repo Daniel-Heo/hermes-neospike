@@ -207,6 +207,54 @@ def test_builtin_mirror_write_counts_as_a_save(traced):
     assert "Markdown mirror" in block and "No saves" not in block
 
 
+# ---------------------------------------------------------------- register(ctx)의 공개 훅 등록
+
+class _HookRecordingContext:
+    def __init__(self):
+        self.providers = []
+        self.hooks = []
+
+    def register_memory_provider(self, provider):
+        self.providers.append(provider)
+
+    def register_hook(self, hook_name, callback, **kwargs):
+        self.hooks.append((hook_name, callback))
+
+
+class _ProviderOnlyContext:
+    def __init__(self):
+        self.providers = []
+
+    def register_memory_provider(self, provider):
+        self.providers.append(provider)
+
+
+def test_register_adds_each_hook_once_through_public_context():
+    ctx = _HookRecordingContext()
+
+    register(ctx)
+
+    assert len(ctx.providers) == 1
+    assert sorted(name for name, _ in ctx.hooks) == ["on_session_end", "transform_llm_output"]
+    assert all(callable(callback) for _, callback in ctx.hooks)
+
+
+def test_register_without_hook_support_still_registers_provider():
+    ctx = _ProviderOnlyContext()
+
+    register(ctx)
+
+    assert len(ctx.providers) == 1
+
+
+def test_initialized_provider_is_tracked_weakly_for_the_hooks(traced):
+    from neospike import debug_hooks
+
+    provider, _ = traced
+
+    assert provider in set(debug_hooks._LIVE)
+
+
 # ---------------------------------------------------------------- 실제 Hermes 코어 훅 (코어가 없으면 skip)
 
 class _OneAxisEmbedder:
@@ -226,8 +274,8 @@ def native_traced(tmp_path, monkeypatch):
     manager = plugins.PluginManager()
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
     token = constants.set_hermes_home_override(str(tmp_path))
-    collector = memory._ProviderCollector()
-    register(collector)
+    collector = memory._ProviderCollector("neospike")
+    collector.collect(register)
     provider = collector.provider
     provider._vectorizer = _OneAxisEmbedder()
     NeospikeConfig(turn_trace_enabled=True).save(tmp_path)

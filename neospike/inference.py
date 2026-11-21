@@ -22,12 +22,13 @@ import signal
 import socket
 import stat
 import subprocess
+import sys
 import threading
 import time
 
 from . import _wincompat as _wc
 from ._wincompat import fcntl
-from .config import EMBEDDING_DIMENSIONS
+from .config import EMBEDDING_DIMENSIONS, PAUSED_MESSAGE, read_enabled
 
 # One input may fill the full token window. The bge-m3 tokenizer emits at most 16
 # characters (plus a space) per piece, so 17 chars/token is the ceiling. A frame holds that input
@@ -38,6 +39,11 @@ INPUT_CHAR_CAP = 8192 * 17
 _FRAME_OVERHEAD = 65_536
 FRAME_BYTE_CAP = INPUT_CHAR_CAP * 6 + _FRAME_OVERHEAD
 _OPS = frozenset(('query', 'document'))
+SHUTDOWN_OP = 'shutdown'
+# release_daemon() results.
+DAEMON_STOPPED, DAEMON_NOT_RUNNING, DAEMON_IN_USE = 'stopped', 'not_running', 'in_use'
+_SHUTDOWN_REPLY_SECONDS = 5
+_PROVIDER_ID = 'neospike'
 _PRIORITY_RANK = {'interactive': 0, 'indexing': 1}
 _UNIX_SOCKET_LIMIT = 104
 _MAX_REQUEST_SECONDS = 120
@@ -51,8 +57,14 @@ _CONN_JOIN_SECONDS = 3
 _LISTEN_BACKLOG = 32
 _DEFAULT_REQUEST_SECONDS = 30
 _SPIN_SLEEP = .025
+_LAUNCH_GUARD_NAME = 'launch.lock'
 _MAIN_WAIT_SLICE = .5
 _TOKEN_READ_LIMIT = 256
+# Mirror embedder.TOKENIZER_JSON / ONNX_MODEL_FILE / MODEL_FOLDER: importing embedder loads the model packages.
+MODEL_FILE_NAMES = ('tokenizer.json', 'sentence_transformers_int8.onnx')
+MODEL_FOLDER = 'bge-m3-onnx'
+_MODEL_DIR_ENV = 'HERMES_BGE_M3_DIR'
+_MODEL_MISSING_EXIT = 1
 
 _ERR = {
     'dir_owner': 'Inference directory must be owned by this user, not a symlink',
@@ -78,7 +90,29 @@ _ERR = {
     'owner_busy': 'Inference service owns profile but is not ready',
     'launching': 'Inference launch in progress; service is not ready',
     'spawn_failed': 'Inference service failed to start; see private inference.log',
+    'model_missing': 'Embedding model file not found: {path} (put bge-m3-onnx there or set HERMES_BGE_M3_DIR)',
 }
+
+
+class EmbeddingUnavailable(RuntimeError):
+    """The embedding service cannot answer: an error reply of the daemon, or a daemon that cannot be started.
+    A RuntimeError, so callers that catch RuntimeError keep working."""
+
+
+def missing_model_message(home=None):
+    """The model-missing error for the first model file the daemon would fail to load, or None when all exist.
+    Resolves the folder as embedder.resolve_model_dir does in a daemon whose HERMES_HOME is *home*
+    (None: this process's HERMES_HOME)."""
+    configured = os.environ.get(_MODEL_DIR_ENV)
+    if configured:
+        model_dir = pathlib.Path(configured).expanduser()
+    else:
+        base = _wc.default_hermes_home() if home is None else home
+        model_dir = _wc.shared_inference_home(base) / 'models' / MODEL_FOLDER
+    for name in MODEL_FILE_NAMES:
+        if not (model_dir / name).is_file():
+            return _ERR['model_missing'].format(path=model_dir / name)
+    return None
 
 
 def _not_mine(info):
@@ -143,6 +177,9 @@ class LocalModelRunner:
         if op not in _OPS:
             raise ValueError(_ERR['bad_op'])
         if self.text is None:
+            missing = missing_model_message()
+            if missing:
+                raise FileNotFoundError(missing)
             from .embedder import OnnxDenseEmbedder
             self.text = OnnxDenseEmbedder()
         if op == 'query':
@@ -166,6 +203,8 @@ class EmbeddingDaemon:
         self.conn_slots = threading.BoundedSemaphore(connections)
         self.ticket_seq = itertools.count()
         self.stop_event = threading.Event()
+        # Set by an authenticated shutdown request or a stop signal; main() waits on it.
+        self.shutdown_requested = threading.Event()
         self.lifetime_lock = None
         self.server_sock = None
         self.secret = None
@@ -259,6 +298,12 @@ class EmbeddingDaemon:
             request = self._authenticated_request(conn)
             if request.get('op') == 'ping':
                 _write_frame(conn, {'result': {'pid': os.getpid()}})
+                return
+            if request.get('op') == SHUTDOWN_OP:
+                # Set before the answer, so a caller that got it knows the stop is under way; main() then
+                # leaves its wait, and close() waits for this connection and the in-flight model call.
+                self.shutdown_requested.set()
+                _write_frame(conn, {'result': {'pid': os.getpid(), 'stopping': True}})
                 return
             future, seconds = self._enqueue(request)
             try:
@@ -368,9 +413,11 @@ def _stamp(handle, text=''):
 class EmbeddingClient:
     dimensions = EMBEDDING_DIMENSIONS
 
-    def __init__(self, profile_home, *, timeout: float = 30, startup_timeout: float = 10):
+    def __init__(self, profile_home, *, timeout: float = 30, startup_timeout: float = 10, paused=None):
         # A single shared daemon serves every profile (_wincompat.shared_inference_home); memory DBs stay per profile.
         self.home = _wc.shared_inference_home(profile_home)
+        # paused(): True refuses every embedding request before a daemon is reached or started (the on/off switch).
+        self.paused = paused
         self.directory = self.home / 'neospike' / '.cache'
         self.timeout = timeout
         if startup_timeout <= 0 or not math.isfinite(startup_timeout):
@@ -424,23 +471,22 @@ class EmbeddingClient:
             _stamp(log_file)
             child_env = {name: setting for name, setting in os.environ.items() if name != 'PYTHONPATH'}
             child_env['HERMES_HOME'] = str(self.home)  # the shared daemon finds models/cache under its own home
-            interpreter = _wc.detached_interpreter(_wc.inference_python(), child_env)
-            command = [interpreter, '-m', 'neospike.inference', '--home', str(self.home),
-                       *_wc.launch_fd_args(guard.fileno())]
+            command = _wc.inference_command(self.home, ['--home', str(self.home),
+                                                         *_wc.launch_fd_args(guard.fileno())], child_env)
             return subprocess.Popen(
                 command, env=child_env, cwd=str(pathlib.Path(__file__).resolve().parent.parent),
                 stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file,
                 **_wc.detached_popen_kwargs(guard.fileno()))
 
     def _open_launch_guard(self):
-        guard_path = self.directory / 'launch.lock'
+        guard_path = self.directory / _LAUNCH_GUARD_NAME
         if not _wc.IS_WINDOWS:
             return _open_owner_file(guard_path)
         # Windows cannot hand a flock to a new process; the inherited no-sharing handle serves as the guard.
         try:
             return _open_owner_file(guard_path, unshared=True)
         except BlockingIOError:
-            raise RuntimeError(_ERR['launching']) from None
+            raise EmbeddingUnavailable(_ERR['launching']) from None
 
     def ensure_daemon(self):
         countdown = _Countdown(self.startup_timeout)
@@ -453,20 +499,24 @@ class EmbeddingClient:
                 time.sleep(min(_SPIN_SLEEP, countdown.left()))
             if self._daemon_responds(countdown):
                 return
+            # A daemon without its model files could only answer errors while staying resident.
+            missing = missing_model_message(self.home)
+            if missing:
+                raise EmbeddingUnavailable(missing)
             # Failure backoff shared by every starter, including one that was killed mid-launch.
             gate.seek(0)
             stamped = gate.read().strip()
             if stamped and 0 <= time.monotonic() - float(stamped) < _FAILURE_BACKOFF_SECONDS:
-                raise RuntimeError(_ERR['recent_failure'])
+                raise EmbeddingUnavailable(_ERR['recent_failure'])
             # The lifetime lock is authoritative, even if its owner is unable to answer a ping.
             with _open_owner_file(self.directory / 'owner.lock') as lifetime:
                 if not _try_flock(lifetime):
-                    raise RuntimeError(_ERR['owner_busy'])
+                    raise EmbeddingUnavailable(_ERR['owner_busy'])
             # The second flock survives exec, so the child holds the guard from its first instruction
             # even when this starter exits; a timestamp or a PID could not pass that along.
             with self._open_launch_guard() as guard:
                 if not _try_flock(guard):
-                    raise RuntimeError(_ERR['launching'])
+                    raise EmbeddingUnavailable(_ERR['launching'])
                 _stamp(gate, str(time.monotonic()))
                 try:
                     child = self._spawn_daemon(guard)
@@ -474,7 +524,7 @@ class EmbeddingClient:
                     threading.Thread(target=child.wait, daemon=True).start()
                     while not self._daemon_responds(countdown):
                         if child.poll() is not None:
-                            raise RuntimeError(_ERR['spawn_failed'])
+                            raise EmbeddingUnavailable(_ERR['spawn_failed'])
                         time.sleep(min(_SPIN_SLEEP, countdown.left()))
                     _stamp(gate)
                 except BaseException:
@@ -483,8 +533,18 @@ class EmbeddingClient:
 
     def request(self, op, value='', *, priority='interactive', **extra):
         if op in _OPS:
+            if self.paused is not None and self.paused():
+                raise EmbeddingUnavailable(PAUSED_MESSAGE)
             self.ensure_daemon()
         return self._exchange(op, value, priority=priority, **extra)
+
+    def request_shutdown(self):
+        """Ask the running daemon to stop; True when it accepted, False when none runs. Never starts one."""
+        try:
+            self._exchange(SHUTDOWN_OP, socket_timeout=_SHUTDOWN_REPLY_SECONDS)
+        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
+            return False
+        return True
 
     def _read_token(self):
         folder = self.directory.lstat()
@@ -511,7 +571,7 @@ class EmbeddingClient:
                                     timeout=self.timeout, priority=priority, **extra))
             response = _read_frame(conn)
         if 'error' in response:
-            raise RuntimeError(response['error'])
+            raise EmbeddingUnavailable(response['error'])
         warnings = response.get('warnings')
         if warnings and isinstance(warnings, list):
             with self._reported_warnings_lock:
@@ -523,6 +583,27 @@ class EmbeddingClient:
 
     def embed_document(self, passage, *, title='none'):
         return self.request('document', passage, title=title, priority='indexing')
+
+
+def daemon_users(profile_home):
+    """The other homes served by the daemon of *profile_home* that still use Neospike: memory.provider is
+    neospike and the on/off switch is on (the root home, then its Neospike profiles)."""
+    from .cron.neospike_cron_common import configured_memory_provider, target_homes
+    own = pathlib.Path(profile_home).expanduser().resolve()
+    homes = target_homes(_wc.shared_inference_home(profile_home))
+    return [home for home in homes if home.resolve() != own
+            and configured_memory_provider(home) == _PROVIDER_ID and read_enabled(home)]
+
+
+def release_daemon(profile_home):
+    """(DAEMON_STOPPED | DAEMON_NOT_RUNNING | DAEMON_IN_USE, the homes still using it). *profile_home* stops
+    using the shared daemon (uninstall, or its switch turned off); the daemon is asked to stop only when no
+    other home uses it. OSError when a running daemon could not be reached."""
+    users = daemon_users(profile_home)
+    if users:
+        return DAEMON_IN_USE, users
+    stopped = EmbeddingClient(profile_home).request_shutdown()
+    return (DAEMON_STOPPED if stopped else DAEMON_NOT_RUNNING), []
 
 
 class _StopFlagSetter:
@@ -543,16 +624,21 @@ def main():
     home = pathlib.Path(args.home).expanduser()
     os.environ.setdefault("HERMES_HOME", str(home))
     daemon = EmbeddingDaemon(home)
-    stop_requested = threading.Event()
+    stop_requested = daemon.shutdown_requested
     # On Windows a graceful stop is delivered as CTRL_BREAK_EVENT (SIGBREAK).
     for signal_number in (signal.SIGINT, signal.SIGTERM, *_wc.stop_signals()):
         signal.signal(signal_number, _StopFlagSetter(stop_requested))
     try:
+        # However it was started, a daemon without its model files never reports ready.
+        missing = missing_model_message()
+        if missing:
+            print(json.dumps({'error': missing}), file=sys.stderr, flush=True)
+            raise SystemExit(_MODEL_MISSING_EXIT)
         daemon.start()
     finally:
         # Drop the inherited guard only after start() holds owner.lock for itself.
         if args.launch_fd is not None:
-            _wc.close_launch_fd(args.launch_fd)
+            _wc.close_launch_fd(args.launch_fd, daemon.directory / _LAUNCH_GUARD_NAME)
     print(json.dumps({'ready': str(daemon.socket_path), 'pid': os.getpid()}), flush=True)
     try:
         # Windows cannot break an unbounded wait with a signal, hence the short slice on that platform.

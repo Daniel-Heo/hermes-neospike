@@ -12,6 +12,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 from neospike import _wincompat as wc
+from neospike import hermes_runtime
 from neospike.inference import EmbeddingClient
 from neospike.tests.test_wincompat import HARD_KILL, wait_pid_exit
 
@@ -42,6 +43,27 @@ def poll_until(check, seconds: float) -> bool:
     return bool(check())
 
 
+FAKE_CHECKOUT_DIR = 'hermes-checkout'
+FAKE_BOOTSTRAP = '"""Test stand-in for the Hermes checkout\'s hermes_bootstrap: selects nothing."""\n'
+
+
+def fake_hermes_checkout(directory: Path) -> Path:
+    """A folder with an empty hermes_bootstrap.py, for hermes_launch.py to import instead of Hermes's."""
+    checkout = Path(directory) / FAKE_CHECKOUT_DIR
+    checkout.mkdir(parents=True, exist_ok=True)
+    (checkout / (hermes_runtime.BOOTSTRAP_MODULE + '.py')).write_text(FAKE_BOOTSTRAP, encoding='utf-8')
+    return checkout
+
+
+def use_test_runtime(tmp_path: Path, monkeypatch) -> Path:
+    """Child processes start through hermes_launch.py on this interpreter and the fake checkout, never the
+    installed Hermes (HERMES_PYTHON is the runtime python fallback when there is no runtime.json)."""
+    checkout = fake_hermes_checkout(tmp_path)
+    monkeypatch.setenv(hermes_runtime.ENV_PYTHON, sys.executable)
+    monkeypatch.setenv(hermes_runtime.ENV_CHECKOUT, str(checkout))
+    return checkout
+
+
 @contextmanager
 def profile_root(tmp_path: Path, monkeypatch):
     """Yield a directory that holds throw-away profile homes.
@@ -49,8 +71,8 @@ def profile_root(tmp_path: Path, monkeypatch):
     POSIX uses a short /tmp path so the AF_UNIX path limit is never hit; Windows uses pytest's temp
     root (it purges itself, and a just-killed venv launcher may still hold a log file there).
     """
+    use_test_runtime(tmp_path, monkeypatch)
     if ON_WINDOWS:
-        monkeypatch.setenv('HERMES_PYTHON', sys.executable)  # never the installed Hermes venv
         wc.chmod(tmp_path, 0o700)  # drop any foreign ACE inherited from the temp root
         holder = nullcontext(str(tmp_path))
     else:

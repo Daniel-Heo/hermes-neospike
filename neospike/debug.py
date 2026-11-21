@@ -22,8 +22,35 @@ _ENTRY_COUNT_CAP = 12
 _ENTRY_CHARS_CAP = 2800
 _HIDDEN_RECALL = "Context hidden by safety filter."
 _HIDDEN_EXCERPT = "content hidden by safety filter"
+_DELETED_RECALL = "Context hidden after record deletion."
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _MARKUP_RE = re.compile(r"([\\`*_{}\[\]#|!])")
+
+_TITLE = "**Neospike: diagnostics**"
+_SEPARATOR = "---"
+# A literal "> " row marker: a real blockquote would swallow the following lines (lazy continuation).
+_QUOTE_MARK = "\\> "
+# CommonMark hard line break; visible, so it survives trailing-whitespace stripping.
+_LINE_BREAK = "\\\n"
+_RECALL_HEAD = "Retrieved context:"
+_RECALL_NONE = "Retrieved context: none."
+_SEARCH_HEAD = "Explicit search — passed to agent:"
+_SEARCH_NONE = "No matches."
+_CHANGES_HEAD = "Memory changes:"
+_OBSERVED_HEAD = "Observed results:"
+_NO_SAVE_UNCHANGED = "No saves: the operation did not change memory."
+_NO_SAVE_NO_WRITE = "No saves: Neospike received no successful write operation."
+_FAILURES_HEAD = "Rejections/failures:"
+_TRUNCATED = "Diagnostics truncated."
+# Lines a diagnostics block (current or older blank-line format) can consist of, for spotting copies.
+_BLOCK_LINES = frozenset({
+    "", _SEPARATOR, _TITLE, _RECALL_HEAD, _RECALL_NONE, _HIDDEN_RECALL, _DELETED_RECALL, _SEARCH_HEAD,
+    _SEARCH_NONE, _CHANGES_HEAD, _OBSERVED_HEAD, _FAILURES_HEAD, _TRUNCATED,
+})
+_BLOCK_LINE_PREFIXES = ("• ", "- ", "* ", "> ", _QUOTE_MARK)
+_NO_SAVE_PREFIX = "No saves:"
+# Section headings whose following lines (model-written copies may drop the bullets) belong to the block.
+_SECTION_HEADS = (_RECALL_HEAD, "Explicit search", _CHANGES_HEAD, _OBSERVED_HEAD, _FAILURES_HEAD)
 
 
 def _inert(value: object, cap: int = 240) -> str:
@@ -31,6 +58,53 @@ def _inert(value: object, cap: int = 240) -> str:
     text = str(value).replace("\x00", "").replace("\r", " ").replace("\n", " ")
     text = html.escape(_CONTROL_RE.sub(" ", text)[:cap], quote=False)
     return _MARKUP_RE.sub(r"\\\1", text)
+
+
+def _clip(text: str, cap: int) -> str:
+    """Cut to cap without leaving half of a backslash escape at the end."""
+    clipped = text[:cap]
+    trailing = len(clipped) - len(clipped.rstrip("\\"))
+    return clipped[:-1] if trailing % 2 else clipped
+
+
+def _block_line(line: str) -> str:
+    text = line.strip()
+    return text[:-1].rstrip() if text.endswith("\\") else text
+
+
+def _is_block_tail(lines: list[str], start: int) -> bool:
+    """Whether lines[start:] read as diagnostics blocks only: fixed lines, bullet rows, section text."""
+    in_section = False
+    for line in lines[start:]:
+        text = _block_line(line)
+        if text.endswith(":") and text.startswith(_SECTION_HEADS):
+            in_section = True
+        elif text in _BLOCK_LINES or text.startswith(_NO_SAVE_PREFIX):
+            in_section = False
+        elif not in_section and not text.startswith(_BLOCK_LINE_PREFIXES):
+            return False
+    return True
+
+
+def strip_block_copies(response: str) -> str:
+    """Remove diagnostics blocks the model copied onto the end of its reply.
+
+    The cut starts at the first title line from which everything to the end reads as diagnostics blocks,
+    together with the separator above it; text above that title (lists included) and a title quoted
+    inside the reply are left alone.
+    """
+    lines = response.splitlines(keepends=True)
+    for cut, line in enumerate(lines):
+        if _block_line(line) == _TITLE and _is_block_tail(lines, cut):
+            break
+    else:
+        return response
+    above = cut
+    while above > 0 and not _block_line(lines[above - 1]):
+        above -= 1
+    if above > 0 and _block_line(lines[above - 1]) == _SEPARATOR:
+        cut = above - 1
+    return "".join(lines[:cut])
 
 
 @dataclass
@@ -79,8 +153,8 @@ class TurnTraceLog:
             if screen_text(rendered) is AdmitVerdict.BLOCK:
                 trace.recall = _HIDDEN_RECALL
                 return
-            quoted = "\n".join("> " + _inert(row, 600) for row in rendered.splitlines() if row.strip())
-            trace.recall = quoted[:_RECALL_CAP]
+            quoted = "\n".join(_QUOTE_MARK + _inert(row, 600) for row in rendered.splitlines() if row.strip())
+            trace.recall = _clip(quoted, _RECALL_CAP)
             trace.clipped |= len(quoted) > _RECALL_CAP
 
     def change(self, key: str, fact: object, scope: object, *, action: str = "Saved") -> None:
@@ -101,8 +175,8 @@ class TurnTraceLog:
                 if screen_text(str(excerpt)) is AdmitVerdict.BLOCK:
                     excerpt = _HIDDEN_EXCERPT
                 rows.append(f"• #{_inert(hit.get('id', '?'), 30)}: {_inert(excerpt)}")
-            body = '\n'.join(rows) if rows else 'No matches.'
-            trace.search = body[:_SEARCH_CAP]
+            body = '\n'.join(rows) if rows else _SEARCH_NONE
+            trace.search = _clip(body, _SEARCH_CAP)
             trace.clipped |= len(body) > _SEARCH_CAP or len(results) > _SEARCH_SHOWN
 
     def record_deletion(self, key: str, memory_id: int | str, *, kind: str = "record") -> None:
@@ -110,7 +184,7 @@ class TurnTraceLog:
             trace = self._trace(key)
             if trace:
                 # A deleted record must not survive as a fresh copy in the chat.
-                trace.recall = "Context hidden after record deletion."
+                trace.recall = _DELETED_RECALL
                 trace.search = ""
                 trace.changes.clear()
                 self.change(key, f"{kind} #{memory_id}", "current accessible scope", action="Deleted")
@@ -134,19 +208,20 @@ class TurnTraceLog:
             trace = self._open_turns.pop(key, None)
         if not enabled or trace is None:
             return response
-        parts = ["**Neospike: diagnostics**"]
-        parts += ["\nRetrieved context:", trace.recall] if trace.recall else ["\nRetrieved context: none."]
+        parts = [_TITLE]
+        parts += [_RECALL_HEAD, *trace.recall.split("\n")] if trace.recall else [_RECALL_NONE]
         if trace.search:
-            parts += ["\nExplicit search — passed to agent:", trace.search]
+            parts += [_SEARCH_HEAD, *trace.search.split("\n")]
         if trace.changes:
-            parts += ["\nMemory changes:", *trace.changes]
+            parts += [_CHANGES_HEAD, *trace.changes]
         if trace.unsure_outcomes:
-            parts += ["\nObserved results:", *trace.unsure_outcomes]
+            parts += [_OBSERVED_HEAD, *trace.unsure_outcomes]
         if not trace.changes and not trace.unsure_outcomes:
-            parts.append("\nNo saves: the operation did not change memory." if trace.write_attempted
-                         else "\nNo saves: Neospike received no successful write operation.")
+            parts.append(_NO_SAVE_UNCHANGED if trace.write_attempted else _NO_SAVE_NO_WRITE)
         if trace.failures:
-            parts += ["\nRejections/failures:", *trace.failures]
+            parts += [_FAILURES_HEAD, *trace.failures]
         if trace.clipped:
-            parts.append("\nDiagnostics truncated.")
-        return response.rstrip() + "\n\n---\n\n" + "\n".join(parts)
+            parts.append(_TRUNCATED)
+        # The blank line keeps "---" a separator: right under a paragraph it would turn it into a heading.
+        body = strip_block_copies(response).rstrip()
+        return body + "\n\n" + _SEPARATOR + "\n" + _LINE_BREAK.join(parts)

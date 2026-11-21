@@ -36,12 +36,12 @@ On top of that storage:
 4. **Topics.** A linked group of more than 5 memories without a topic becomes a topic. A topic with more than 10 memories becomes an automatic note with one section per memory, and those memories and the topic are removed.
 5. **Your edits win.** A correction applies at once and the old text is kept as history. Automated jobs never change a note you wrote.
 
-Steps 3 and 4 are plain code. They run after a save and in the daily job; no LLM is called. Preferences and constraints that are similar but not exact duplicates are judged once a day by an LLM (see [Daily job](#daily-job)).
+Steps 3 and 4 are plain code. They run after a save and in the daily job; no LLM is called. Preferences and constraints that are similar but not exact duplicates are judged once a day by an LLM, inside Hermes (see [Preference tidy-up](#preference-tidy-up)).
 
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent). The web dashboard is needed only for the Neospike tab.
-- Python 3.11 or newer, and [uv](https://docs.astral.sh/uv/) on the `PATH` (the installer uses it because Hermes environments may not include pip).
+- Python 3.11 or newer to run `install.py`. [uv](https://docs.astral.sh/uv/) on the `PATH` is needed only when an earlier version of `install.py` installed the package into the Hermes CLI environment (`hermes-agent/venv`); the installer uses it to remove that copy.
 - About 600 MB of disk space for the embedding model.
 
 The embedding model is BAAI/bge-m3 as an int8 ONNX file from `Xenova/bge-m3`, pinned to one revision. It produces 1,024-dimension vectors and reads up to 2,048 tokens per input. It is MIT-licensed and not gated, so no Hugging Face account is needed. The plugin does not ship the model; the installer downloads it.
@@ -65,13 +65,13 @@ Opening a new Desktop window is not enough: the running gateway keeps the old co
 
 `install.py` does the following, in this order:
 
-1. installs the package into the Python that Hermes uses for its CLI;
-2. copies the plugin to `$HERMES_HOME/plugins/neospike` (an existing copy is kept as `neospike.previous`) and adds it to `plugins.enabled`;
+1. finds the Hermes runtime Python and, if an earlier version installed the `neospike` package into the Hermes CLI environment (`hermes-agent/venv`), removes that package (only that one) with `uv pip uninstall`;
+2. copies the plugin to `$HERMES_HOME/plugins/neospike` (the new copy is staged in `$HERMES_HOME/neospike/.install/staging` and the existing copy is kept as `$HERMES_HOME/neospike/.install/previous`, outside `plugins`, because Hermes loads every folder there as a plugin; `neospike.previous` and `neospike.installing` folders an earlier version left in `plugins` are deleted) and adds it to `plugins.enabled`;
 3. creates `MEMORY_RULE.md` for each Hermes home that uses Neospike, unless the file already exists;
-4. enables the plugin so that the Hermes package manager installs `numpy` and `faiss-cpu` into the Hermes runtime;
+4. enables the plugin so that the Hermes package manager installs `numpy`, `faiss-cpu`, `tokenizers`, `onnxruntime` and `huggingface-hub` into the Hermes runtime;
 5. downloads the model;
 6. sets `memory.provider` to `neospike`;
-7. registers the daily cron job `neospike-daily` (every day at 4am);
+7. registers the daily cron job `neospike-daily` (every day at 12pm);
 8. registers the `neospike` MCP server in Claude Code at user scope.
 
 | Option | Effect |
@@ -80,8 +80,21 @@ Opening a new Desktop window is not enough: the running gateway keeps the old co
 | `--skip-models` | Do not download the model. |
 | `--check` | Verify an existing installation and change nothing. |
 | `--dry-run` | Print the planned copies and commands and change nothing. |
+| `--uninstall` | Remove Neospike from the Hermes home (see [Uninstall](#uninstall)). With `--dry-run`, print the plan only. |
 
 `$HERMES_HOME` is `%LOCALAPPDATA%\hermes` on Windows and `~/.hermes` on Linux and macOS. Data lives in `$HERMES_HOME/neospike`.
+
+### Uninstall
+
+To pause Neospike without removing it, turn it off in the dashboard Config tab (`enabled` below). To remove it:
+
+```bash
+python install.py --uninstall --dry-run   # print the plan
+python install.py --uninstall             # add --home <path> for a profile home
+hermes gateway restart
+```
+
+`--uninstall` removes the cron job `neospike-daily` and the cron scripts in `$HERMES_HOME/scripts` (root home only), the Claude Code MCP server `neospike` (only when it points at that home), asks the embedding service to stop (unless another home still uses Neospike), and runs `hermes plugins remove neospike`, which deletes `$HERMES_HOME/plugins/neospike` and clears `plugins.enabled` and a `memory.provider` of `neospike`; `$HERMES_HOME/neospike/.install` (the previous plugin copy) and any `neospike.previous` or `neospike.installing` left in `plugins` are deleted too. Steps that find nothing to remove are skipped, so it can be run again. Your data (`$HERMES_HOME/neospike`) and the model (`$HERMES_HOME/models/bge-m3-onnx`) stay; the command prints both paths, and you delete those folders yourself if you no longer want them.
 
 ### Hermes profiles
 
@@ -118,6 +131,7 @@ Settings are in `$HERMES_HOME/neospike/config.json`.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `enabled` | `true` | On/off switch (Config tab). `false` pauses Neospike in this home without uninstalling it: no automatic recall, no conversation capture, no save follow-up, tool calls and MCP searches return an error, the daily job skips the home, and the embedding service is asked to stop unless another home uses it. Turning it back on works from the next turn, without a restart. |
 | `conversation_capture` | `true` | Copy user and assistant turns into the conversation store, with secrets masked. |
 | `conversation_prefetch` | `false` | Also add conversation excerpts to automatic recall. |
 | `recall_log_enabled` | `true` | Write one log line per recall under `neospike/logs` (ids and scores only, never the query text). |
@@ -126,9 +140,11 @@ Settings are in `$HERMES_HOME/neospike/config.json`.
 | `map_recent_days` | `7` | Age below which the Map shows an item as recent. |
 | `map_stale_days` | `14` | Age above which the Map shows an item as old. |
 | `extraction_language` | `en` | Language (`en` or `ko`) Neospike uses when it extracts memories from conversations. Set it in the Config tab. |
-| `pref_reconcile_enabled` | `true` | Run the daily `pref-reconcile` stage, the only stage that calls an LLM. |
+| `pref_reconcile_enabled` | `true` | Run the daily preference tidy-up (the Hermes idle task `neospike-pref-reconcile`), the only Neospike job that calls an LLM. |
 
 The rules that tell the agent what to save are the text of `$HERMES_HOME/neospike/MEMORY_RULE.md`. Edit it in the Config tab or in any editor.
+
+The model of the preference tidy-up is picked in the Config tab ("Preference and constraint cleanup model"). It is not in `config.json`: it is the Hermes auxiliary slot `auxiliary.neospike_pref_reconcile` (provider, model) of `$HERMES_HOME/config.yaml`, the same value the Hermes auxiliary model screen shows. `auto`, which `install.py` sets only when the slot is missing, follows the chat model. Models reached with an API key are marked ` API`.
 
 Environment variables:
 
@@ -141,26 +157,35 @@ Environment variables:
 
 ## Daily job
 
-`neospike-daily` runs these stages in order. All of them are code only, except `pref-reconcile`.
+`neospike-daily` runs every day at 12pm and runs these stages in order. All of them are code only; none calls an LLM.
 
 1. `backup`: back up the database.
 2. `link-prune`: remove links whose memory or note is gone.
 3. `conv-import`: bring in conversations added or changed since the last run.
 4. `conv-index`: index the new conversation text.
 5. `embed-pending`: embed memories that were saved while the embedder was unavailable, then link them.
-6. `pref-reconcile`: find preference or constraint pairs of the same user with cosine 0.8 or more that are not exact duplicates, and ask an LLM (32 pairs per call, at most 4 calls a day) to keep both, merge them, or delete one. A preference the user stated is never deleted because of one the agent inferred. Pairs judged "keep" are not asked again until one of them changes. A merged row is embedded the next day.
-7. `topic-discover`: turn linked groups into topics.
-8. `topic-to-note`: turn large topics into notes.
+6. `topic-discover`: turn linked groups into topics.
+7. `topic-to-note`: turn large topics into notes.
 
 A failure is reported to Bot Chat. A successful run reports nothing.
+
+The schedule is Hermes cron's. If Hermes is not running at 12pm, Hermes runs the missed job once when it runs again (`cron.catch_up_missed`, on by default). A run that started but was cut off, for example by shutting the computer down, is not repeated; the next run is the next day. `hermes cron run <job id>` runs it at once.
+
+### Preference tidy-up
+
+Hermes runs this as the plugin idle task `neospike-pref-reconcile`: at most once every 24 hours, and only after Hermes has been idle for 2 hours (the Hermes default). It finds preference or constraint pairs of the same user with cosine 0.8 or more that are not exact duplicates, and asks an LLM (32 pairs per call, at most 4 calls a run) to keep both, merge them, or delete one. A preference the user stated is never deleted because of one the agent inferred. Pairs judged "keep" are not asked again until one of them changes. A merged row is embedded by the next daily job.
+
+- **Model.** The call goes through the Hermes plugin LLM (`ctx.llm`) with the auxiliary task `neospike_pref_reconcile`: set `auxiliary.neospike_pref_reconcile` in the Hermes config to pick a model, otherwise the main model is used.
+- **When it is scheduled.** Only when Hermes loads Neospike as a general plugin as well as the memory provider: `plugin.yaml` declares `kind: standalone` and `install.py` adds `neospike` to `plugins.enabled`. If `neospike` is not in `plugins.enabled`, the tidy-up does not run.
+- **Turning it off.** Set `pref_reconcile_enabled` to `false`, or pause Neospike (`enabled: false`). `hermes plugins idle-tasks neospike` shows the task; add `--pause neospike-pref-reconcile` to pause it. `neospike pref-reconcile` on the command line only explains this and exits 1.
 
 ## Command line
 
 ```bash
-python -m neospike.cli --home <home> <command>
+<runtime python> -I $HERMES_HOME/plugins/neospike/hermes_launch.py <hermes checkout> neospike.cli --home <home> <command>
 ```
 
-Use the Python that `install.py` installed the package into. `--help` lists every command. The main groups are:
+`<runtime python>` is the first element that `hermes --print-runtime-command` prints (`install.py` saves it as `runtime_python` in `$HERMES_HOME/neospike/runtime.json`), and `<hermes checkout>` is the `hermes-agent` folder. `hermes_launch.py` starts Python the way the Hermes launcher does, so the command runs with the packages the Hermes package manager installed, and puts the plugin folder on the import path. The dashboard, the cron job, the MCP server and the embedding service run Neospike the same way. `--help` lists every command. The main groups are:
 
 - memories: `memory-search`, `memory-count`, `memory-update`, `memory-delete`, `memory-revisions`, `memory-restore`
 - notes: `note-save`, `note-read`, `note-search`, `note-delete`, `note-restore`
@@ -168,14 +193,27 @@ Use the Python that `install.py` installed the package into. `--help` lists ever
 - conversations: `conv-import`, `conv-index`, `conv-search`, `conv-read`
 - backup and maintenance: `backup`, `backup-restore`, `reembed`
 
+A command prints its result as JSON. A failed command prints `{"error": ..., "message": ...}` and exits 1, also when the embedding model or the embedding service is not available (the message names the missing model file); a wrong argument prints the usage and exits 2.
+
 A database embedded with a different model or dimension is refused until `reembed` rewrites its vectors. Back up `neospike/memory.db` first.
 
 ## Privacy
 
-- Embedding, search and every background job run on your machine. Only the daily `pref-reconcile` stage calls an LLM: it sends pairs of similar preferences (text, situation, basis, time) to the auxiliary model Hermes is configured with (`auxiliary.neospike_pref_reconcile` in the Hermes config, else the main model). Set `pref_reconcile_enabled` to `false` to stop it.
+- Embedding, search and every background job run on your machine. Only the daily preference tidy-up calls an LLM: it sends pairs of similar preferences (text, situation, basis, time) through the Hermes plugin LLM to the model Hermes is configured with (`auxiliary.neospike_pref_reconcile` in the Hermes config, else the main model). Set `pref_reconcile_enabled` to `false` to stop it.
 - Recalled text goes only to the model your agent already uses.
 - Text that looks like a credential or a prompt-injection attempt is rejected when it is saved.
 - Recalled text is given to the agent as data, not as instructions.
+
+## Disclosure
+
+What Neospike does outside its own data folder (`$HERMES_HOME/neospike`):
+
+- **Network.** Two things contact a remote host. (1) The model download: `install.py` and the dashboard Setup tab run the Hugging Face CLI (`hf download Xenova/bge-m3` at a pinned revision). (2) The daily preference tidy-up calls an LLM through Hermes (the plugin LLM `ctx.llm`), so the request goes to the model and endpoint your Hermes config chooses (see [Privacy](#privacy)). The packages are installed by the Hermes package manager (`hermes plugins enable`), which downloads them from the package index. The embedding service listens only on a local socket (a Unix socket, or `127.0.0.1` with a per-request token on Windows). There is no telemetry, analytics or update check.
+- **Reads outside the data folder.** `conv-import`, the provider and the dashboard open Hermes's `$HERMES_HOME/state.db` read-only to read past conversations. `install.py` reads `$HERMES_HOME/config.yaml` and `$HERMES_HOME/cron/jobs.json`. The daily cron script reads `config.yaml` of the root home and of each profile (`memory.provider`) to find the homes that use Neospike.
+- **Shell commands and child processes.** All of them run without a shell. `install.py` runs `hermes --print-runtime-command` (to find the Hermes runtime Python), `uv pip uninstall neospike` (only when an earlier install left that package in the Hermes CLI environment), `hf download`, the environment, import and provider checks of `neospike.runtime_check`, `hermes plugins enable`, `hermes config set memory.provider neospike`, `hermes cron create` / `edit` / `remove`, and `claude mcp remove` / `add-json`; with `--check` it also runs `hermes memory status`; with `--uninstall` it runs `hermes cron remove`, `claude mcp get` / `remove`, `hermes plugins remove neospike` (or `hermes memory off` when the plugin folder is already gone). The dashboard runs `hermes config get` / `set memory.provider`, `hf download`, the Neospike CLI, and the dependency and provider checks of `neospike.runtime_check`. The provider checks the embedding service's dependencies with `neospike.runtime_check` before it reports itself available. The MCP server runs the Neospike CLI for writes. Every Python child (`hf download`, the CLI, the checks, the MCP server, the cron script's CLI call and the embedding service) runs on the Hermes runtime Python through `hermes_launch.py`, which imports Hermes's `hermes_bootstrap` to select the package manager's environment.
+- **Long-running background process.** The embedding service (`neospike.inference`, started through `hermes_launch.py`) is started on first use as a detached process and keeps running after the agent exits; one service serves every profile of a Hermes home. It stops on Ctrl-C or SIGTERM, or when asked over its socket (with its token) by `install.py --uninstall` or by turning the Config tab switch off, unless another home still uses it. Its socket and log (`inference.log`) are in `$HERMES_HOME/neospike/.cache`. Inside the provider, the conversation indexer and the save follow-up run as daemon threads.
+- **Files written outside the data folder.** `install.py` copies the plugin to `$HERMES_HOME/plugins/neospike` (staged in, and the previous copy kept in, `$HERMES_HOME/neospike/.install`; a `neospike.previous` or `neospike.installing` folder an earlier install left in `$HERMES_HOME/plugins` is removed, because Hermes would load it as a second copy of the plugin), the cron scripts to `$HERMES_HOME/scripts`, the model to `$HERMES_HOME/models/bge-m3-onnx`, adds `neospike` to `plugins.enabled` in `$HERMES_HOME/config.yaml` (and, through `hermes config set`, `auxiliary.neospike_pref_reconcile.provider: auto` in each home that has no such slot), and registers the `neospike` MCP server in Claude Code at user scope through `claude mcp add-json`. `MEMORY_RULE.md` is created inside the data folder.
+- **Credentials.** Neospike stores no tokens, API keys or passwords. The model is not gated, so no Hugging Face token is needed. The LLM call goes through Hermes, which holds the provider credentials; Neospike never reads them. The dashboard passes its child processes only a fixed list of environment variables and discards their output.
 
 ## Development
 

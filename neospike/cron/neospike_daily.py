@@ -1,10 +1,11 @@
 ﻿"""Daily Neospike maintenance (`hermes cron create --no-agent`).
 
-Only the pref-reconcile stage calls an LLM (Hermes's auxiliary model; off with "pref_reconcile_enabled": false
-in <home>/neospike/config.json); every other stage is plain code.
+Every stage is plain code; no LLM is called. (The LLM tidy-up of similar preferences runs inside Hermes as
+the plugin idle task "neospike-pref-reconcile", not here.)
 
 Stages run in order and a failed stage does not stop the rest. The stages run for every home of
-common.target_homes (root first, then the Neospike profiles); a failed home does not stop the others.
+common.active_homes (root first, then the Neospike profiles; a home whose "enabled" is false is skipped); a failed
+home does not stop the others.
 Success prints nothing (Hermes then delivers nothing). Any failure prints one line per home ("<home>: ok", or
 "<home>: " and its failed stages joined by " | ", a backup failure always first) and exits 1, so Hermes sends
 it to the job's failure delivery.
@@ -42,9 +43,6 @@ def stages(home: Path, until: float | None = None) -> list[tuple[str, list[str]]
         # first stage that reads memory vectors. It ends with the save follow-up a turn runs itself:
         # note-absorb (cos >= 0.8 to an automatic note chunk) then topic-assign, for what no turn handled.
         ("embed-pending", ["embed-pending"]),
-        # Similar preference/constraint pairs (cos >= 0.8, not the save-time duplicates): an LLM decides
-        # keep / update / delete per pair, a few calls a day; rewritten rows are embedded the next day.
-        ("pref-reconcile", ["pref-reconcile"]),
         # A linked group of more than 5 memories without a topic becomes a topic (applied at once).
         ("topic-discover", ["topic-discover"]),
         # A topic with more than 10 live members becomes an automatic note (memories, topic deleted).
@@ -77,7 +75,7 @@ def run_home(home: Path, until: float | None = None) -> list[str]:
 
 def main() -> int:
     until = time.time()  # boundary T of this batch, the same for every home
-    results = [(home, run_home(home, until)) for home in common.target_homes(common.home_dir())]
+    results = [(home, run_home(home, until)) for home in common.active_homes(common.home_dir())]
     if not any(failures for _, failures in results):
         return 0
     for home, failures in results:

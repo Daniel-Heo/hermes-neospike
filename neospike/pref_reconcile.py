@@ -1,5 +1,8 @@
 ﻿"""Daily tidy-up of similar preference/constraint pairs, judged by an LLM.
 
+It runs inside Hermes as a plugin idle task (once a day, when Hermes has been idle), with the host-owned plugin
+LLM (ctx.llm) routed through the auxiliary task auxiliary.neospike_pref_reconcile. No Hermes internals are imported.
+
 Code picks the pairs: rows of the same owner whose text vectors have cos >= RememberTuning.CONTRADICTION_COSINE
 and that the save-time duplicate rule (notes.tidy_saved_preference) does not already remove. An LLM then decides
 per pair: keep both, update (rewrite one row, delete the other) or delete (delete one row). Decisions are applied
@@ -10,16 +13,15 @@ hashes of both rows), so the same pair is not asked again until one of its rows 
 from __future__ import annotations
 
 import json
+import logging
 import math
-import os
-import sys
 from array import array
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import preferences as pref_ops
-from .config import EXTRACTION_LANGUAGE_DEFAULT, LANGUAGE_NAMES, NeospikeConfig
-from .hermes_runtime import hermes_agent_dir
+from .config import EMBEDDING_DIMENSIONS, EXTRACTION_LANGUAGE_DEFAULT, LANGUAGE_NAMES, NeospikeConfig, read_enabled
+from .database import canonical_database_path
 from .notes import RememberTuning
 from .store import MemoryStore, dot_similarities, vector_present_sql
 
@@ -27,9 +29,14 @@ ACTION_KEEP, ACTION_UPDATE, ACTION_DELETE = "keep", "update", "delete"
 ACTIONS = (ACTION_KEEP, ACTION_UPDATE, ACTION_DELETE)
 KEPT_META_KEY = "pref_reconcile_kept"
 LLM_TASK = "neospike_pref_reconcile"  # auxiliary.<task> in the Hermes config picks the model; unset: main model
-# Hermes finishes a pending source update when its bootstrap is imported, re-running this process on another
-# interpreter without our dependencies; Hermes's own POSIX cron scripts run with this switch for that reason.
-LAZY_INSTALL_SWITCH = "HERMES_DISABLE_LAZY_INSTALLS"
+LLM_TASK_DISPLAY_NAME = "Neospike preference tidy-up"
+LLM_TASK_DESCRIPTION = "Daily check of similar stored preferences/constraints: keep both, merge or delete one."
+LLM_PURPOSE = "neospike preference tidy-up"
+IDLE_TASK_NAME = "neospike-pref-reconcile"
+IDLE_INTERVAL_HOURS = 24.0  # Hermes runs it when idle (its default: 2 hours without activity), once a day
+NO_LLM_MESSAGE = ("pref-reconcile needs the Hermes plugin LLM (ctx.llm) and runs inside Hermes as the idle "
+                  "task 'neospike-pref-reconcile'; it cannot run from the command line.")
+logger = logging.getLogger(__name__)
 
 
 class ReconcileTuning:
@@ -69,33 +76,79 @@ def system_prompt(language: str) -> str:
     return SYSTEM_PROMPT.format(language=LANGUAGE_NAMES.get(language, LANGUAGE_NAMES[EXTRACTION_LANGUAGE_DEFAULT]))
 
 
-class HermesLlm:
-    """Hermes's auxiliary LLM call (agent.auxiliary_client.call_llm), as Hermes's own memory plugin uses it."""
+class PluginLlmCall:
+    """One chat completion through the host-owned plugin LLM (``ctx.llm`` of a Hermes PluginContext),
+    routed through the auxiliary task this plugin registers."""
 
-    def __init__(self, home: str | Path) -> None:
-        self._agent_dir = str(hermes_agent_dir(home))
+    def __init__(self, plugin_llm: Any) -> None:
+        self._plugin_llm = plugin_llm
 
     def __call__(self, messages: list[dict]) -> str:
-        os.environ.setdefault(LAZY_INSTALL_SWITCH, "1")
-        if self._agent_dir not in sys.path:
-            sys.path.insert(0, self._agent_dir)
-        from agent.auxiliary_client import call_llm
-        response = call_llm(task=LLM_TASK, messages=messages, temperature=0,
-                            max_tokens=ReconcileTuning.MAX_TOKENS, timeout=ReconcileTuning.TIMEOUT_SECONDS)
-        return _response_text(response)
+        result = self._plugin_llm.complete(messages, temperature=0, max_tokens=ReconcileTuning.MAX_TOKENS,
+                                           timeout=ReconcileTuning.TIMEOUT_SECONDS, task=LLM_TASK,
+                                           purpose=LLM_PURPOSE)
+        text = getattr(result, "text", "")
+        return text if isinstance(text, str) else ""
 
 
-def _response_text(response: Any) -> str:
+class IdleReconcile:
+    """The idle task: one run for the home it was registered in. Hermes calls it with an IdleTaskRun."""
+
+    def __init__(self, plugin_llm: Any, home: str | Path) -> None:
+        self._llm = PluginLlmCall(plugin_llm)
+        self._home = Path(home)
+
+    def __call__(self, run_info: Any = None) -> str:
+        if not read_enabled(self._home):
+            logger.info("Neospike pref-reconcile skipped: Neospike is paused (enabled: false)")
+            return "paused"
+        store = MemoryStore(canonical_database_path(self._home / "neospike", "memory"),
+                            dimensions=EMBEDDING_DIMENSIONS)
+        try:
+            result = run(store, self._home, self._llm)
+        finally:
+            store.close()
+        if result.get("disabled"):
+            logger.info("Neospike pref-reconcile skipped: pref_reconcile_enabled is false")
+            return "disabled"
+        summary = summary_line(result)
+        if result["errors"]:
+            raise RuntimeError(f"{summary}; LLM call failed: {result['errors'][0]}")
+        return summary
+
+
+def summary_line(result: dict) -> str:
+    return (f"asked {result['asked']} of {result['candidates']} pairs in {result['calls']} calls: "
+            f"keep {result[ACTION_KEEP]}, update {result[ACTION_UPDATE]}, delete {result[ACTION_DELETE]}, "
+            f"skipped {result['skipped']}, deferred {result['deferred']}")
+
+
+def register_idle_task(ctx: Any, home: str | Path | None = None) -> bool:
+    """Register the auxiliary LLM slot and the daily idle task on a plugin context that has ``llm``.
+
+    The memory-provider load hands register() a collector without ``llm``; nothing is registered there and
+    the general plugin load (plugin.yaml kind: standalone, listed in plugins.enabled) registers it.
+    Returns True when the task was registered."""
+    plugin_llm = getattr(ctx, "llm", None)
+    if plugin_llm is None:
+        logger.info("Neospike pref-reconcile not scheduled by this load: the plugin context has no llm")
+        return False
     try:
-        content = response.choices[0].message.content
-    except (AttributeError, IndexError, TypeError):
-        return ""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    parts = [part.get("text") if isinstance(part, dict) else getattr(part, "text", None) for part in content]
-    return "".join(part for part in parts if isinstance(part, str))
+        ctx.register_auxiliary_task(LLM_TASK, display_name=LLM_TASK_DISPLAY_NAME,
+                                    description=LLM_TASK_DESCRIPTION)
+        ctx.register_idle_task(IDLE_TASK_NAME, IdleReconcile(plugin_llm, home or _hermes_home()),
+                               interval_hours=IDLE_INTERVAL_HOURS)
+    except Exception as exc:  # a failed schedule must not cost the hooks registered by the same load
+        logger.warning("Neospike pref-reconcile not scheduled: %s: %s", type(exc).__name__, exc)
+        return False
+    logger.info("Neospike pref-reconcile scheduled as idle task '%s' (every %g hours)",
+                IDLE_TASK_NAME, IDLE_INTERVAL_HOURS)
+    return True
+
+
+def _hermes_home() -> Path:
+    from hermes_constants import get_hermes_home
+    return Path(get_hermes_home())
 
 
 # -- candidate pairs (code only) ---------------------------------------------------------------------------
@@ -352,9 +405,11 @@ def reconcile(store: MemoryStore, llm: Callable[[list[dict]], str], *, language:
             "skip_reasons": tally.skipped, "errors": errors, "language": language}
 
 
-def run(store: MemoryStore, home: str | Path, llm: Callable[[list[dict]], str] | None = None) -> dict:
-    """The pref-reconcile stage: settings from <home>/neospike/config.json."""
+def run(store: MemoryStore, home: str | Path, llm: Callable[[list[dict]], str] | None) -> dict:
+    """One pref-reconcile run: settings from <home>/neospike/config.json. Without an llm: {"error": ...}."""
     config = NeospikeConfig.load(home)
     if not config.pref_reconcile_enabled:
         return {"disabled": True}
-    return reconcile(store, llm or HermesLlm(home), language=config.extraction_language)
+    if llm is None:
+        return {"error": NO_LLM_MESSAGE}
+    return reconcile(store, llm, language=config.extraction_language)

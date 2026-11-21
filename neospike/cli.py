@@ -9,7 +9,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from .inference import EmbeddingClient
+from .inference import EmbeddingClient, EmbeddingUnavailable
 from . import backup as backup_tools
 from . import topics as topic_ops
 from . import conversations as conv_ops
@@ -42,7 +42,7 @@ _PREF_UPDATE_KEYS = {"id", "expected_text", *_PREF_ADD_KEYS}
 # Supersede / revision / link maintenance. JSON out; exit 1 on refusal.
 _LINK_VERBS = {"link-revert", "memory-revisions", "memory-restore"}
 _TOPIC_VERBS = {"topic-assign", "topic-discover", "topic-member-move", "note-absorb", "topic-to-note"}
-PREF_RECONCILE_VERB = "pref-reconcile"  # daily stage; the one stage that calls an LLM
+PREF_RECONCILE_VERB = "pref-reconcile"  # runs as a Hermes idle task; the CLI only explains that
 EMBED_PENDING_VERB = "embed-pending"  # daily stage; ends with the save follow-up (note-absorb, topic-assign)
 EMBED_PENDING_EDITED_BY = topic_ops.FORMULA_EDITOR  # edited_by of a chunk that takes a filled duplicate's body
 _CONV_VERBS = {"conv-index", "conv-search", "conv-import", "conv-read"}
@@ -342,11 +342,15 @@ def _move_topic_links(args: argparse.Namespace, store: MemoryStore) -> dict:
 
 
 def _run_pref_reconcile_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
-    """Similar preference pairs judged by an LLM (pref_reconcile.py); exit 1 when an LLM call failed."""
+    """pref_reconcile.py runs inside Hermes (idle task with ctx.llm); from the command line it only reports that
+    (exit 1), or {"disabled": true} when pref_reconcile_enabled is false."""
     from . import pref_reconcile
-    output = pref_reconcile.run(store, Path(args.home).expanduser())
+    output = pref_reconcile.run(store, Path(args.home).expanduser(), None)
     _emit_json(output)
-    return _EXIT_REFUSED if output.get("errors") else 0
+    if "error" in output:
+        sys.stderr.write(f"neospike: {output['error']}\n")
+        return _EXIT_REFUSED
+    return 0
 
 
 def _run_topic_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
@@ -541,8 +545,8 @@ def _build_parser() -> argparse.ArgumentParser:
     cmds.add_parser(EMBED_PENDING_VERB, help="Embed memories saved without an embedding, give the memory items "
                                                "the save-time duplicate handling, then the save follow-up "
                                                "(note-absorb, topic-assign)")
-    cmds.add_parser(PREF_RECONCILE_VERB, help="Similar preference/constraint pairs (cos >= 0.8, not exact "
-                                              "duplicates) judged keep/update/delete by an LLM, applied in place")
+    cmds.add_parser(PREF_RECONCILE_VERB, help="Similar preference/constraint pairs judged by an LLM: runs inside "
+                                              "Hermes as an idle task; from the command line it exits 1")
     archive_p = cmds.add_parser("memory-archive", help="Human archive: take one memory out of prefetch (direct search keeps it)")
     archive_p.add_argument("--id", type=int, required=True)
     unarchive_p = cmds.add_parser("memory-unarchive", help="Put an archived memory back into prefetch")
@@ -760,6 +764,15 @@ def _run_schema_cmd(args: argparse.Namespace, home: Path) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(forward_old_command(forward_old_options(sys.argv[1:] if argv is None else argv)))
+    try:
+        return _run_command(args)
+    except EmbeddingUnavailable as exc:
+        # Every command that embeds (search, save, re-embed, migrate, ...) ends the same way.
+        _emit_json({"error": "invalid", "message": f"{type(exc).__name__}: {exc}"})
+        return _EXIT_REFUSED
+
+
+def _run_command(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser()
     args.namespace = pick_namespace(args.namespace, memory_db_path(Path(args.home)))
     verb = args.command

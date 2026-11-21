@@ -20,8 +20,8 @@ from agent.memory_provider import MemoryProvider as HermesMemoryProvider
 
 from . import conversations as conversation_family
 from . import topics as topic_pages  # noqa: F401 (without numpy the provider fails to load visibly)
-from .config import (DEFAULT_RULES_DIGEST, NeospikeConfig, read_extraction_language, read_memory_rule,
-                     rules_digest, save_language_rule)
+from .config import (DEFAULT_RULES_DIGEST, PAUSED_MESSAGE, NeospikeConfig, read_enabled, read_extraction_language,
+                     read_memory_rule, rules_digest, save_language_rule)
 from .debug import TurnTraceLog
 from . import database as database_paths
 from .policy import (AdmitVerdict, screen_text, item_schema_fields,
@@ -318,42 +318,40 @@ _INFERENCE_IMPORTS = ("numpy", "tokenizers", "onnxruntime")
 # Mirror embedder.ONNX_MODEL_FILE / TOKENIZER_JSON / MODEL_FOLDER without importing the model packages here.
 _MODEL_FILE_NAMES = ("sentence_transformers_int8.onnx", "tokenizer.json")
 _MODEL_DIR = "bge-m3-onnx"
-_PROBE_SNIPPET = (
-    "import importlib.util, sys; "
-    "sys.exit(0 if all(importlib.util.find_spec(m) for m in sys.argv[1:]) else 1)"
-)
+_INFERENCE_PROBE_TIMEOUT_S = 30
 
 
 def _inference_stack_ready() -> bool:
-    """Model file present and the inference interpreter has its dependencies.
+    """Model file present and the inference daemon's environment has its dependencies.
 
-    Embedding runs in a child process (_wincompat.inference_python()); on Windows
-    that is HERMES_PYTHON (hermes-agent\\venv), not the host runtime. Importing
-    embedder here would require the heavy packages in the host runtime, which a
-    Hermes update replaces with a fresh dependency generation.
+    The probe starts exactly like the daemon (_wincompat.inference_command: hermes_launch.py on the
+    Hermes runtime python, same home), so it sees the dependency environment the daemon will import
+    from. Importing embedder here would load the heavy packages into this process.
     """
     import os
     import subprocess
 
     from . import _wincompat as _wc
+    from . import hermes_runtime
+    from . import runtime_check
 
+    inference_home = _wc.shared_inference_home(_wc.default_hermes_home())
     configured = os.environ.get("HERMES_BGE_M3_DIR")
-    model_dir = (FilePath(configured).expanduser() if configured
-                 else _wc.shared_inference_home(_wc.default_hermes_home()) / "models" / _MODEL_DIR)
+    model_dir = FilePath(configured).expanduser() if configured else inference_home / "models" / _MODEL_DIR
     if not all((model_dir / name).is_file() for name in _MODEL_FILE_NAMES):
         return False
     try:
+        command = _wc.launch_command(inference_home, [runtime_check.MODULE, runtime_check.CHECK_PRESENT,
+                                                      *_INFERENCE_IMPORTS])
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        done = subprocess.run([_wc.inference_python(), "-c", _PROBE_SNIPPET, *_INFERENCE_IMPORTS],
-                              capture_output=True, timeout=30, creationflags=flags)
-    except (OSError, subprocess.SubprocessError):
+        done = subprocess.run(command, capture_output=True, timeout=_INFERENCE_PROBE_TIMEOUT_S,
+                              creationflags=flags)
+    except (hermes_runtime.HermesRuntimeNotFound, OSError, subprocess.SubprocessError):
         return False
-    if done.returncode != 0 and _wc.IS_WINDOWS:
-        # Without HERMES_PYTHON or the default Hermes venv, inference_python() falls
-        # back to the host runtime, which on Windows usually lacks these packages.
+    if done.returncode != 0:
         import warnings
-        warnings.warn(f"Neospike inference interpreter {_wc.inference_python()} lacks "
-                      f"{', '.join(_INFERENCE_IMPORTS)}; set HERMES_PYTHON to the Hermes venv python.exe",
+        warnings.warn(f"Neospike inference runtime {command[0]} lacks {', '.join(_INFERENCE_IMPORTS)}; "
+                      "check the Hermes package manager environment (`hermes pm status`)",
                       RuntimeWarning, stacklevel=2)
     return done.returncode == 0
 
@@ -366,6 +364,16 @@ def _tool_spec(name: str, description: str, properties: dict | None = None, requ
     if required:
         params["required"] = required
     return {"name": name, "description": description, "parameters": params}
+
+
+class _PausedHome:
+    """paused() probe of one home for EmbeddingClient: background indexing starts no daemon while paused."""
+
+    def __init__(self, home: FilePath) -> None:
+        self._home = home
+
+    def __call__(self) -> bool:
+        return not read_enabled(self._home)
 
 
 class NeospikeProvider(HermesMemoryProvider):
@@ -453,7 +461,7 @@ class NeospikeProvider(HermesMemoryProvider):
         self._can_write = kwargs.get("agent_context", "primary") == "primary"
         if self._vectorizer is None:
             from .inference import EmbeddingClient
-            self._vectorizer = EmbeddingClient(home)
+            self._vectorizer = EmbeddingClient(home, paused=_PausedHome(home))
         self._memory_db = MemoryStore(database_paths.canonical_database_path(home / "neospike", "memory"),
                                   dimensions=self._vectorizer.dimensions)
         if self._can_write:
@@ -467,11 +475,8 @@ class NeospikeProvider(HermesMemoryProvider):
         self._sync_project_scope(session_id)
         self._begin_capture()
         self._begin_follow_up()
-        try:
-            from .debug_hooks import hook_into_hermes
-            hook_into_hermes(self)
-        except ImportError:
-            pass  # standalone storage and minimal Hermes installs stay usable
+        from .debug_hooks import track
+        track(self)
 
     def system_prompt_block(self):
         # The save criteria (default: config.DEFAULT_SAVE_CRITERIA) are the checked items of this home's
@@ -507,9 +512,13 @@ class NeospikeProvider(HermesMemoryProvider):
             "belongs only in Neospike."
         )
 
+    def _paused(self) -> bool:
+        """The on/off switch (config.json "enabled"), read at every call so turning it back on needs no restart."""
+        return not read_enabled(self._home_root)
+
     def prefetch(self, request_text: str, *, session_id: str = "") -> str:
         with self._guard:
-            if not self._core:
+            if not self._core or self._paused():
                 return ""
             live_sid = session_id or self._active_sid
             notice, rules_hash = self._pending_criteria_notice(live_sid)
@@ -983,6 +992,10 @@ class NeospikeProvider(HermesMemoryProvider):
         Chunking, embedding, absorbing and topic joining happen on background threads, off the turn path.
         """
         live_sid = session_id or self._sid_var.get() or self._active_sid
+        if self._paused():
+            with self._guard:
+                self._saved_in_turn.discard(live_sid)
+            return
         self._follow_up_turn(live_sid)
         conversations = self._talk_store
         if conversations is None:
@@ -1032,7 +1045,7 @@ class NeospikeProvider(HermesMemoryProvider):
 
     def on_memory_write(self, change_kind: str, file_label: str, entry_text: str,
                         metadata: dict[str, Any] | None = None) -> None:
-        if not self._can_write or not self._memory_db:
+        if not self._can_write or not self._memory_db or self._paused():
             return
         source = f"builtin:{file_label}"
         key = self._trace_key(self._sid_var.get() or self._active_sid)
@@ -1143,6 +1156,8 @@ class NeospikeProvider(HermesMemoryProvider):
         ]
 
     def handle_tool_call(self, tool_id: str, call_args: dict[str, Any], **kwargs: Any) -> str:
+        if self._home_root is not None and self._paused():
+            return json.dumps({"error": PAUSED_MESSAGE})
         with self._guard:
             sid = self._sid_var.get() or self._active_sid
             self._sync_project_scope(sid)
@@ -1844,5 +1859,14 @@ class NeospikeProvider(HermesMemoryProvider):
 
 
 def register(ctx: Any) -> None:
-    """Hermes plugin entry point: hand the memory provider to the plugin context."""
+    """Hermes plugin entry point: hand the memory provider and its hooks to the plugin context.
+
+    Hermes calls it twice: as the configured memory provider (a collector without ``llm``) and, because
+    plugin.yaml declares kind: standalone and plugins.enabled lists the plugin, from general discovery (a real
+    PluginContext). Hermes keeps one hook group for both loads; only the context with ``llm`` schedules the
+    daily preference tidy-up."""
+    from .debug_hooks import register_hooks
+    from .pref_reconcile import register_idle_task
     ctx.register_memory_provider(NeospikeProvider())
+    register_hooks(ctx)
+    register_idle_task(ctx)

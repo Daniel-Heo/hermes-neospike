@@ -1,9 +1,16 @@
 name: neospike
 version: 1.0.0
 description: "Private local hybrid text memory with profile isolation."
-hooks:
-  - on_memory_write
+requires_hermes: ">=0.23.3"
+# standalone: general discovery also loads it (plugins.enabled), giving register() ctx.llm for the
+# daily idle task; the memory loader still finds it as a provider.
+kind: standalone
+provides_hooks:
   - transform_llm_output
+  - on_session_end
 python_dependencies:
   - "numpy>=2.0,<3"
   - "faiss-cpu>=1.16,<2"
+  - "tokenizers>=0.22,<1"
+  - "onnxruntime>=1.20,<2"
+  - "huggingface-hub>=1.0,<2"
