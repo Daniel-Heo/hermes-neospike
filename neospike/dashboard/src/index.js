@@ -378,6 +378,21 @@
       return keys.filter(function (key) { return shown[key] === true; });
     }
 
+    // The map payload without a deleted item, so the list and the sphere drop it before /map answers.
+    function withoutPoint(data, key) {
+      return Object.assign({}, data, { points: data.points.filter(function (point) { return point.key !== key; }) });
+    }
+
+    function foldersWithout(folders, folderId) { return folders.filter(function (folder) { return folder.id !== folderId; }); }
+
+    // The map payload without a trashed folder; its items become unfiled, as the server releases them.
+    function withoutFolder(data, folderId) {
+      return Object.assign({}, data, {
+        folders: foldersWithout(data.folders, folderId),
+        points: data.points.map(function (point) { return point.folder_id === folderId ? Object.assign({}, point, { folder_id: null }) : point; })
+      });
+    }
+
     // A drawn member point beats its own folder marker. A one-member folder's marker sits exactly
     // on that member, so without this the last item could not be dragged out on the map.
     // The click goes to the point whose centre is nearest; at equal distance the one in front.
@@ -555,7 +570,8 @@
              mapStatusText: mapStatusText, createDrawScheduler: createDrawScheduler, createCanvasBinding: createCanvasBinding,
              placeLabel: placeLabel, expandedWithFocus: expandedWithFocus, isDragMove: isDragMove, dragKeys: dragKeys,
              dragLabel: dragLabel, dropFolderId: dropFolderId, moveMessage: moveMessage, titleVisible: titleVisible,
-             keptKeys: keptKeys, memberBeatsMarker: memberBeatsMarker, closerHit: closerHit, dropTopicKey: dropTopicKey,
+             keptKeys: keptKeys, withoutPoint: withoutPoint, foldersWithout: foldersWithout, withoutFolder: withoutFolder,
+             memberBeatsMarker: memberBeatsMarker, closerHit: closerHit, dropTopicKey: dropTopicKey,
              topicIdOf: topicIdOf, connectedText: connectedText, STRINGS: STRINGS, languageOf: languageOf, setLanguage: setLanguage,
              getLanguage: getLanguage, t: t, codeParts: codeParts, exportNoteIds: exportNoteIds, unsafeExportPath: unsafeExportPath,
              writeExportFiles: writeExportFiles };
@@ -1113,7 +1129,8 @@
     const [message, setMessage] = useState(null);
     const editor = useRef(null);
 
-    function changed() { if (props.onChanged) props.onChanged(); }
+    // removed: true only after a delete, so the map closes the panel and drops the point.
+    function changed(removed) { if (props.onChanged) props.onChanged(removed === true); }
 
     function fetchSide(id) {
       SDK.fetchJSON(API + "/notes/" + id + "/related").then(setRelated).catch(function () { setRelated(null); });
@@ -1179,7 +1196,7 @@
     function dropMemo() {
       setBusy(true);
       return SDK.fetchJSON(API + "/notes/" + noteId + "?expected_rev=" + rev, { method: "DELETE" }).then(function () {
-        setBusy(false); setConfirmDelete(false); freshMemo(); changed();
+        setBusy(false); setConfirmDelete(false); freshMemo(); changed(true);
         setMessage({ ok: true, text: t("note.trashed") });
       }).catch(function (e) { setBusy(false); setConfirmDelete(false); setMessage({ ok: false, text: apiFault(e).text }); });
     }
@@ -2256,11 +2273,15 @@
 
     // The folder list comes from its own read-only route, so a failed or slow /map
     // (a CLI child) never hides the folders or the New folder box.
+    // Only the newest load applies its answers: an older /map that answers late never brings a deleted item back.
+    const loadSeq = useRef(0);
     const load = useCallback(function () {
-      SDK.fetchJSON(API + "/folders").then(function (payload) { setFolderList(payload.folders || []); setFolderError(null); })
-        .catch(function (e) { setFolderError(apiFault(e).text); });
-      return SDK.fetchJSON(API + "/map").then(function (payload) { setData(payload); setLoadError(null); setLoaded(true); })
-        .catch(function (e) { setData({ points: [], folders: [] }); setLoadError(apiFault(e).text); setLoaded(true); });
+      const seq = ++loadSeq.current;
+      function isLatest() { return seq === loadSeq.current; }
+      SDK.fetchJSON(API + "/folders").then(function (payload) { if (isLatest()) { setFolderList(payload.folders || []); setFolderError(null); } })
+        .catch(function (e) { if (isLatest()) setFolderError(apiFault(e).text); });
+      return SDK.fetchJSON(API + "/map").then(function (payload) { if (isLatest()) { setData(payload); setLoadError(null); setLoaded(true); } })
+        .catch(function (e) { if (isLatest()) { setData({ points: [], folders: [] }); setLoadError(apiFault(e).text); setLoaded(true); } });
     }, []);
     // Map folders carry their sphere position; until /map succeeds the sidebar uses the plain list.
     const sidebarFolders = loaded && !loadError ? data.folders : folderList;
@@ -2677,7 +2698,10 @@
 
     function showNode(point) { setPanel({ type: point.lane, id: point.id, seq: Date.now() }); }
 
+    // The sidebar and the points drop the folder now; the reload BinSidebar started confirms it.
     function handleBinDeleted(folderId) {
+      setData(function (current) { return MAP_VIEW.withoutFolder(current, folderId); });
+      setFolderList(function (list) { return MAP_VIEW.foldersWithout(list, folderId); });
       if (focus === folderId) setFocus(null);
       if (MAP_VIEW.isExpanded(expanded, folderId)) setExpanded(MAP_VIEW.toggledExpansion(expanded, folderId));
     }
@@ -2685,8 +2709,14 @@
     // A PartRoll move clears the map selection like every other move path.
     function postPartShift() { setSelection([]); return load(); }
 
+    // A deleted memory or note leaves the list, the sphere, the selection and the panel at once.
     function onItemChanged(removed) {
-      if (removed) setPanel(null);
+      if (removed && panel) {
+        const key = rowKey(panel.type, panel.id);
+        setData(function (current) { return MAP_VIEW.withoutPoint(current, key); });
+        setSelection(function (keys) { return keys.filter(function (other) { return other !== key; }); });
+        setPanel(null);
+      }
       load();
     }
 
@@ -2718,7 +2748,7 @@
     // Body, Save/Delete with the folder Move bar beside it, the read-only connected text, then Connected.
     function memoryGroup() {
       if (!panel) return null;
-      return h(ViewEntry, { panel: panel, version: data, folders: sidebarFolders, onMove: shiftEntries, onNoteChanged: load,
+      return h(ViewEntry, { panel: panel, version: data, folders: sidebarFolders, onMove: shiftEntries, onNoteChanged: onItemChanged,
         onItemChanged: onItemChanged, onMap: isPlotted, onOpen: showLinked, onMoved: postPartShift, onMessage: setMessage,
         dropTarget: dropTarget });
     }
