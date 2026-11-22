@@ -2,6 +2,8 @@
 
 ![Neospike: knowledge that gathers, assembles, and grows on its own](assets/branding/neospike-hero.png)
 
+![How Neospike works: recall, save, daily tidy-up and MCP](assets/branding/neospike-architecture.png)
+
 **An AI agent whose knowledge gathers, assembles, and grows on its own. Second brain + RAG, for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
 Neospike is a memory provider plugin for Hermes Agent. The agent saves short facts and decisions as it works, keeps long documents as notes, and indexes past conversations. Code then tidies that knowledge in the background without calling an LLM: related memories are linked, linked groups become topics, and a topic that grows large becomes a note. One daily stage is the exception: it asks your Hermes model whether similar preferences should be kept, merged or removed (it can be turned off). Embeddings are computed on your machine and everything is stored in one SQLite file.
