@@ -81,7 +81,7 @@ def tools(tmp_path: Path) -> NeospikeTools:
         remember("memory of another project", 0.97, scope="project", project=OTHER_PROJECT)
         with store._conn:
             store._conn.execute("UPDATE items SET invalid_at=?, superseded_by=? WHERE id=?", (time.time(), new, old))
-            # Floor 0.61, so the chunks sit at 0.75 / 0.72 above it and 0.55 below it.
+            # Floor 0.70, so the chunks sit at 0.75 / 0.72 above it and 0.55 below it.
             _note(store, "auto A", FORMULA_AUTHOR, [("auto chunk 0.90", 0.90), ("auto chunk 0.72", 0.72)])
             _note(store, "auto B", FORMULA_AUTHOR, [("auto chunk 0.75", 0.75), ("auto chunk 0.55", 0.55)])
             _note(store, "auto trashed", FORMULA_AUTHOR, [("trashed auto chunk", 0.98)], trashed=True)

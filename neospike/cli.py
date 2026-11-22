@@ -30,10 +30,9 @@ from .store import (
 )
 
 
-_NOTE_VERBS = {"note-save", "note-read", "note-search", "note-delete", "note-restore", "note-append-report",
+_NOTE_VERBS = {"note-save", "note-read", "note-search", "note-delete", "note-restore",
                   "task-owners", "task-next"}
 _NOTE_SAVE_KEYS = {"id", "title", "body", "tags", "project", "author", "expected_rev", "origin"}
-_REPORT_KEYS = {"title", "text"}
 _ITEM_VERBS = {"memory-update", "memory-delete"}
 # Dashboard Preferences tab: JSON in, JSON out; a row added here is basis user_said.
 _PREF_VERBS = {"pref-add", "pref-update", "pref-delete", "pref-list"}
@@ -102,13 +101,6 @@ def _run_note_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
             return 0
         if args.command == "note-restore":
             _emit_json({"note": service.restore_note(args.id, args.rev, author="human", expected_rev=args.expected_rev)})
-            return 0
-        if args.command == "note-append-report":
-            # MCP write path (Claude Code): only the report section (`## Report`, or `## 보고`) of a TASK_ note
-            # changes; a missing one is titled in this home's extraction_language.
-            request = _load_json_payload(args.input, _REPORT_KEYS, "note-append-report")
-            _emit_json({"note": service.notes.append_report(request.get("title"), request.get("text"),
-                                                            hermes_home=Path(args.home).expanduser())})
             return 0
         request = _note_save_payload(args.input)
         author = request.get("author", "human")
@@ -568,11 +560,6 @@ def _build_parser() -> argparse.ArgumentParser:
     note_restore_p.add_argument("--id", type=int, required=True)
     note_restore_p.add_argument("--rev", type=int, required=True)
     note_restore_p.add_argument("--expected-rev", type=int)
-    note_report_p = cmds.add_parser("note-append-report",
-                                 help="Append to the '## Report' section ('## 보고' is also recognised; a new one "
-                                      "follows the extraction language) of one TASK_ note from a JSON object "
-                                      "{title, text} on stdin")
-    note_report_p.add_argument("--input", help="Read the JSON object from this file instead of stdin")
     cmds.add_parser("task-owners", help="Owned files of status:active TASK_ notes and the paths they share, as JSON")
     cmds.add_parser("task-next", help="Next TASK_ number (largest in notes + 1), as JSON")
     item_update_p = cmds.add_parser("memory-update", help="CAS-update one memory item from a JSON object on stdin")

@@ -112,7 +112,7 @@ def test_restore_matches_original_row_for_row(env, tmp_path: Path) -> None:
     restored_store = MemoryStore(target, dimensions=DIMENSIONS)
     try:
         restored_notes = NoteService(restored_store, BowEmbedder())
-        query = "tomatoes basil chili compost"  # BoW query long enough to clear the 0.61 cosine floor
+        query = "tomatoes basil chili compost"  # BoW query long enough to clear the 0.70 cosine floor
         found = restored_notes.search(query, BowEmbedder().embed_query(query))
         assert found and "chili" in json.dumps(found, ensure_ascii=False)
     finally:

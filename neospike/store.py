@@ -45,7 +45,7 @@ SEMANTIC_WEIGHT, IMPORTANCE_WEIGHT, FRESHNESS_WEIGHT = 0.68, 0.07, 0.05
 DURABLE_BOOST = 0.08
 # 관련 없는 기억 주입을 막는 코사인 하한(cos 단독 문턱).
 # 회상 주입과 MCP mem_search가 함께 쓰는 하나의 상수(mcp_server.MEMORY_SEARCH_COSINE_THRESHOLD가 이 값을 import).
-DEFAULT_SEMANTIC_CUTOFF = 0.61
+DEFAULT_SEMANTIC_CUTOFF = 0.70
 RECENCY_HALF_LIFE_DAYS = 90.0
 FTS_TERM_CAP = 16
 _FTS_WORD = re.compile(r"[\w-]{2,}", flags=re.UNICODE)

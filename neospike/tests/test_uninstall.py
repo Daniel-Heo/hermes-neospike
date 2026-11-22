@@ -22,22 +22,23 @@ def install():
 
 
 class _UninstallRunner:
-    """subprocess.run stand-in: `claude mcp get` shows *mcp_home* (None: not registered); the removals change the
-    scratch home the way Hermes and Claude Code would."""
+    """subprocess.run stand-in: `claude mcp get neospike-mcp` shows *mcp_home* and `claude mcp get neospike` shows
+    *old_home* (None: not registered); the removals change the scratch home the way Hermes and Claude Code would."""
 
-    def __init__(self, mcp_home: Path | None) -> None:
-        self.mcp_home = mcp_home
+    def __init__(self, mcp_home: Path | None, old_home: Path | None = None) -> None:
+        self.mcp_homes: dict[str, Path | None] = {"neospike-mcp": mcp_home, "neospike": old_home}
         self.commands: list[list[str]] = []
 
     def __call__(self, command: list[str], **kwargs) -> subprocess.CompletedProcess:
         self.commands.append(command)
         home = Path(kwargs.get("env", {}).get("HERMES_HOME", "."))
         if command[1:3] == ["mcp", "get"]:
-            if self.mcp_home is None:
+            shown = self.mcp_homes.get(command[3])
+            if shown is None:
                 return subprocess.CompletedProcess(command, 1, "", "No MCP server found")
-            return subprocess.CompletedProcess(command, 0, f"neospike:\n  Args: --home {self.mcp_home}\n", "")
+            return subprocess.CompletedProcess(command, 0, f"{command[3]}:\n  Args: --home {shown}\n", "")
         if command[1:3] == ["mcp", "remove"]:
-            self.mcp_home = None
+            self.mcp_homes[command[-1]] = None
         elif command[1:3] == ["cron", "remove"]:
             _remove_job(home, command[3])
         elif command[1:3] == ["plugins", "remove"]:  # hermes_cli _remove_user_plugin + _forget_plugin_config
@@ -92,15 +93,17 @@ def _job_names(home: Path) -> list[str]:
 
 def test_dry_run_prints_every_step_and_changes_nothing(tmp_path, monkeypatch, capsys, install):
     home = _installed_root(tmp_path, install)
-    runner, release = _UninstallRunner(home), _Release()
+    runner, release = _UninstallRunner(home, home), _Release()
     _wire(monkeypatch, install, runner, release)
     before = sorted(str(path) for path in home.rglob("*"))
     assert install.run_uninstall(HERMES, home, dry_run=True) == 0
     out = capsys.readouterr().out
     assert sorted(str(path) for path in home.rglob("*")) == before
-    assert runner.commands == [[CLAUDE, "mcp", "get", "neospike"]] and release.homes == []  # read only
+    assert runner.commands == [[CLAUDE, "mcp", "get", "neospike-mcp"], [CLAUDE, "mcp", "get", "neospike"]]
+    assert release.homes == []  # read only
+    assert "mcp remove -s user neospike-mcp\n" in out and "mcp remove -s user neospike\n" in out
     for line in ("+ hermes cron remove job0", f"+ remove {home / 'scripts' / 'neospike_daily.py'}",
-                 "mcp remove -s user neospike", "+ ask the embedding service of", "+ hermes plugins remove neospike",
+                 "+ ask the embedding service of", "+ hermes plugins remove neospike",
                  f"+ remove {home / 'plugins' / 'neospike.previous'}",
                  f"+ remove {home / 'neospike' / '.install'}", f"Kept your Neospike data (memories, notes, "
                  f"conversations, backups): {home / 'neospike'}", f"Kept the model: {home / 'models' / 'bge-m3-onnx'}"):
@@ -114,7 +117,7 @@ def test_uninstall_removes_each_step_and_keeps_the_data(tmp_path, monkeypatch, c
     _wire(monkeypatch, install, runner, release)
     assert install.run_uninstall(HERMES, home, dry_run=False) == 0
     assert [command[1:3] for command in runner.commands] == [["cron", "remove"], ["mcp", "get"], ["mcp", "remove"],
-                                                             ["plugins", "remove"]]
+                                                             ["mcp", "get"], ["plugins", "remove"]]
     assert _job_names(home) == ["user-job"]
     assert not any((home / "scripts" / name).exists() for name in install.CRON_FILES)
     assert (home / "scripts" / "user_script.py").is_file()
@@ -134,11 +137,23 @@ def test_second_run_skips_what_is_gone(tmp_path, monkeypatch, capsys, install):
     runner.commands.clear()
     assert install.run_uninstall(HERMES, home, dry_run=False) == 0
     out = capsys.readouterr().out
-    assert runner.commands == [[CLAUDE, "mcp", "get", "neospike"]]
-    for line in ("Cron job neospike-daily: not registered (skipped)", "MCP server neospike: not registered",
+    assert runner.commands == [[CLAUDE, "mcp", "get", "neospike-mcp"], [CLAUDE, "mcp", "get", "neospike"]]
+    for line in ("Cron job neospike-daily: not registered (skipped)", "MCP server neospike-mcp: not registered",
+                 "MCP server neospike: not registered",
                  "Plugin folder", "not there (skipped)"):
         assert line in out
     assert (home / "neospike" / "memory.db").is_file()
+
+
+def test_uninstall_removes_the_old_name_only_when_it_points_here(tmp_path, monkeypatch, capsys, install):
+    home = _installed_root(tmp_path, install)
+    for old_home, removed in ((home, True), (tmp_path / "other", False)):
+        runner, release = _UninstallRunner(home, old_home), _Release()
+        _wire(monkeypatch, install, runner, release)
+        install.uninstall_mcp(home, dry_run=False, runner=runner)
+        removals = [command[-1] for command in runner.commands if command[1:3] == ["mcp", "remove"]]
+        assert removals == (["neospike-mcp", "neospike"] if removed else ["neospike-mcp"])
+        assert runner.mcp_homes["neospike"] == (None if removed else old_home)
 
 
 def test_folder_already_gone_turns_memory_off_and_unlists_the_plugin(tmp_path, monkeypatch, capsys, install):

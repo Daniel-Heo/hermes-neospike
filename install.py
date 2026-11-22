@@ -63,7 +63,9 @@ CRON_DAILY_FILE = CRON_FILES[1]
 DELIVER_OK = "local"
 DELIVER_FAIL = "bot-chat"
 # Claude Code MCP registration (user scope).
-MCP_SERVER_NAME, MCP_REG_SCOPE = "neospike", "user"
+MCP_SERVER_NAME, MCP_REG_SCOPE = "neospike-mcp", "user"
+# The name earlier installs registered; removed when its entry points at the home being installed or uninstalled.
+OLD_MCP_SERVER_NAME = "neospike"
 MCP_MODULE = "neospike.mcp_server"
 HF_CLI_MODULE = "huggingface_hub.cli.hf"  # the `hf` console script's module
 # An earlier install.py ran `uv pip install` of this package into the Hermes CLI venv (hermes-agent/venv);
@@ -436,12 +438,17 @@ def mcp_server_entry(python: str, home: Path) -> dict:
     }
 
 
-def mcp_argv_list(claude: str, python: str, home: Path) -> list[list[str]]:
-    """remove the current entry (may fail when absent), then add-json; compact JSON so claude.cmd passes it
-    through cmd.exe intact."""
+def mcp_remove_argv(claude: str, name: str) -> list[str]:
+    return [claude, "mcp", "remove", "-s", MCP_REG_SCOPE, name]
+
+
+def mcp_argv_list(claude: str, python: str, home: Path, drop_old: bool = False) -> list[list[str]]:
+    """remove the old-name entry (*drop_old*: it points at *home*), remove the current entry (may fail when
+    absent), then add-json; compact JSON so claude.cmd passes it through cmd.exe intact."""
     payload = json.dumps(mcp_server_entry(python, home), ensure_ascii=False, separators=(",", ":"))
-    return [[claude, "mcp", "remove", "-s", MCP_REG_SCOPE, MCP_SERVER_NAME],
-            [claude, "mcp", "add-json", "-s", MCP_REG_SCOPE, MCP_SERVER_NAME, payload]]
+    removals = [mcp_remove_argv(claude, OLD_MCP_SERVER_NAME)] if drop_old else []
+    return removals + [mcp_remove_argv(claude, MCP_SERVER_NAME),
+                       [claude, "mcp", "add-json", "-s", MCP_REG_SCOPE, MCP_SERVER_NAME, payload]]
 
 
 def is_profile(home: Path) -> bool:
@@ -478,7 +485,7 @@ def apply_mcp_registration(python: str, home: Path, runner=None) -> None:
     if not claude:
         print(f"Claude Code (claude) not found; MCP server {MCP_SERVER_NAME} not registered.")
         return
-    *removals, add = mcp_argv_list(claude, python, home)
+    *removals, add = mcp_argv_list(claude, python, home, mcp_points_at(claude, home, runner, OLD_MCP_SERVER_NAME))
     for remove in removals:
         print("+", subprocess.list2cmdline(remove))
         runner(remove, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -735,11 +742,11 @@ def uninstall_cron(hermes: str, home: Path, dry_run: bool) -> None:
             _plan_or_remove(script, dry_run)
 
 
-def mcp_points_at(claude: str, home: Path, runner=None) -> bool:
-    """True when Claude Code has the neospike MCP server and its entry names *home* (`claude mcp get`, read only)."""
+def mcp_points_at(claude: str, home: Path, runner=None, name: str = MCP_SERVER_NAME) -> bool:
+    """True when Claude Code has the MCP server *name* and its entry names *home* (`claude mcp get`, read only)."""
     runner = _runner_or_default(runner)
     try:
-        shown = runner([claude, "mcp", "get", MCP_SERVER_NAME], capture_output=True, text=True, encoding="utf-8",
+        shown = runner([claude, "mcp", "get", name], capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=PROBE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return False
@@ -747,17 +754,19 @@ def mcp_points_at(claude: str, home: Path, runner=None) -> bool:
 
 
 def uninstall_mcp(home: Path, dry_run: bool, runner=None) -> None:
-    """Step 2: `claude mcp remove`, only when the user-scope entry points at *home* (never for a profile home)."""
+    """Step 2: `claude mcp remove` of the current and the old server name, each only when its user-scope entry
+    points at *home* (never for a profile home)."""
     if skip_mcp_for_profile(home):
         return
     claude = shutil.which("claude")
     if not claude:
         print(f"Claude Code (claude) not found; MCP server {MCP_SERVER_NAME} left as it is.")
         return
-    if not mcp_points_at(claude, home, runner):
-        print(f"Claude Code MCP server {MCP_SERVER_NAME}: not registered for {home} (skipped)")
-        return
-    _plan_or_run([claude, "mcp", "remove", "-s", MCP_REG_SCOPE, MCP_SERVER_NAME], dry_run)
+    for name in (MCP_SERVER_NAME, OLD_MCP_SERVER_NAME):
+        if mcp_points_at(claude, home, runner, name):
+            _plan_or_run(mcp_remove_argv(claude, name), dry_run)
+        else:
+            print(f"Claude Code MCP server {name}: not registered for {home} (skipped)")
 
 
 def uninstall_daemon(home: Path, dry_run: bool) -> None:
@@ -890,7 +899,10 @@ def _print_dry_run(hermes: str, home: Path) -> None:
         for argv in cron_argv_list(hermes, home):
             print("+", subprocess.list2cmdline(argv))
     if not skip_mcp_for_profile(home):
-        for argv in mcp_argv_list(shutil.which("claude") or "claude", _dry_run_python(home), home):
+        claude = shutil.which("claude") or "claude"
+        print("+", f"(when `claude mcp get {OLD_MCP_SERVER_NAME}` names {home})",
+              subprocess.list2cmdline(mcp_remove_argv(claude, OLD_MCP_SERVER_NAME)))
+        for argv in mcp_argv_list(claude, _dry_run_python(home), home):
             print("+", subprocess.list2cmdline(argv))
 
 

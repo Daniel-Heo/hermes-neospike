@@ -97,9 +97,3 @@ def test_dashboard_save_failure_keeps_editor_text() -> None:
     assert not re.search(r"set(Title|Body|Tags)\(|showNote\(", catch.group(1))
     assert INDEX_JS.read_bytes() == (INDEX_JS.parents[1] / "dist" / "index.js").read_bytes()
 
-
-# 6 ------------------------------------------------------------------------------------------
-def test_append_report_still_task_only(notes: NoteService) -> None:
-    notes.save("Plain note", "# Plain\n## 보고\n", author="human")
-    with pytest.raises(NotePermissionError):
-        notes.append_report("Plain note", "report text that should not land")

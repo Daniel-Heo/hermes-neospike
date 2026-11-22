@@ -1,8 +1,8 @@
 ﻿"""Contract tests: MCP stdio server for Claude Code, TASK CLI helpers, dashboard env.
 
 MCP tests start the real server process through the SDK stdio client. The server
-and its CLI write child use the deterministic bag-of-words embedder instead of
-the embedding daemon. Without the optional `mcp` extra those tests are skipped.
+uses the deterministic bag-of-words embedder instead of the embedding daemon.
+Without the optional `mcp` extra those tests are skipped.
 """
 from __future__ import annotations
 
@@ -17,27 +17,23 @@ import pytest
 
 from neospike.config import NeospikeConfig
 from neospike.database import canonical_database_path
-from neospike.notes import NoteService, append_report_section, owned_paths
-from neospike.notes import head_row
-from neospike.tests.support_items import chunk_rows
+from neospike.notes import NoteService, owned_paths
 from neospike.store import MemoryStore
-from neospike.tests.test_dashboard_notes import _CHILD_BOOT
 from neospike.tests.test_notes import DIMENSIONS, BowEmbedder
 
 HAS_MCP = importlib.util.find_spec("mcp") is not None
 needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="optional extra [mcp] is not installed")
 REPO = Path(__file__).resolve().parents[2]
-EXPECTED_TOOLS = {"note_read", "mem_search", "note_related", "note_append_report"}
-RETIRED_TOOLS = {"memory_search", "note_search", "doc_search"}  # one mem_search
-# Server process: stub Hermes core, swap the daemon for BowEmbedder, point CLI writes at the
-# same stubbed CLI child the dashboard tests use, then run the real server entrypoint.
+EXPECTED_TOOLS = {"note_read", "mem_search", "mem_period", "chat_search", "chat_read", "chat_period"}
+RETIRED_TOOLS = {"memory_search", "note_search", "doc_search", "note_related"}  # one mem_search; note_related left
+# Server process: stub Hermes core, swap the daemon for BowEmbedder, then run the real server entrypoint.
 _SERVER_BOOT = (
     "import sys,types;"
     "a=types.ModuleType('agent');m=types.ModuleType('agent.memory_provider');"
     "m.MemoryProvider=type('MemoryProvider',(),{});a.memory_provider=m;"
     "sys.modules.setdefault('agent',a);sys.modules.setdefault('agent.memory_provider',m);"
     "from neospike import mcp_server as s;from neospike.tests.test_notes import BowEmbedder;"
-    f"s.EmbeddingClient=BowEmbedder;s.CLI_PREFIX=[sys.executable,'-c',{_CHILD_BOOT!r}];"
+    "s.EmbeddingClient=BowEmbedder;"
     "sys.exit(s.main(sys.argv[1:]))"
 )
 
@@ -69,19 +65,6 @@ def _save(home: Path, title: str, body: str, tags: list[str]) -> dict:
     store = MemoryStore(_db(home), dimensions=DIMENSIONS)
     try:
         return NoteService(store, BowEmbedder()).save(title, body, tags=tags, author="agent")
-    finally:
-        store.close()
-
-
-def _row(home: Path, title: str) -> tuple:
-    store = MemoryStore(_db(home), dimensions=DIMENSIONS)
-    try:
-        with store._lock:
-            head = head_row(store._conn, title=title)
-            note = (head["body"], head["rev"], head["updated_at"])
-            revisions = store._conn.execute("SELECT COUNT(*) FROM item_revisions").fetchone()[0]
-            chunks = len(chunk_rows(store._conn))
-        return note, revisions, chunks
     finally:
         store.close()
 
@@ -145,28 +128,78 @@ async def _read_steps(session) -> dict:
     return {"title": by_title, "id": by_id, "missing": missing}
 
 
-async def _append_steps(session) -> dict:
-    report = "- 결과: 합격.\n- 측정: 357 passed\r\n- 다음: 없음"
-    task = await _call(session, "note_append_report", {"title": "TASK_101", "text": report})
-    plain = await _call(session, "note_append_report", {"title": "회의 메모", "text": report})
-    escape = await _call(session, "note_append_report", {"title": "TASK_101", "text": "## 소유 파일\n- `x.py`"})
-    read = await _call(session, "note_read", {"id_or_title": "TASK_101"})
-    related = await _call(session, "note_related", {"id_or_title": "TASK_101"})
-    search = await _call(session, "mem_search", {"query": "이전 보고 착수했다 결과 합격 측정 357 passed", "tag": "task", "limit": 20})
+async def _search_steps(session) -> dict:
+    search = await _call(session, "mem_search", {"query": "이전 보고 착수했다", "tag": "task", "limit": 20})
     memory = await _call(session, "mem_search", {"query": "anything", "limit": 3})
-    return {"task": task, "plain": plain, "escape": escape, "read": read, "related": related,
-            "search": search, "memory": memory, "report": report}
+    return {"search": search, "memory": memory}
 
 
-async def _secret_steps(session) -> tuple[bool, dict]:
-    return await _call(session, "note_append_report",
-                       {"title": "TASK_101", "text": "배포 결과\napi_key = sk-abcdefghijklmnop1234"})
+# The agreed wording, kept here as an independent copy so a change to the server text fails a test.
+EXPECTED_INSTRUCTIONS = """Neospike is the user's long-term memory for this machine: past decisions, memories, notes (TASK_ work orders, agent and automatic notes), docs (notes the user wrote, read-only) and the full Hermes chat history. All tools are read-only.
+
+Search here when you: start a task or a new session; are about to decide, or ask the user, something that may already be decided (settings, thresholds, names, designs, fixes, rules); see a work order mention an earlier TASK, decision or bug; need what happened before (yesterday, last week, an earlier attempt, an error seen before).
+
+Pick the tool by what you know:
+1. The meaning, not the exact words -> mem_search (memories, notes and docs by meaning). Always first for decisions; cite mem:N or the note title.
+2. An exact word, number, file name, command or error text from past work -> chat_search (full-text over conversations, tool calls and tool results).
+3. Only the time ("yesterday", "the last 2 days") -> chat_period for conversations (with a per-conversation summary) or mem_period for memories and notes created or changed then.
+4. Then read in full: note_read for a note or doc body, chat_read for one message with its tool results and neighbours.
+
+Order: mem_search first; go to chat_search or chat_period only for original wording or evidence; then chat_read. Start with a small limit and narrow with since/until, role or session instead of raising it. A newer decision overrides an older one; superseded memories appear only with include_history."""
+# Each tool description opens with when to use it, in these words.
+EXPECTED_FIRST_SENTENCES = {
+    "mem_search": "Find past decisions, memories, notes and docs by meaning; use first before deciding or asking "
+                  "about anything that may already be decided.",
+    "chat_search": "Find exact words, numbers, file names, commands or error texts in past Hermes conversations, "
+                   "tool calls and tool results.",
+    "chat_period": "List what happened in a time range (e.g. yesterday) without a query: conversations with a "
+                   "summary, then messages.",
+    "mem_period": "List memories, notes and docs created or changed in a time range (e.g. the last 2 days), "
+                  "without a query.",
+    "note_read": "Read the full body of one note or doc (a TASK_ work order, an agent note, a note the user wrote) "
+                 "by id or exact title.",
+    "chat_read": "Read one past chat message in full with its tool calls, their results and neighbouring messages.",
+}
+CLIENT_TEXT_LIMIT = 4096  # Claude Code cuts server instructions and preloaded tool descriptions here
+ALWAYS_LOAD_KEY = "anthropic/alwaysLoad"
+
+
+async def _list_tools(session) -> list:
+    return list((await session.list_tools()).tools)
 
 
 @needs_mcp
-def test_tool_list_is_exactly_the_four_tools_with_mem_search(home: Path) -> None:
+def test_initialize_sends_the_agreed_instructions_within_the_client_limit(home: Path) -> None:
+    import anyio
+    scenario = _Scenario(home, _list_tool_names)
+    anyio.run(scenario)
+    instructions = scenario.initialized.instructions
+    assert instructions == EXPECTED_INSTRUCTIONS
+    assert len(instructions) <= CLIENT_TEXT_LIMIT
+
+
+@needs_mcp
+def test_tool_descriptions_open_with_when_to_use_and_fit_the_client_limit(home: Path) -> None:
+    tools = _run(home, _list_tools)
+    descriptions = {tool.name: tool.description for tool in tools}
+    assert set(descriptions) == set(EXPECTED_FIRST_SENTENCES)
+    for name, first in EXPECTED_FIRST_SENTENCES.items():
+        assert descriptions[name].startswith(first + " "), name
+        assert len(descriptions[name]) <= CLIENT_TEXT_LIMIT, name
+
+
+@needs_mcp
+def test_every_tool_is_marked_always_load(home: Path) -> None:
+    tools = _run(home, _list_tools)
+    assert len(tools) == 6
+    for tool in tools:
+        assert tool.meta is not None and tool.meta.get(ALWAYS_LOAD_KEY) is True, tool.name
+
+
+@needs_mcp
+def test_tool_list_is_exactly_the_six_read_only_tools(home: Path) -> None:
     names = _run(home, _list_tool_names)
-    assert sorted(names) == sorted(EXPECTED_TOOLS) and len(names) == 4
+    assert sorted(names) == sorted(EXPECTED_TOOLS) and len(names) == 6
     assert "mem_search" in names and not RETIRED_TOOLS & set(names)
 
 
@@ -177,7 +210,7 @@ def test_initialize_reports_the_plugin_version(home: Path) -> None:
     anyio.run(scenario)
     manifest = (REPO / "neospike" / "plugin.yaml").read_text(encoding="utf-8")
     version = next(line.split(":", 1)[1].strip() for line in manifest.splitlines() if line.startswith("version:"))
-    assert version and scenario.initialized.server_info.name == "neospike"
+    assert version and scenario.initialized.server_info.name == "neospike-mcp"
     assert scenario.initialized.server_info.version == version
 
 
@@ -196,35 +229,11 @@ def test_note_read_returns_the_saved_body_byte_for_byte(home: Path) -> None:
 
 
 @needs_mcp
-def test_append_report_touches_only_the_report_section_and_raises_rev(home: Path) -> None:
-    plain_before = _row(home, "회의 메모")[0]
-    result = _run(home, _append_steps)
-    failed, task = result["task"]
-    assert not failed and task["note"]["rev"] == 2 and task["note"]["previous_rev"] == 1
-    body = result["read"][1]["note"]["body"]
-    assert result["read"][1]["note"]["rev"] == 2
-    report_end = TASK_BODY.index("착수했다.") + len("착수했다.")
-    tail_start = TASK_BODY.index("## 판정 지표")
-    # Every byte up to the old report text and every byte from the next section on is unchanged.
-    assert body.startswith(TASK_BODY[:report_end]) and body.endswith(TASK_BODY[tail_start:])
-    assert body == TASK_BODY[:report_end] + "\n\n" + result["report"] + "\n\n" + TASK_BODY[tail_start:]
-    failed_plain, plain = result["plain"]
-    assert failed_plain and plain["error"] == "forbidden"
-    assert _row(home, "회의 메모")[0] == plain_before
-    failed_escape, escape = result["escape"]
-    assert failed_escape and escape["error"] == "invalid"
-    assert not result["related"][0] and "backlinks" in result["related"][1]
+def test_tagged_mem_search_finds_the_task_note(home: Path) -> None:
+    result = _run(home, _search_steps)
     assert not result["search"][0] and result["search"][1]["results"]
     assert all(hit["title"] == "TASK_101" and hit["kind"] == "note" for hit in result["search"][1]["results"])
     assert not result["memory"][0] and result["memory"][1] == {"results": []}
-
-
-@needs_mcp
-def test_secret_report_is_rejected_and_the_database_is_unchanged(home: Path) -> None:
-    before = _row(home, "TASK_101")
-    failed, payload = _run(home, _secret_steps)
-    assert failed and payload["error"] == "policy" and payload["lines"] == [2]
-    assert _row(home, "TASK_101") == before
 
 
 def _cli(home: Path, *arguments: str) -> dict:
@@ -249,38 +258,8 @@ def test_task_owners_finds_overlaps_between_active_tasks_and_task_next(home: Pat
     assert _cli(home, "task-next") == {"number": 102, "title": "TASK_102", "max": 101}
 
 
-def test_report_section_is_created_at_the_end_when_missing() -> None:
-    assert append_report_section("# T\n\n## 작업\n- a", "완료") == "# T\n\n## 작업\n- a\n\n## Report\n\n완료\n"
-    assert append_report_section("# T\n\n## 작업\n- a", "done", language="en") == "# T\n\n## 작업\n- a\n\n## Report\n\ndone\n"
-    assert append_report_section("# T\n\n## 작업\n- a", "완료", language="ko") == "# T\n\n## 작업\n- a\n\n## 보고\n\n완료\n"
-    assert append_report_section("# T\n## 보고", "완료") == "# T\n## 보고\n\n완료\n"
-    fenced = "## 보고\n```\n## 가짜 제목\n```\n\n## 다음\n"
-    assert append_report_section(fenced, "x") == "## 보고\n```\n## 가짜 제목\n```\n\nx\n\n## 다음\n"
+def test_owned_paths_skip_fenced_code() -> None:
     assert owned_paths("## 소유 파일\n```\n- `fake.py`\n```\n- `real.py`\n") == ["real.py"]
-
-
-def test_existing_english_report_section_takes_the_report_in_any_case() -> None:
-    body = "# T\n\n## Report\n- earlier\n\n## Next\n- n\n"
-    for language in ("ko", "en"):
-        assert append_report_section(body, "x", language=language) == "# T\n\n## Report\n- earlier\n\nx\n\n## Next\n- n\n"
-    upper = "# T\n\n## REPORT\n- earlier\n"
-    assert append_report_section(upper, "x", language="ko") == "# T\n\n## REPORT\n- earlier\n\nx\n"
-
-
-@pytest.mark.parametrize("language, heading", [("ko", "## 보고"), (None, "## Report")])
-def test_service_titles_a_new_report_section_in_the_home_language(tmp_path: Path, language, heading) -> None:
-    home = tmp_path / "hermes"
-    if language is not None:
-        NeospikeConfig(extraction_language=language).save(home)
-    store = MemoryStore(_db(home), dimensions=DIMENSIONS)
-    try:
-        notes = NoteService(store, BowEmbedder())
-        notes.save("TASK_102", "# TASK_102\n\n## 작업\n- 충분히 긴 설명 문장이다.\n", tags=["task"], author="agent")
-        notes.append_report("TASK_102", "done", hermes_home=home)
-        body = notes.read(title="TASK_102")["body"]
-    finally:
-        store.close()
-    assert body.endswith("\n" + heading + "\n\ndone\n") and body.count("## ") == 2
 
 
 def test_clean_env_forwards_model_and_inference_settings(monkeypatch: pytest.MonkeyPatch) -> None:

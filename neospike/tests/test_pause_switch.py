@@ -163,13 +163,12 @@ def test_daily_job_skips_a_paused_home(tmp_path, monkeypatch):
 
 
 # ---- MCP server ---------------------------------------------------------------------------------------------
-def test_mcp_search_and_write_are_refused_while_paused(tmp_path):
+def test_mcp_search_is_refused_while_paused(tmp_path):
     _switch(tmp_path, False)
     tools = mcp_server.NeospikeTools(tmp_path)
-    for call, args in ((tools.mem_search, ("guitar",)), (tools.note_append_report, ("TASK_1", "text"))):
-        with pytest.raises(mcp_server.ToolError) as refused:
-            call(*args)
-        assert json.loads(str(refused.value)) == {"error": "paused", "message": PAUSED_MESSAGE}
+    with pytest.raises(mcp_server.ToolError) as refused:
+        tools.mem_search("guitar")
+    assert json.loads(str(refused.value)) == {"error": "paused", "message": PAUSED_MESSAGE}
     _switch(tmp_path, True)
     with pytest.raises(mcp_server.ToolError) as missing:
         tools.mem_search("guitar")

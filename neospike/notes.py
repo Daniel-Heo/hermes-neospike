@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 from .chunking import pack_markdown_chunks, count_headings, split_document_parts
-from .config import EMBEDDING_MAX_TOKENS, EXTRACTION_LANGUAGE_DEFAULT, read_extraction_language
+from .config import EMBEDDING_MAX_TOKENS
 from . import vector_index
 from .policy import ITEM_TEXT_CEILING, AdmitVerdict, flagged_line_numbers, screen_text
 from .store import (DOC_TYPES_SQL, FORMULA_AUTHOR, FORMULA_HWM_META_KEY, ITEM_MEMORY, LINK_TO_MEMORY_SQL,
@@ -1296,45 +1296,14 @@ class NoteService:
         self.store.log_note_access(hit["id"] for hit in results)  # recent ring
         return results
 
-    def append_report(self, title: Any, text: Any, *, hermes_home: str | Path | None = None) -> dict:
-        """Append text to the end of the report section of one live TASK_ note.
 
-        The section is `## Report` (`## 보고` is also recognised); a missing one is created
-        and titled in the extraction_language of hermes_home (default en without a home or config).
-        Only that section changes; every byte before it and after it stays. The
-        note keeps its author (edited_by is agent: Claude Code writes it), the rev rises
-        by one, and the whole new body passes the normal note policy in save().
-        """
-        title = _validated_title(title)
-        if not title.startswith(TASK_TITLE_PREFIX):
-            raise NotePermissionError(f"Reports can only be appended to notes whose title starts with {TASK_TITLE_PREFIX}")
-        text = validated_report_text(text)
-        language = read_extraction_language(hermes_home)
-        for _attempt in range(MAX_SAVE_ATTEMPTS):
-            current = self.read(title=title)
-            body = append_report_section(current["body"], text, language=language)
-            try:
-                saved = self.save(title, body, tags=current["tags"], project=current["project"], author="agent",
-                                  expected_rev=current["rev"], note_id=current["id"])
-            except NoteConflict:
-                continue
-            return {"id": saved["id"], "title": saved["title"], "rev": saved["rev"], "previous_rev": current["rev"],
-                    "appended_chars": len(text)}
-        raise NoteConflict("Note kept changing while the report was appended; retry", current_rev=None)
+# --- TASK owned-file parsing -----------------------------------
 
-
-# --- TASK report section and owned-file parsing -----------------------------------
-
-# Report section: any of these names is recognised (casefold); a new one is titled in the extraction language.
-REPORT_SECTIONS = ("보고", "report")
-REPORT_HEADINGS = {"ko": "보고", "en": "Report"}
-REPORT_HEADING_LEVEL = 2
 OWNED_FILES_SECTIONS = ("소유 파일", "owned files")
 # A bullet group whose label contains one of these lists files that are NOT owned.
 OWNED_EXCLUDE_MARKERS = ("금지", "forbidden", "do not")
 TASK_STATUS_ACTIVE = "status:active"
 TASK_NUMBER_MIN_DIGITS = 3
-MAX_REPORT_BYTES = 1_000_000
 _LINE = re.compile(r"[^\n]*\n|[^\n]+$")
 _HEADING_TEXT = re.compile(r"^(#{1,6})[ \t]+(.+?)[ \t#]*\r?$")
 _FENCE_LINE = re.compile(r"^\s*(?:```|~~~)")
@@ -1370,58 +1339,6 @@ def section_span(body: str, names: tuple[str, ...], *, level: int | None = None)
             end = next((other[0] for other in headings[index + 1:] if other[2] <= heading_level), len(body))
             return start, content, end
     return None
-
-
-def validated_report_text(text: Any) -> str:
-    """Report text that cannot leave its section: no `#`/`##` headings, balanced fences, no secrets."""
-    if not isinstance(text, str) or not text.strip():
-        raise NoteError("Report text must be a non-empty string")
-    if len(text.encode("utf-8")) > MAX_REPORT_BYTES:
-        raise NoteError(f"Report text exceeds the {MAX_REPORT_BYTES}-byte limit")
-    text = text.strip("\r\n").rstrip()
-    fences = sum(1 for line in text.splitlines() if _FENCE_LINE.match(line))
-    if fences % 2:
-        raise NoteError("Report text has an unclosed code fence")
-    escaping = [number for number, (_, _, level, _) in enumerate(_headings(text), 1) if level <= REPORT_HEADING_LEVEL]
-    if escaping:
-        raise NoteError("Report text must not contain '#' or '##' headings; use '###' or deeper")
-    lines = flagged_line_numbers(text)
-    if lines:
-        raise NotePolicyError("Report was rejected by ingestion policy (secret or prompt-injection pattern)",
-                              lines=lines, fields=["text"])
-    return text
-
-
-def _newline(body: str) -> str:
-    """The body's line ending: CRLF when most line breaks are CRLF."""
-    return "\r\n" if body.count("\r\n") * 2 > body.count("\n") else "\n"
-
-
-def append_report_section(body: str, text: str, *, language: str = EXTRACTION_LANGUAGE_DEFAULT) -> str:
-    """body with text appended at the end of its report section (`## Report`; `## 보고` is also recognised).
-
-    The first level-2 heading with either name is used as is. When there is none, a
-    section titled in language (REPORT_HEADINGS) is created at the end of the body.
-    """
-    newline = _newline(body)
-    span = section_span(body, REPORT_SECTIONS, level=REPORT_HEADING_LEVEL)
-    if span is None:
-        if not body:
-            separator = ""
-        elif body.endswith("\n\n") or body.endswith("\r\n\r\n"):
-            separator = ""
-        elif body.endswith("\n"):
-            separator = newline
-        else:
-            separator = newline * 2
-        heading = REPORT_HEADINGS.get(language, REPORT_HEADINGS[EXTRACTION_LANGUAGE_DEFAULT])
-        return body + separator + "## " + heading + newline + newline + text + newline
-    _start, content, end = span
-    prefix = body[:content] if body[:content].endswith("\n") else body[:content] + newline
-    existing = body[content:end].rstrip()
-    middle = existing + newline + newline if existing.strip() else newline
-    tail = body[end:]
-    return prefix + middle + text + newline + (newline + tail if tail else "")
 
 
 def owned_paths(body: str) -> list[str]:

@@ -42,7 +42,7 @@ Before each turn, up to 8 matching memories and note sections with cosine 0.7 or
 
 ## MCP tools
 
-`mem_search`, `note_read`, `note_related`, `note_append_report`. The server needs the optional `mcp` dependency (`pip install 'neospike[mcp]'`).
+`note_read`, `mem_search`, `mem_period`, `chat_search`, `chat_read`, `chat_period` (all read-only). The server needs the optional `mcp` dependency (`pip install 'neospike[mcp]'`).
 
 ## Command line
 

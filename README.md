@@ -21,10 +21,10 @@ Neospike is a memory provider plugin for Hermes Agent. The agent saves short fac
 
 On top of that storage:
 
-- **Automatic recall.** Before each turn, up to 8 matching memories and note sections (cosine 0.61 or more) are added to the agent's context. Items the conversation already contains are skipped.
+- **Automatic recall.** Before each turn, up to 8 matching memories and note sections (cosine 0.70 or more) are added to the agent's context. Items the conversation already contains are skipped.
 - **Preferences in context.** Preferences without a situation are shown once per conversation. Preferences tied to a situation are shown when the current message matches that situation, at most 3 per turn. A constraint always needs a situation, so it is never shown in every conversation.
 - **Dashboard tab** in the Hermes web dashboard: Map (a 3D view of memories, notes and topics, with folders), Notes, Docs, Memory, Preferences, Conversations, Config and Setup. The interface is English or Korean, following the dashboard language.
-- **MCP server** for Claude Code and other MCP clients: `mem_search`, `note_read`, `note_related`, `note_append_report`.
+- **MCP server** for Claude Code and other MCP clients: `mem_search`, `mem_period`, `note_read`, plus `chat_search`, `chat_period` and `chat_read` to search, list and read past Hermes conversations (read-only).
 - **Markdown export** of notes as a zip. Export is one-way; the database stays the source of truth.
 - **Backups.** The daily job writes a full snapshot first and incremental backups after that.
 
@@ -74,7 +74,7 @@ Opening a new Desktop window is not enough: the running gateway keeps the old co
 5. downloads the model;
 6. sets `memory.provider` to `neospike`;
 7. registers the daily cron job `neospike-daily` (every day at 12pm);
-8. registers the `neospike` MCP server in Claude Code at user scope.
+8. registers the `neospike-mcp` MCP server in Claude Code at user scope (and removes an MCP server `neospike`, the name earlier versions used, when it points at the same home).
 
 | Option | Effect |
 |---|---|
@@ -96,7 +96,7 @@ python install.py --uninstall             # add --home <path> for a profile home
 hermes gateway restart
 ```
 
-`--uninstall` removes the cron job `neospike-daily` and the cron scripts in `$HERMES_HOME/scripts` (root home only), the Claude Code MCP server `neospike` (only when it points at that home), asks the embedding service to stop (unless another home still uses Neospike), and runs `hermes plugins remove neospike`, which deletes `$HERMES_HOME/plugins/neospike` and clears `plugins.enabled` and a `memory.provider` of `neospike`; `$HERMES_HOME/neospike/.install` (the previous plugin copy) and any `neospike.previous` or `neospike.installing` left in `plugins` are deleted too. Steps that find nothing to remove are skipped, so it can be run again. Your data (`$HERMES_HOME/neospike`) and the model (`$HERMES_HOME/models/bge-m3-onnx`) stay; the command prints both paths, and you delete those folders yourself if you no longer want them.
+`--uninstall` removes the cron job `neospike-daily` and the cron scripts in `$HERMES_HOME/scripts` (root home only), the Claude Code MCP server `neospike-mcp` and the earlier name `neospike` (each only when it points at that home), asks the embedding service to stop (unless another home still uses Neospike), and runs `hermes plugins remove neospike`, which deletes `$HERMES_HOME/plugins/neospike` and clears `plugins.enabled` and a `memory.provider` of `neospike`; `$HERMES_HOME/neospike/.install` (the previous plugin copy) and any `neospike.previous` or `neospike.installing` left in `plugins` are deleted too. Steps that find nothing to remove are skipped, so it can be run again. Your data (`$HERMES_HOME/neospike`) and the model (`$HERMES_HOME/models/bge-m3-onnx`) stay; the command prints both paths, and you delete those folders yourself if you no longer want them.
 
 ### Hermes profiles
 
@@ -118,14 +118,16 @@ The agent gets these tools from the provider:
 | `neospike_doc_read` | Read a whole doc (a note the user wrote). |
 | `neospike_doc_write` | Edit an existing doc, only when the user asks. |
 
-MCP clients get a smaller, mostly read-only set:
+MCP clients (server `neospike-mcp`; in Claude Code the tools are named `mcp__neospike-mcp__<tool>`) get a smaller, read-only set:
 
 | Tool | Purpose |
 |---|---|
 | `mem_search` | Search memories, notes and docs at once. |
 | `note_read` | Read one note or doc by id or exact title. |
-| `note_related` | Backlinks, outgoing links and the most similar notes. |
-| `note_append_report` | Append a work report to a `TASK_` note. |
+| `mem_period` | List memories, notes and docs created or changed in a time range (e.g. `since: "2d"`), newest first. |
+| `chat_search` | Search past Hermes conversations: messages, tool calls and tool results (read-only). |
+| `chat_read` | Read one past chat message with its tool calls, their results and nearby messages. |
+| `chat_period` | List past chat messages in a time range without a query, with a per-conversation summary (e.g. yesterday's work). |
 
 ## Configuration
 
@@ -211,10 +213,10 @@ A database embedded with a different model or dimension is refused until `reembe
 What Neospike does outside its own data folder (`$HERMES_HOME/neospike`):
 
 - **Network.** Two things contact a remote host. (1) The model download: `install.py` and the dashboard Setup tab run the Hugging Face CLI (`hf download Xenova/bge-m3` at a pinned revision). (2) The daily batch: preference data is extracted and reworked by the selected LLM model. The packages are installed by the Hermes package manager (`hermes plugins enable`), which downloads them from the package index. The embedding service listens only on a local socket (a Unix socket, or `127.0.0.1` with a per-request token on Windows). There is no telemetry, analytics or update check.
-- **Reads outside the data folder.** `conv-import`, the provider and the dashboard open Hermes's `$HERMES_HOME/state.db` read-only to read past conversations. `install.py` reads `$HERMES_HOME/config.yaml` and `$HERMES_HOME/cron/jobs.json`. The daily cron script reads `config.yaml` of the root home and of each profile (`memory.provider`) to find the homes that use Neospike.
-- **Shell commands and child processes.** All of them run without a shell. `install.py` runs `hermes --print-runtime-command` (to find the Hermes runtime Python), `uv pip uninstall neospike` (only when an earlier install left that package in the Hermes CLI environment), `hf download`, the environment, import and provider checks of `neospike.runtime_check`, `hermes plugins enable`, `hermes config set memory.provider neospike`, `hermes cron create` / `edit` / `remove`, and `claude mcp remove` / `add-json`; with `--check` it also runs `hermes memory status`; with `--uninstall` it runs `hermes cron remove`, `claude mcp get` / `remove`, `hermes plugins remove neospike` (or `hermes memory off` when the plugin folder is already gone). The dashboard runs `hermes config get` / `set memory.provider`, `hf download`, the Neospike CLI, and the dependency and provider checks of `neospike.runtime_check`. The provider checks the embedding service's dependencies with `neospike.runtime_check` before it reports itself available. The MCP server runs the Neospike CLI for writes. Every Python child (`hf download`, the CLI, the checks, the MCP server, the cron script's CLI call and the embedding service) runs on the Hermes runtime Python through `hermes_launch.py`, which imports Hermes's `hermes_bootstrap` to select the package manager's environment.
+- **Reads outside the data folder.** `conv-import`, the provider, the dashboard and the MCP server open Hermes's `$HERMES_HOME/state.db` read-only to read past conversations. `install.py` reads `$HERMES_HOME/config.yaml` and `$HERMES_HOME/cron/jobs.json`. The daily cron script reads `config.yaml` of the root home and of each profile (`memory.provider`) to find the homes that use Neospike.
+- **Shell commands and child processes.** All of them run without a shell. `install.py` runs `hermes --print-runtime-command` (to find the Hermes runtime Python), `uv pip uninstall neospike` (only when an earlier install left that package in the Hermes CLI environment), `hf download`, the environment, import and provider checks of `neospike.runtime_check`, `hermes plugins enable`, `hermes config set memory.provider neospike`, `hermes cron create` / `edit` / `remove`, and `claude mcp remove` / `add-json`; with `--check` it also runs `hermes memory status`; with `--uninstall` it runs `hermes cron remove`, `claude mcp get` / `remove`, `hermes plugins remove neospike` (or `hermes memory off` when the plugin folder is already gone). The dashboard runs `hermes config get` / `set memory.provider`, `hf download`, the Neospike CLI, and the dependency and provider checks of `neospike.runtime_check`. The provider checks the embedding service's dependencies with `neospike.runtime_check` before it reports itself available. The MCP server only reads; it runs no Neospike CLI child. Every Python child (`hf download`, the CLI, the checks, the MCP server, the cron script's CLI call and the embedding service) runs on the Hermes runtime Python through `hermes_launch.py`, which imports Hermes's `hermes_bootstrap` to select the package manager's environment.
 - **Long-running background process.** The embedding service (`neospike.inference`, started through `hermes_launch.py`) is started on first use as a detached process and keeps running after the agent exits; one service serves every profile of a Hermes home. It stops on Ctrl-C or SIGTERM, or when asked over its socket (with its token) by `install.py --uninstall` or by turning the Setup tab switch off, unless another home still uses it. Its socket and log (`inference.log`) are in `$HERMES_HOME/neospike/.cache`. Inside the provider, the conversation indexer and the save follow-up run as daemon threads.
-- **Files written outside the data folder.** `install.py` copies the plugin to `$HERMES_HOME/plugins/neospike` (staged in, and the previous copy kept in, `$HERMES_HOME/neospike/.install`; a `neospike.previous` or `neospike.installing` folder an earlier install left in `$HERMES_HOME/plugins` is removed, because Hermes would load it as a second copy of the plugin), the cron scripts to `$HERMES_HOME/scripts`, the model to `$HERMES_HOME/models/bge-m3-onnx`, adds `neospike` to `plugins.enabled` in `$HERMES_HOME/config.yaml` (and, through `hermes config set`, `auxiliary.neospike_pref_reconcile.provider: auto` in each home that has no such slot), and registers the `neospike` MCP server in Claude Code at user scope through `claude mcp add-json`. `MEMORY_RULE.md` is created inside the data folder.
+- **Files written outside the data folder.** `install.py` copies the plugin to `$HERMES_HOME/plugins/neospike` (staged in, and the previous copy kept in, `$HERMES_HOME/neospike/.install`; a `neospike.previous` or `neospike.installing` folder an earlier install left in `$HERMES_HOME/plugins` is removed, because Hermes would load it as a second copy of the plugin), the cron scripts to `$HERMES_HOME/scripts`, the model to `$HERMES_HOME/models/bge-m3-onnx`, adds `neospike` to `plugins.enabled` in `$HERMES_HOME/config.yaml` (and, through `hermes config set`, `auxiliary.neospike_pref_reconcile.provider: auto` in each home that has no such slot), and registers the `neospike-mcp` MCP server in Claude Code at user scope through `claude mcp add-json`. `MEMORY_RULE.md` is created inside the data folder.
 - **Credentials.** Neospike stores no tokens, API keys or passwords. The model is not gated, so no Hugging Face token is needed. The LLM call goes through Hermes, which holds the provider credentials; Neospike never reads them. The dashboard passes its child processes only a fixed list of environment variables and discards their output.
 
 ## Development

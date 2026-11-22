@@ -25,7 +25,7 @@ def _find_repo_root() -> Path:
 
 
 REPO_ROOT = _find_repo_root()
-EXPECTED_VERSION = "1.0.1"
+EXPECTED_VERSION = "1.0.2"
 # 자격 증명 모양 문자열은 소스에 통째로 적지 않고 실행 시 조립한다.
 FAKE_VCS_TOKEN = "gh" + "p_" + string.ascii_lowercase + string.digits
 

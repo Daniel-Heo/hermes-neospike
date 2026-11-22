@@ -343,9 +343,10 @@ def test_mcp_registration_overwrites_with_the_hand_made_shape(tmp_path, monkeypa
     monkeypatch.setattr(install.shutil, "which", {"claude": "claude"}.get)
     monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
     install.apply_mcp_registration("/runtime/python", tmp_path, runner)
-    (remove, remove_check), (add, add_check) = calls
-    assert remove == ["claude", "mcp", "remove", "-s", "user", "neospike"] and remove_check is False
-    assert add[:6] == ["claude", "mcp", "add-json", "-s", "user", "neospike"] and add_check is True
+    (get, _), (remove, remove_check), (add, add_check) = calls
+    assert get == ["claude", "mcp", "get", "neospike"]  # the old name is not registered: nothing more to remove
+    assert remove == ["claude", "mcp", "remove", "-s", "user", "neospike-mcp"] and remove_check is False
+    assert add[:6] == ["claude", "mcp", "add-json", "-s", "user", "neospike-mcp"] and add_check is True
     assert json.loads(add[6]) == {
         "type": "stdio", "command": "/runtime/python",
         "args": ["-I", str(tmp_path / "plugins" / "neospike" / "hermes_launch.py"), str(tmp_path / "hermes-agent"),
@@ -376,7 +377,43 @@ def test_mcp_registration_is_skipped_without_claude(tmp_path, monkeypatch, capsy
     install = _install_module()
     monkeypatch.setattr(install.shutil, "which", {}.get)
     install.apply_mcp_registration("/venv/python", tmp_path, None)
-    assert capsys.readouterr().out.strip() == "Claude Code (claude) not found; MCP server neospike not registered."
+    assert capsys.readouterr().out.strip() == "Claude Code (claude) not found; MCP server neospike-mcp not registered."
+
+
+class _OldNameRunner:
+    """subprocess.run stand-in: `claude mcp get neospike` shows an entry for *old_home*; records every command."""
+
+    def __init__(self, old_home: Path) -> None:
+        self.old_home = old_home
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command, **kwargs):
+        self.commands.append(command)
+        if command[1:4] == ["mcp", "get", "neospike"]:
+            return subprocess.CompletedProcess(command, 0, f"neospike:\n  Args: --home {self.old_home}\n", "")
+        return subprocess.CompletedProcess(command, 1, "", "")
+
+
+def test_mcp_registration_removes_the_old_name_that_points_here(tmp_path, monkeypatch):
+    install = _install_module()
+    monkeypatch.setattr(install.shutil, "which", {"claude": "claude"}.get)
+    runner = _OldNameRunner(tmp_path)
+    install.apply_mcp_registration("/runtime/python", tmp_path, runner)
+    assert [command[:6] for command in runner.commands] == [
+        ["claude", "mcp", "get", "neospike"],
+        ["claude", "mcp", "remove", "-s", "user", "neospike"],
+        ["claude", "mcp", "remove", "-s", "user", "neospike-mcp"],
+        ["claude", "mcp", "add-json", "-s", "user", "neospike-mcp"]]
+
+
+def test_mcp_registration_keeps_the_old_name_of_another_home(tmp_path, monkeypatch):
+    install = _install_module()
+    monkeypatch.setattr(install.shutil, "which", {"claude": "claude"}.get)
+    (tmp_path / "mine").mkdir()
+    runner = _OldNameRunner(tmp_path / "other")
+    install.apply_mcp_registration("/runtime/python", tmp_path / "mine", runner)
+    assert ["claude", "mcp", "remove", "-s", "user", "neospike"] not in runner.commands
+    assert [command[2] for command in runner.commands] == ["get", "remove", "add-json"]
 
 
 def test_mcp_registration_is_skipped_for_a_profile_home(tmp_path, monkeypatch, capsys):
@@ -390,13 +427,14 @@ def test_mcp_registration_is_skipped_for_a_profile_home(tmp_path, monkeypatch, c
 
     def runner(command, **kwargs):
         calls.append(command)
+        return subprocess.CompletedProcess(command, 1, "", "")
 
     install.apply_mcp_registration("/venv/python", profile, runner)
     assert calls == []
     assert capsys.readouterr().out.strip() == (
-        f"Profile home {profile}: Claude Code MCP server neospike left pointing at {tmp_path.resolve()}.")
+        f"Profile home {profile}: Claude Code MCP server neospike-mcp left pointing at {tmp_path.resolve()}.")
     install.apply_mcp_registration("/venv/python", tmp_path, runner)
-    assert [command[2] for command in calls] == ["remove", "add-json"]  # the root home still registers
+    assert [command[2] for command in calls] == ["get", "remove", "add-json"]  # the root home still registers
 
 
 # A config.yaml whose `plugins:` block holds a column-0 comment block

@@ -1,14 +1,13 @@
-﻿"""MCP stdio server for Claude Code: read notes and memories, append TASK reports.
+﻿"""MCP stdio server for Claude Code: read notes, memories and past Hermes conversations.
 
 Run: python -m neospike.mcp_server [--home <HERMES_HOME>] [--owner <owner>]  (v21 --namespace: accepted with a warning)
 Register (install.py does this, not this module):
-    claude mcp add --scope user neospike -- <runtime python> -I <plugins>/neospike/hermes_launch.py <hermes checkout> neospike.mcp_server
+    claude mcp add --scope user neospike-mcp -- <runtime python> -I <plugins>/neospike/hermes_launch.py <hermes checkout> neospike.mcp_server
 
 Reads open the database with mode=ro and never write (no access bookkeeping).
-Query embeddings come from the shared embedding daemon (EmbeddingClient). The
-only write, note_append_report, runs the CLI in a subprocess: the single
-writer path shared with the dashboard. Every tool answers with JSON text and
-never shortens note bodies or chunk texts.
+Query embeddings come from the shared embedding daemon (EmbeddingClient). Every
+tool is read-only. Every tool answers with JSON text and never shortens note
+bodies or chunk texts.
 
 The `mcp` SDK is the optional extra `neospike[mcp]`; this module
 imports without it, and main() reports the missing extra.
@@ -19,9 +18,7 @@ import argparse
 import inspect
 import json
 import math
-import os
 import sqlite3
-import subprocess
 import sys
 import threading
 from operator import itemgetter
@@ -31,14 +28,14 @@ from typing import Any
 from ._wincompat import default_hermes_home
 from .config import EMBEDDING_DIMENSIONS, PAUSED_MESSAGE, NeospikeConfig, read_enabled
 from .database import canonical_database_path
-from . import hermes_runtime
 from .inference import EmbeddingClient
 from .renames import forward_old_options
 from . import vector_index
-from .notes import NoteError, NoteNotFound, _NOT_TOPIC_PAGE_SQL, note_record, note_related
-from .store import (DEFAULT_NAMESPACE, DEFAULT_SEMANTIC_CUTOFF, FORMULA_AUTHOR, ITEM_DOC, ITEM_MEMORY, NOTE_CHUNKS_SQL,
-                    SQLITE_BUSY_TIMEOUT_SECONDS, OLD_VERSION_SCORE_FACTOR,
-                    MemoryStore, vector_present_sql, pick_namespace)
+from . import chat_history
+from .notes import NoteError, NoteNotFound, _NOT_TOPIC_PAGE_SQL, note_record
+from .store import (DEFAULT_NAMESPACE, DEFAULT_SEMANTIC_CUTOFF, FORMULA_AUTHOR, ITEM_DOC, ITEM_MEMORY, ITEM_NOTE,
+                    NOTE_CHUNKS_SQL, SQLITE_BUSY_TIMEOUT_SECONDS, OLD_VERSION_SCORE_FACTOR,
+                    MemoryStore, note_head_sql, vector_present_sql, pick_namespace)
 
 try:
     from mcp.server.mcpserver import MCPServer
@@ -50,17 +47,11 @@ except ImportError:  # optional extra [mcp]
         """Stand-in so the tool class imports without the SDK."""
 
 
-SERVER_NAME = "neospike"
+SERVER_NAME = "neospike-mcp"
 # DEFAULT_NAMESPACE (store.py) applies only when no live provider namespace is recorded.
 MAX_RESULTS = 20
 DEFAULT_RESULTS = 5
-CLI_TIMEOUT_SECONDS = 180
 EXIT_MISSING_SDK = 2
-CLI_MODULE = "neospike.cli"
-# None: the CLI child runs this same copy of neospike through hermes_launch.py (hermes_runtime.launch_command);
-# tests replace this prefix.
-CLI_PREFIX: list[str] | None = None
-_PACKAGE_PARENT = str(Path(__file__).resolve().parent.parent)
 # The version the server reports at initialize: plugin.yaml's top-level `version:` (the copy installed with it).
 PLUGIN_MANIFEST = Path(__file__).resolve().with_name("plugin.yaml")
 _VERSION_KEY = "version:"
@@ -76,29 +67,80 @@ DOC_AUTHOR = "human"  # a doc is a note the user wrote (notes.author); the table
 
 TOOL_DESCRIPTIONS = {
     "note_read": (
-        "Read one Neospike note or doc (e.g. a TASK_NNN work order) by numeric id or exact title. Returns the full body "
-        "(never shortened), rev, author, tags, project and outgoing links as JSON. Trashed notes are not found."
+        "Read the full body of one note or doc (a TASK_ work order, an agent note, a note the user wrote) by id or "
+        "exact title. id_or_title is a numeric id or an exact title (e.g. TASK_NNN). Returns the body (never "
+        "shortened), rev, author, tags, project and outgoing links as JSON. Trashed notes are not found."
     ),
     "mem_search": (
-        "Search memories (facts, decisions, constraints), notes (agent notes such as TASK_ orders, automatic notes) "
-        f"and docs (notes the user wrote) at once, cosine >= {MEMORY_SEARCH_COSINE_THRESHOLD}, best first, limit 1-20. "
+        "Find past decisions, memories, notes and docs by meaning; use first before deciding or asking about anything "
+        "that may already be decided. Covers memories (facts, decisions, constraints), notes (agent notes such as "
+        "TASK_ orders, automatic notes) and docs (notes the user wrote) in one search, "
+        f"cosine >= {MEMORY_SEARCH_COSINE_THRESHOLD}, best first, limit 1-20. "
         "Each result has kind memory, note or doc. note/doc: note_id, title, chunk_id, heading_path, text. memory: "
         "id, text, origin, confidence; superseded memories only with include_history, at half score with "
         "superseded_by=N: mem:N is the current decision. Optional tag keeps only items with that tag (e.g. 'task', "
         "'status:active')."
     ),
-    "note_related": (
-        "Graph neighbours of one note (id or exact title): backlinks from notes and memories, outgoing links, "
-        "broken links and the most similar notes, as JSON."
+    "mem_period": (
+        "List memories, notes and docs created or changed in a time range (e.g. the last 2 days), without a query. "
+        "Range: since <= changed < until; changed = updated_at, else created_at. Newest first, limit 1-20 "
+        "(default 10), no embedding. since is "
+        "required, until defaults to now; both accept ISO time (local without a zone), epoch seconds or 24h/7d/2w. "
+        "kind memory, note, doc or all; tag and include_history as in mem_search. Notes and docs come without "
+        "the body (note_id, title, tags, rev): read one with note_read. truncated=true: call again with until = "
+        "the last result's timestamp (order oldest: since)."
     ),
-    "note_append_report": (
-        "Append a work report to the '## Report' section of a TASK_ note (title must start with 'TASK_'; '## 보고' "
-        "is also recognised, and a missing section is created titled in the configured extraction language). Only "
-        "that section grows; every other section stays byte-for-byte. The note rev rises by 1. The text must not contain "
-        "'#' or '##' headings or unclosed code fences; secrets and prompt-injection text are rejected."
+    "chat_search": (
+        "Find exact words, numbers, file names, commands or error texts in past Hermes conversations, tool calls and "
+        "tool results. Full-text search over the read-only chat history database, user and assistant messages and "
+        "tool call arguments included. query is an FTS5 expression; column filters content:, tool_name:, "
+        "tool_calls:. Deleted conversations are not found. "
+        "exclude_notifications drops Hermes gateway notifications (background-process and delegation results) from "
+        "user messages; default true for chat_period, false for chat_search."
+    ),
+    "chat_read": (
+        "Read one past chat message in full with its tool calls, their results and neighbouring messages. "
+        "message_id comes from chat_search or chat_period; context = how many neighbours on each side (default 0)."
+    ),
+    "chat_period": (
+        "List what happened in a time range (e.g. yesterday) without a query: conversations with a summary, then "
+        "messages. Messages: since <= time < until, newest first, limit 1-50 (default 20). Summary of the whole "
+        "range regardless of limit (sessions: title, first and last message time, message count; up to 50, most "
+        "recent first). since is required, until defaults to now; "
+        "both accept ISO time (local without a zone), epoch seconds or 24h/7d/2w. Filters session, role, "
+        "tool_name as in chat_search. truncated=true: call again with until = the last result's timestamp "
+        "(order oldest: since). "
+        "exclude_notifications drops Hermes gateway notifications (background-process and delegation results) from "
+        "user messages; default true for chat_period, false for chat_search."
     ),
 }
 TOOL_NAMES = tuple(TOOL_DESCRIPTIONS)
+# Claude Code loads a tool marked with this _meta key at session start, without a tool search.
+TOOL_META = {"anthropic/alwaysLoad": True}
+SERVER_INSTRUCTIONS = (
+    "Neospike is the user's long-term memory for this machine: past decisions, memories, notes (TASK_ work orders, "
+    "agent and automatic notes), docs (notes the user wrote, read-only) and the full Hermes chat history. All tools "
+    "are read-only.\n"
+    "\n"
+    "Search here when you: start a task or a new session; are about to decide, or ask the user, something that may "
+    "already be decided (settings, thresholds, names, designs, fixes, rules); see a work order mention an earlier "
+    "TASK, decision or bug; need what happened before (yesterday, last week, an earlier attempt, an error seen "
+    "before).\n"
+    "\n"
+    "Pick the tool by what you know:\n"
+    "1. The meaning, not the exact words -> mem_search (memories, notes and docs by meaning). Always first for "
+    "decisions; cite mem:N or the note title.\n"
+    "2. An exact word, number, file name, command or error text from past work -> chat_search (full-text over "
+    "conversations, tool calls and tool results).\n"
+    "3. Only the time (\"yesterday\", \"the last 2 days\") -> chat_period for conversations (with a per-conversation "
+    "summary) or mem_period for memories and notes created or changed then.\n"
+    "4. Then read in full: note_read for a note or doc body, chat_read for one message with its tool results and "
+    "neighbours.\n"
+    "\n"
+    "Order: mem_search first; go to chat_search or chat_period only for original wording or evidence; then "
+    "chat_read. Start with a small limit and narrow with since/until, role or session instead of raising it. A newer "
+    "decision overrides an older one; superseded memories appear only with include_history."
+)
 
 
 def _json(payload: Any) -> str:
@@ -115,22 +157,122 @@ def _limit(value: Any) -> int:
     return value
 
 
-def _visible_memory_rows(connection: sqlite3.Connection, namespace: str, project: str,
-                         session_id: str, tag: str | None = None) -> list[sqlite3.Row]:
-    """Memories of *namespace* visible from project/session (MemoryStore._scope_clause); with tag, only those
-    whose metadata tags hold it."""
+def _visible_memory_where(namespace: str, project: str, session_id: str,
+                          tag: str | None = None) -> tuple[str, tuple]:
+    """WHERE condition (no leading AND) and its parameters: memories of *namespace* visible from project/session
+    (MemoryStore._scope_clause); with tag, only those whose metadata tags hold it."""
     visibility, visibility_args = MemoryStore._scope_clause(project, session_id)
-    history_columns = ",invalid_at,superseded_by"
     tag_sql, tag_args = "", ()
     if tag:
         tag_sql = (" AND json_valid(metadata_json) AND EXISTS (SELECT 1 FROM json_each(metadata_json,'$.tags') "
                    "WHERE json_each.value=?)")
         tag_args = (tag,)
+    return (f"owner=? AND type='{ITEM_MEMORY}'" + visibility + tag_sql,
+            (namespace, *visibility_args, *tag_args))
+
+
+def _visible_memory_rows(connection: sqlite3.Connection, namespace: str, project: str,
+                         session_id: str, tag: str | None = None) -> list[sqlite3.Row]:
+    """Visible memories (_visible_memory_where) that have a vector."""
+    where, args = _visible_memory_where(namespace, project, session_id, tag)
     return connection.execute(
-        "SELECT id,text,origin,kind,confidence,importance,created_at" + history_columns + " "
-        f"FROM items WHERE owner=? AND type='{ITEM_MEMORY}' AND {vector_present_sql()}" + visibility + tag_sql,
-        (namespace, *visibility_args, *tag_args),
+        "SELECT id,text,origin,kind,confidence,importance,created_at,invalid_at,superseded_by "
+        f"FROM items WHERE {where} AND {vector_present_sql()}",
+        args,
     ).fetchall()
+
+
+# mem_period: when an item last changed (updated_at; created_at when it has none).
+_CHANGED_SQL = "COALESCE(updated_at,created_at)"
+PERIOD_KINDS = (KIND_MEMORY, KIND_NOTE, KIND_DOC, "all")
+DEFAULT_PERIOD_RESULTS = 10
+
+
+def _period_order_sql(order: str, id_column: str = "id") -> str:
+    direction = "ASC" if order == chat_history.ORDER_OLDEST else "DESC"
+    return f" ORDER BY changed {direction}, {id_column} {direction} LIMIT ?"
+
+
+def _period_item_times(row: sqlite3.Row) -> dict:
+    changed = float(row["changed"])
+    return {"time": chat_history._local_time(changed), "timestamp": changed, "created_at": row["created_at"],
+            "updated_at": row["updated_at"]}
+
+
+def _memory_period_items(connection: sqlite3.Connection, namespace: str, start: float, end: float, *, project: str,
+                         session_id: str, include_history: bool, tag: str | None, order: str,
+                         wanted: int) -> list[dict]:
+    """Visible memories (embedded or not) changed in [start, end); superseded ones only with include_history."""
+    where, args = _visible_memory_where(namespace, project, session_id, tag)
+    history_sql = "" if include_history else " AND invalid_at IS NULL"
+    rows = connection.execute(
+        f"SELECT id,text,origin,kind,confidence,created_at,updated_at,invalid_at,superseded_by,"
+        f"{_CHANGED_SQL} AS changed FROM items WHERE {where}{history_sql} "
+        f"AND {_CHANGED_SQL}>=? AND {_CHANGED_SQL}<?" + _period_order_sql(order),
+        (*args, start, end, wanted)).fetchall()
+    items = []
+    for row in rows:
+        item = {"kind": KIND_MEMORY, "id": int(row["id"]), "text": row["text"], "origin": row["origin"],
+                "item_kind": row["kind"], "confidence": float(row["confidence"]), **_period_item_times(row)}
+        if row["invalid_at"] is not None and row["superseded_by"] is not None:
+            item["superseded_by"] = int(row["superseded_by"])
+        items.append(item)
+    return items
+
+
+def _tag_list(tags_json: Any) -> list:
+    try:
+        tags = json.loads(tags_json)
+    except (TypeError, ValueError):
+        return []
+    return tags if isinstance(tags, list) else []
+
+
+def _document_period_items(connection: sqlite3.Connection, start: float, end: float, *, types: tuple[str, ...],
+                           tag: str | None, order: str, wanted: int) -> list[dict]:
+    """Live notes and docs (no TOPIC pages) changed in [start, end): head rows without the body."""
+    tag_sql, tag_args = "", ()
+    if tag:
+        tag_sql, tag_args = " AND EXISTS (SELECT 1 FROM json_each(n.tags_json) WHERE json_each.value=?)", (tag,)
+    placeholders = ",".join("?" for _ in types)
+    rows = connection.execute(
+        f"SELECT n.id AS id,n.type AS type,n.title AS title,n.tags_json AS tags_json,n.rev AS rev,"
+        f"n.created_at AS created_at,n.updated_at AS updated_at,COALESCE(n.updated_at,n.created_at) AS changed "
+        f"FROM items n WHERE {note_head_sql('n')} AND n.type IN ({placeholders}) AND n.deleted_at IS NULL"
+        + _NOT_TOPIC_PAGE_SQL + tag_sql
+        + " AND COALESCE(n.updated_at,n.created_at)>=? AND COALESCE(n.updated_at,n.created_at)<?"
+        + _period_order_sql(order, "n.id"),
+        (*types, *tag_args, start, end, wanted)).fetchall()
+    return [{"kind": KIND_DOC if row["type"] == ITEM_DOC else KIND_NOTE, "note_id": int(row["id"]),
+             "title": row["title"], "tags": _tag_list(row["tags_json"]), "rev": int(row["rev"]),
+             **_period_item_times(row)} for row in rows]
+
+
+class _ChangedKey:
+    """Sort key of mem_period results: change time, then id (note_id for notes and docs)."""
+
+    @staticmethod
+    def of(item: dict) -> tuple[float, int]:
+        return item["timestamp"], item.get("id", item.get("note_id", 0))
+
+
+def mem_period_readonly(connection: sqlite3.Connection, namespace: str, since: float, until: float, *, kind: str,
+                        limit: int, project: str, session_id: str, include_history: bool = False,
+                        tag: str | None = None, order: str = chat_history.ORDER_NEWEST) -> dict:
+    """MCP mem_period: memories, notes and docs whose last change (updated_at, else created_at) lies in
+    [since, until), sorted by that time, cut to limit; truncated tells more matched."""
+    wanted = limit + 1
+    items: list[dict] = []
+    if kind in (KIND_MEMORY, "all"):
+        items += _memory_period_items(connection, namespace, since, until, project=project, session_id=session_id,
+                                      include_history=include_history, tag=tag, order=order, wanted=wanted)
+    types = {KIND_NOTE: (ITEM_NOTE,), KIND_DOC: (ITEM_DOC,), "all": (ITEM_NOTE, ITEM_DOC)}.get(kind, ())
+    if types:
+        items += _document_period_items(connection, since, until, types=types, tag=tag, order=order, wanted=wanted)
+    items.sort(key=_ChangedKey.of, reverse=order != chat_history.ORDER_OLDEST)
+    results = items[:limit]
+    return {"since": chat_history._local_time(since), "until": chat_history._local_time(until),
+            "results": results, "count": len(results), "truncated": len(items) > limit}
 
 
 def _memory_hits(connection: sqlite3.Connection, namespace: str, qvec: list[float], *, project: str,
@@ -240,20 +382,21 @@ class _ReadOnlyConnection:
 
 
 class NeospikeTools:
-    """The four MCP tools. Each method returns JSON text or raises ToolError with a JSON error."""
+    """The six MCP tools, all read-only. Each method returns JSON text or raises ToolError with a JSON error."""
 
     def __init__(self, home: Path, namespace: str | None = None) -> None:
         self.home = Path(home).expanduser()
         self.config = NeospikeConfig.load(self.home)
         self.database = canonical_database_path(self.home / "neospike", "memory")
         self.namespace = pick_namespace(namespace, self.database)
+        self.chat_database = chat_history.chat_database_path(self.home)
         self._embedder: Any = None
         self._embedder_lock = threading.Lock()
 
     # -- helpers -----------------------------------------------------------------------------
 
     def _refuse_when_paused(self) -> None:
-        """The on/off switch, read at every call: a search or a write (both may start the embedding daemon) is
+        """The on/off switch, read at every call: a memory search (it may start the embedding daemon) is
         refused while it is off; reading a note still works."""
         if not read_enabled(self.home):
             raise _failure("paused", PAUSED_MESSAGE)
@@ -295,13 +438,6 @@ class NeospikeTools:
     def _note_read(self, connection: sqlite3.Connection, id_or_title: str) -> dict:
         return {"note": self._resolve(connection, id_or_title)}
 
-    def note_related(self, id_or_title: str) -> str:
-        return self._guarded(self._note_related, id_or_title)
-
-    def _note_related(self, connection: sqlite3.Connection, id_or_title: str) -> dict:
-        note = self._resolve(connection, id_or_title)
-        return {"title": note["title"], **note_related(connection, note["id"])}
-
     def mem_search(self, query: str, limit: int = DEFAULT_RESULTS, include_history: bool = False,
                    tag: str | None = None) -> str:
         limit = _limit(limit)
@@ -323,37 +459,61 @@ class NeospikeTools:
                                       include_history=include_history, tag=tag)
         return {"results": results}
 
-    def note_append_report(self, title: str, text: str) -> str:
+    def mem_period(self, since: float | str, until: float | str | None = None, kind: str = "all",
+                   tag: str | None = None, include_history: bool = False, order: str = chat_history.ORDER_NEWEST,
+                   limit: int = DEFAULT_PERIOD_RESULTS) -> str:
+        limit = _limit(limit)
+        if kind not in PERIOD_KINDS:
+            raise _failure("invalid", f"kind must be one of: {', '.join(PERIOD_KINDS)}")
+        if order not in chat_history.PERIOD_ORDERS:
+            raise _failure("invalid", f"order must be one of: {', '.join(chat_history.PERIOD_ORDERS)}")
+        if not isinstance(include_history, bool):
+            raise _failure("invalid", "include_history must be a boolean")
+        if tag is not None and not isinstance(tag, str):
+            raise _failure("invalid", "tag must be a string")
+        try:
+            start, end = chat_history.parse_period(since, until)
+        except chat_history.ChatHistoryError as exc:
+            raise _failure(exc.code, exc.message) from None
         self._refuse_when_paused()
-        code, payload = self._cli(["note-append-report"], {"title": title, "text": text})
-        if code or "error" in payload:
-            raise ToolError(_json(payload))
-        return _json(payload)
+        return self._guarded(self._mem_period, start, end, kind, tag or None, include_history, order, limit)
 
-    def _cli(self, arguments: list[str], payload: dict) -> tuple[int, dict]:
-        """Run one CLI command with JSON on stdin; return (exit code, parsed JSON object)."""
+    def _mem_period(self, connection: sqlite3.Connection, start: float, end: float, kind: str, tag: str | None,
+                    include_history: bool, order: str, limit: int) -> dict:
+        # The visibility of mem_search: the working directory, no session.
+        return mem_period_readonly(connection, self.namespace, start, end, kind=kind, limit=limit,
+                                   project=str(Path.cwd().resolve()), session_id="",
+                                   include_history=include_history, tag=tag, order=order)
+
+    # Hermes chat history: no embedding daemon, so like note_read these work while the switch is off.
+
+    def chat_search(self, query: str, session: str | None = None, role: str | None = None,
+                    tool_name: str | None = None, since: float | str | None = None, until: float | str | None = None,
+                    order: str = chat_history.ORDER_RECENT, limit: int = chat_history.DEFAULT_SEARCH_RESULTS,
+                    exclude_notifications: bool = chat_history.DEFAULT_EXCLUDE_NOTIFICATIONS_SEARCH) -> str:
         try:
-            prefix = CLI_PREFIX or hermes_runtime.launch_command(self.home, [CLI_MODULE])
-        except hermes_runtime.HermesRuntimeNotFound:
-            raise _failure("unavailable", "Neospike write command could not run: Hermes runtime not found") from None
-        command = [*prefix, "--home", str(self.home), "--owner", self.namespace, *arguments]
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, (_PACKAGE_PARENT, env.get("PYTHONPATH"))))
+            return _json(chat_history.search(self.chat_database, query, session=session, role=role,
+                                             tool_name=tool_name, since=since, until=until, order=order, limit=limit,
+                                             exclude_notifications=exclude_notifications))
+        except chat_history.ChatHistoryError as exc:
+            raise _failure(exc.code, exc.message) from None
+
+    def chat_read(self, message_id: int, context: int = 0) -> str:
         try:
-            result = subprocess.run(command, input=_json(payload).encode("utf-8"), capture_output=True,
-                                    timeout=CLI_TIMEOUT_SECONDS, env=env)
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            raise _failure("unavailable", f"Neospike write command could not run: {type(exc).__name__}") from None
-        text = result.stdout.decode("utf-8", errors="replace").strip()
-        for candidate in (text, text.rsplit("\n", 1)[-1]):
-            try:
-                parsed = json.loads(candidate)
-            except ValueError:
-                continue
-            if isinstance(parsed, dict):
-                return result.returncode, parsed
-        raise _failure("unavailable", f"Neospike write command failed with status {result.returncode}")
+            return _json(chat_history.read(self.chat_database, message_id, context=context))
+        except chat_history.ChatHistoryError as exc:
+            raise _failure(exc.code, exc.message) from None
+
+    def chat_period(self, since: float | str, until: float | str | None = None, session: str | None = None,
+                    role: str | None = None, tool_name: str | None = None, order: str = chat_history.ORDER_NEWEST,
+                    limit: int = chat_history.DEFAULT_PERIOD_RESULTS,
+                    exclude_notifications: bool = chat_history.DEFAULT_EXCLUDE_NOTIFICATIONS_PERIOD) -> str:
+        try:
+            return _json(chat_history.period(self.chat_database, since, until, session=session, role=role,
+                                             tool_name=tool_name, order=order, limit=limit,
+                                             exclude_notifications=exclude_notifications))
+        except chat_history.ChatHistoryError as exc:
+            raise _failure(exc.code, exc.message) from None
 
 
 def server_version(manifest: Path = PLUGIN_MANIFEST) -> str:
@@ -371,14 +531,10 @@ def server_version(manifest: Path = PLUGIN_MANIFEST) -> str:
 def build_server(tools: NeospikeTools) -> Any:
     if MCPServer is None:
         raise RuntimeError("The MCP SDK is not installed; install the extra: pip install 'neospike[mcp]'")
-    server = MCPServer(SERVER_NAME, version=server_version(), instructions=(
-        "Neospike second brain. TASK_NNN notes hold work orders; read them with note_read and report with "
-        "note_append_report. Docs (notes the user wrote) are read-only. Before you decide, or ask the user, about anything that may already be "
-        "decided (settings, thresholds, designs, fixes), search mem_search (memories, notes and docs, the notes "
-        "the user wrote) first; cite mem:N or the title. A work order may already list related decisions; search for the rest."
-    ))
+    server = MCPServer(SERVER_NAME, version=server_version(), instructions=SERVER_INSTRUCTIONS)
     for name in TOOL_NAMES:
-        server.add_tool(getattr(tools, name), name=name, description=TOOL_DESCRIPTIONS[name], structured_output=False)
+        server.add_tool(getattr(tools, name), name=name, description=TOOL_DESCRIPTIONS[name], meta=dict(TOOL_META),
+                        structured_output=False)
     return server
 
 
