@@ -26,11 +26,13 @@ LONG_WORD_AT = 1_000
 _SCHEMA = (
     "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT, "
     "tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL, active INTEGER DEFAULT 1)",
-    "CREATE VIEW messages_fts_src AS SELECT id, CASE WHEN role = 'tool' THEN substr(COALESCE(content, ''), 1, 8192) "
-    "ELSE content END AS content, tool_name, tool_calls FROM messages",
-    "CREATE VIRTUAL TABLE messages_fts USING fts5( content, tool_name, tool_calls, content='messages_fts_src', "
-    "content_rowid='id' )",
+    # Hermes' trigram index shape: no tool rows, no tool_calls column (Hermes also leaves out cron and subagent
+    # sessions through a sessions join, which these tests do not need).
+    "CREATE VIEW messages_fts_trigram_src AS SELECT id, role, content, tool_name FROM messages WHERE role <> 'tool'",
+    "CREATE VIRTUAL TABLE messages_fts_trigram USING fts5( content, tool_name, content='messages_fts_trigram_src', "
+    "content_rowid='id', tokenize='trigram' )",
 )
+REBUILD_INDEX = "INSERT INTO messages_fts_trigram(messages_fts_trigram) VALUES('rebuild')"
 
 
 def _calls(*calls: tuple[str, str, dict]) -> str:
@@ -69,7 +71,7 @@ def _build_state_db(path: Path, *, with_fts: bool = True, rebuilding: bool = Fal
         if rebuilding:
             connection.execute("INSERT INTO state_meta VALUES ('fts_rebuild_progress', '3')")
         if with_fts:
-            connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+            connection.execute(REBUILD_INDEX)
         connection.commit()
     finally:
         connection.close()
@@ -110,29 +112,31 @@ def _error(call, *args, **kwargs) -> dict:
 
 def test_word_search_recent_first(tools: NeospikeTools) -> None:
     payload = _search(tools, "threshold")
-    assert _ids(payload) == [2, 1, 8, 5] and payload["count"] == 4
+    # Row 2 has the word only in its tool call arguments, which are not searched.
+    assert _ids(payload) == [1, 8, 5] and payload["count"] == 3
     assert payload["index_rebuilding"] is False and "query_rewritten" not in payload
     first = payload["results"][0]
-    assert first["session_id"] == SESSION_A and first["role"] == "assistant" and first["timestamp"] == T0 + 10
-    assert first["time"] == datetime.fromtimestamp(T0 + 10).isoformat(timespec="seconds")
-    assert first["tool_calls"] == [{"id": "call_1", "name": "neospike_memory_save"}] and first["active"] == 1
+    assert first["session_id"] == SESSION_A and first["role"] == "user" and first["timestamp"] == T0
+    assert first["time"] == datetime.fromtimestamp(T0).isoformat(timespec="seconds")
+    assert first["tool_calls"] == [] and first["active"] == 1
+    assert payload["results"][1]["tool_calls"] == [{"id": "neospike_memory_save", "name": "terminal"}]
 
 
-def test_column_filter_on_tool_calls(tools: NeospikeTools) -> None:
-    payload = _search(tools, "tool_calls: updates")
-    assert _ids(payload) == [2]
-    assert "updates" in payload["results"][0]["excerpt"]  # from the call arguments: the content has no match
+def test_column_filter_on_content_and_tool_calls(tools: NeospikeTools) -> None:
+    assert _ids(_search(tools, "content: updating")) == [2]
+    failure = _error(tools.chat_search, "tool_calls: updates")
+    assert failure["error"] == "invalid" and "tool_calls" in failure["message"]
 
 
 def test_syntax_error_is_rewritten(tools: NeospikeTools) -> None:
     payload = _search(tools, "threshold (")
-    assert payload["query_rewritten"] == '"threshold"' and set(_ids(payload)) == {1, 2, 5, 8}
+    assert payload["query_rewritten"] == '"threshold"' and set(_ids(payload)) == {1, 5, 8}
     assert _error(tools.chat_search, "( )")["error"] == "invalid"
     assert _error(tools.chat_search, "  ")["error"] == "invalid"
 
 
 def test_session_full_id_and_suffix(tools: NeospikeTools) -> None:
-    assert set(_ids(_search(tools, "threshold", session=SESSION_A))) == {1, 2}
+    assert set(_ids(_search(tools, "threshold", session=SESSION_A))) == {1}
     assert set(_ids(_search(tools, "threshold", session="bbbbbb"))) == {5, 8}
     assert _ids(_search(tools, "threshold", session="b_bbbb")) == []  # '_' is no LIKE wildcard
     assert _error(tools.chat_search, "threshold", session="bbbbb")["error"] == "invalid"
@@ -141,17 +145,17 @@ def test_session_full_id_and_suffix(tools: NeospikeTools) -> None:
 def test_role_and_tool_name_filters(tools: NeospikeTools) -> None:
     assert set(_ids(_search(tools, "threshold", role="user"))) == {1, 5}
     assert _error(tools.chat_search, "threshold", role="bot")["error"] == "invalid"
-    payload = _search(tools, "threshold OR updated OR done", tool_name="neospike_memory_save")
-    assert set(_ids(payload)) == {2, 3}  # assistant call and tool result; row 8 only has the name as a call id
-    assert payload["results"][0]["tool_name"] == "neospike_memory_save"
+    payload = _search(tools, "threshold OR updating OR done", tool_name="neospike_memory_save")
+    assert _ids(payload) == [2]  # the assistant call; tool results are not searched; row 8 only has it as a call id
+    assert payload["results"][0]["tool_calls"] == [{"id": "call_1", "name": "neospike_memory_save"}]
 
 
 def test_since_until_epoch_and_iso(tools: NeospikeTools) -> None:
-    assert set(_ids(_search(tools, "threshold", since=T0))) == {1, 2}
+    assert set(_ids(_search(tools, "threshold", since=T0))) == {1}
     assert set(_ids(_search(tools, "threshold", until=T0))) == {5, 8}
-    assert set(_ids(_search(tools, "threshold", since="2026-11-22"))) == {1, 2}
+    assert set(_ids(_search(tools, "threshold", since="2026-11-22"))) == {1}
     assert set(_ids(_search(tools, "threshold", until="2026-11-22T04:00"))) == {5, 8}
-    assert set(_ids(_search(tools, "threshold", since="2026-11-21", until="2026-11-22T04:00:15"))) == {1, 2, 5, 8}
+    assert set(_ids(_search(tools, "threshold", since="2026-11-21", until="2026-11-22T04:00:15"))) == {1, 5, 8}
     assert _error(tools.chat_search, "threshold", since="yesterday")["error"] == "invalid"
     assert _error(tools.chat_search, "threshold", until=True)["error"] == "invalid"
 
@@ -162,8 +166,8 @@ def test_order_recent_and_rank(tools: NeospikeTools, home: Path) -> None:
     connection = sqlite3.connect(home / "state.db")
     try:
         expected = [row[0] for row in connection.execute(
-            "SELECT rowid FROM messages_fts WHERE messages_fts MATCH 'threshold' "
-            "ORDER BY bm25(messages_fts), rowid DESC")]
+            "SELECT rowid FROM messages_fts_trigram WHERE messages_fts_trigram MATCH 'threshold' "
+            "ORDER BY bm25(messages_fts_trigram), rowid DESC")]
     finally:
         connection.close()
     assert _ids(_search(tools, "threshold", order="rank")) == expected
@@ -172,7 +176,7 @@ def test_order_recent_and_rank(tools: NeospikeTools, home: Path) -> None:
 
 def test_limit_bounds(tools: NeospikeTools) -> None:
     assert _search(tools, "threshold", limit=1)["count"] == 1
-    assert _search(tools, "threshold", limit=chat_history.MAX_SEARCH_RESULTS)["count"] == 4
+    assert _search(tools, "threshold", limit=chat_history.MAX_SEARCH_RESULTS)["count"] == 3
     for bad in (0, chat_history.MAX_SEARCH_RESULTS + 1, True, "5"):
         assert _error(tools.chat_search, "threshold", limit=bad)["error"] == "invalid"
 
@@ -228,7 +232,8 @@ def test_missing_database_and_missing_index(tmp_path: Path) -> None:
     home.mkdir()
     _build_state_db(home / "state.db", with_fts=False)
     failure = _error(_tools(home).chat_search, "threshold")
-    assert failure == {"error": "unavailable", "message": "Hermes chat search index is missing"}
+    assert failure["error"] == "unavailable"
+    assert failure["message"].startswith("Hermes chat search index is missing: messages_fts_trigram")
 
 
 def test_index_rebuilding_flag(tmp_path: Path) -> None:
@@ -241,7 +246,7 @@ def test_index_rebuilding_flag(tmp_path: Path) -> None:
 def test_works_while_paused(home: Path) -> None:
     tools = _tools(home)
     NeospikeConfig(enabled=False).save(home)
-    assert _search(tools, "threshold")["count"] == 4
+    assert _search(tools, "threshold")["count"] == 3
     assert json.loads(tools.chat_read(1))["message"]["message_id"] == 1
 
 
@@ -303,21 +308,20 @@ def test_readonly_connection_still_reads(home: Path) -> None:
 
 
 def test_excerpt_and_arguments_unescape_korean(tools: NeospikeTools) -> None:
-    item = _search(tools, "tool_calls: bridgeword")["results"][0]
-    assert item["message_id"] == 9 and KOREAN_TEXT in item["excerpt"] and "\\u" not in item["excerpt"]
+    assert _ids(_search(tools, "bridgeword")) == []  # tool call arguments are not searched
     text = tools.chat_read(9)
     assert "\\u" not in text
     assert json.loads(text)["message"]["tool_calls"][0]["arguments"] == {"marker": "bridgeword", "text": KOREAN_TEXT}
 
 
 def test_rewrite_keeps_numbers() -> None:
-    assert chat_history.rewrite_fts_query('0.61 문턱') == '"0.61" OR "문턱"'
+    assert chat_history.rewrite_fts_query('0.61 문턱') == '"0.61" OR (" 문턱" OR "문턱 ")'
     assert chat_history.rewrite_fts_query('say"hi ( )') == '"say""hi"'
 
 
 def test_number_query_is_rewritten_and_found(tools: NeospikeTools) -> None:
     payload = _search(tools, "0.61 문턱")
-    assert payload["query_rewritten"] == '"0.61" OR "문턱"' and 1 in _ids(payload)
+    assert payload["query_rewritten"] == '"0.61" OR (" 문턱" OR "문턱 ")' and 1 in _ids(payload)
 
 
 # -- Hermes gateway notifications ------------------------------------------------------------------
@@ -360,7 +364,7 @@ def build_notification_db(path: Path, base: float) -> Path:
             connection.execute(statement)
         connection.executemany("INSERT INTO messages (id, session_id, role, content, tool_call_id, tool_calls, "
                                "tool_name, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", notification_rows(base))
-        connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        connection.execute(REBUILD_INDEX)
         connection.commit()
     finally:
         connection.close()

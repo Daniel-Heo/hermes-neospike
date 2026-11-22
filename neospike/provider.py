@@ -1219,7 +1219,7 @@ class NeospikeProvider(HermesMemoryProvider):
                 _UPDATE_REQUIRED, strict=True,
             ),
             _tool_spec("neospike_memory_search", "Search this user's local memory. Superseded (replaced) memories are omitted unless "
-                   "include_history is true; then they show at half score with superseded_by=N (mem:N is the current decision). archived=true means the user archived it. Conversation excerpts carry message_parts/part; conv-read returns the whole message.",
+                   "include_history is true; then they show at half score with superseded_by=N (mem:N is the current decision). archived=true means the user archived it.",
                    {"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                     "include_history": {"type": "boolean", "default": False}}, ["query"]),
             _tool_spec("neospike_memory_delete", "Remove one local-memory record by ID if visible in the current scope. To correct, use neospike_memory_update.", {"id": _ID_SCHEMA, "target": _TARGET_SCHEMA}, ["id"], strict=True),
@@ -1610,7 +1610,7 @@ class NeospikeProvider(HermesMemoryProvider):
         history = HISTORY_SHOW if with_history else HISTORY_OMIT
         live = self._read_live_context(session_id, messages=True)
         hits = self._fused_search(str(args.get("query") or ""), limit=max(1, min(20, int(args.get("limit", 5)))),
-                                  conversations=True, history=history, live=live)
+                                  conversations=False, history=history, live=live)
         # The same in-context rules as the prefetch (builtin mirrors stay); omitted_in_context counts what they left out.
         kept, in_context = self._split_in_context(hits, live)
         return json.dumps({"results": kept, "warnings": self._search_notes,

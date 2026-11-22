@@ -33,9 +33,9 @@ _STAMP_WINDOW_SECONDS = 5.0  # a write stamped up to this long before its commit
 _SQL_BATCH = 500
 _F32_WIDTH = 4
 
-# Rows whose vector may have changed since a time: (id, embedding).
+# Rows whose vector may have changed since a time: (id, embedding); {vector_rows} = _vector_rows_sql().
 _CHANGED_SQL = {
-    "items": "SELECT id,embedding FROM items WHERE updated_at>? AND length(embedding)=?",
+    "items": "SELECT id,embedding FROM items WHERE updated_at>? AND {vector_rows}",
 }
 
 _registry: dict[tuple[str, str], _TableIndex] = {}
@@ -57,6 +57,13 @@ def _database_file(connection: sqlite3.Connection) -> str:
         if row[1] == "main":
             return os.path.normcase(os.path.realpath(row[2])) if row[2] else ""
     return ""
+
+
+def _vector_rows_sql() -> str:
+    """SQL condition, one `?` = the byte width: a stored vector (the present-vector partial index takes it) of
+    exactly this width (a row of another width never reaches the reshape in _add or the indexed-copy compare)."""
+    from .store import vector_present_sql  # store imports this module
+    return f"{vector_present_sql()} AND length(embedding)=?"
 
 
 def _blobs(connection: sqlite3.Connection, table: str, ids: Sequence[int]) -> dict[int, bytes]:
@@ -90,7 +97,7 @@ def _build(state: _TableIndex, connection: sqlite3.Connection, table: str, dims:
     state.index = faiss.IndexIDMap2(hnsw)
     state.meta = meta
     state.synced_at = time.time()
-    rows = connection.execute(f"SELECT id,embedding FROM {table} WHERE length(embedding)=?",
+    rows = connection.execute(f"SELECT id,embedding FROM {table} WHERE {_vector_rows_sql()}",
                               (dims * _F32_WIDTH,)).fetchall()
     _add(state, [(int(row[0]), row[1]) for row in rows], dims)
 
@@ -105,13 +112,15 @@ def _sync(state: _TableIndex, connection: sqlite3.Connection, table: str, ids: S
     if state.index is None or state.meta != meta or state.index.d != dims:
         _build(state, connection, table, dims, meta)
         return
-    live = int(connection.execute(f"SELECT count(*) FROM {table} WHERE length(embedding)=?", (width,)).fetchone()[0])
+    vector_rows = _vector_rows_sql()
+    live = int(connection.execute(f"SELECT count(*) FROM {table} WHERE {vector_rows}", (width,)).fetchone()[0])
     if state.index.ntotal - live > DEAD_RATIO * state.index.ntotal:
         _build(state, connection, table, dims, meta)
         return
     present = set(faiss.vector_to_array(state.index.id_map).tolist())
     since, state.synced_at = state.synced_at - _STAMP_WINDOW_SECONDS, time.time()
-    recent = [(int(row[0]), row[1]) for row in connection.execute(_CHANGED_SQL[table], (since, width))]
+    recent = [(int(row[0]), row[1]) for row in connection.execute(_CHANGED_SQL[table].format(vector_rows=vector_rows),
+                                                                               (since, width))]
     pending = [pair for pair in recent if pair[0] not in present]
     known = [pair for pair in recent if pair[0] in present]
     if known:  # same id: added again only when the stored vector differs from the indexed copy

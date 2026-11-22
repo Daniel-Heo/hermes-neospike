@@ -18,6 +18,7 @@ from neospike.provider import (CRITERIA_CHANGED_NOTICE, PROFILE_CLOSE, PROFILE_H
                                PROFILE_STATED, NeospikeProvider, ProfileTuning, injected_part)
 from neospike.preferences import BASIS_AGENT_INFERRED, PREF_TYPES
 from neospike.recall_log import REASON_IN_CONTEXT, REASON_SOURCE_CAP
+from neospike.store import HISTORY_OMIT
 
 SID = "20261118_live"
 OTHER_SID = "20261101_other"
@@ -157,6 +158,15 @@ def search(provider: NeospikeProvider, query: str, limit: int = 5) -> dict:
     return json.loads(provider.handle_tool_call("neospike_memory_search", {"query": query, "limit": limit}))
 
 
+def conversation_search(provider: NeospikeProvider, query: str, limit: int = 5) -> dict:
+    """The search tool's in-context rules over the lanes with the conversation lane on (the tool itself leaves the
+    conversation lane out; the prefetch runs it when conversation_prefetch is on)."""
+    live = provider._read_live_context(SID, messages=True)
+    hits = provider._fused_search(query, limit=limit, conversations=True, history=HISTORY_OMIT, live=live)
+    kept, in_context = provider._split_in_context(hits, live)
+    return {"results": kept, "omitted_in_context": len(in_context) + provider._chat_omitted}
+
+
 def log_entries(home: Path) -> list[dict]:
     return [json.loads(row) for path in sorted((home / "neospike" / "logs").glob("recall-*.jsonl"))
             for row in path.read_text(encoding="utf-8").splitlines()]
@@ -282,14 +292,14 @@ def test_search_leaves_out_live_excerpts_and_counts_them(home, provider):
     to_state(home, turns, range(1, 3), active=0, compacted=1, timestamp=cut)  # seq 1-2 summarized
     to_state(home, turns, range(3, 7), active=1, compacted=0, timestamp=now)  # seq 3-6 still in context
     _conversation(provider, OTHER_SID, [now - 9000, now - 8000, now - 7000])
-    wide = search(provider, "bicycle", limit=4)
+    wide = conversation_search(provider, "bicycle", limit=4)
     origins = {(hit["session_id"], hit["seq_start"]) for hit in wide["results"]}
     assert origins == {(SID, 1), (OTHER_SID, 1), (OTHER_SID, 3), (OTHER_SID, 5)}
     assert wide["omitted_in_context"] == 2
-    narrow = search(provider, "bicycle", limit=3)
+    narrow = conversation_search(provider, "bicycle", limit=3)
     assert len(narrow["results"]) == 3 and narrow["omitted_in_context"] == 2
     assert all(hit["session_id"] != SID or hit["seq_start"] == 1 for hit in narrow["results"])
-    others = search(provider, "bicycle", limit=2)
+    others = conversation_search(provider, "bicycle", limit=2)
     assert len(others["results"]) == 2
 
 
@@ -304,11 +314,11 @@ def test_excerpt_with_one_summarized_message_is_found(home, provider):
     assert chunk == [(1, 4)]  # one chunk over all four messages
     to_state(home, turns, range(1, 2), active=0, compacted=1, timestamp=now - CUT_AGO_S)
     to_state(home, turns, range(2, 5), active=1, compacted=0, timestamp=now)
-    found = search(provider, "bicycle")
+    found = conversation_search(provider, "bicycle")
     assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 1)]
     assert found["omitted_in_context"] == 0
     to_state(home, turns, range(1, 2), active=1, compacted=0, timestamp=now)  # now every message is resent
-    found = search(provider, "bicycle")
+    found = conversation_search(provider, "bicycle")
     assert found["results"] == [] and found["omitted_in_context"] == 1
 
 
@@ -319,7 +329,7 @@ def test_active_copy_next_to_compacted_original_leaves_the_excerpt_out(home, pro
     turns = _conversation(provider, SID, [cut - 500, cut - 400])
     to_state(home, turns, range(1, 5), active=0, compacted=1, timestamp=cut)
     to_state(home, turns, range(1, 3), active=1, compacted=0, timestamp=cut)  # compaction kept seq 1-2 as copies
-    found = search(provider, "bicycle")
+    found = conversation_search(provider, "bicycle")
     assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 3)]
     assert found["omitted_in_context"] == 1
 
@@ -335,7 +345,7 @@ def test_late_capture_time_does_not_decide(home, provider):
     to_state(home, turns, range(3, 5), active=0, compacted=1, timestamp=cut)
     to_state(home, turns, range(3, 5), active=1, compacted=0, timestamp=cut)  # active copies: left out
     to_state(home, turns, range(5, 7), active=1, compacted=0, timestamp=now)  # live: left out
-    found = search(provider, "bicycle")
+    found = conversation_search(provider, "bicycle")
     assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 1)]
     assert found["omitted_in_context"] == 2
 

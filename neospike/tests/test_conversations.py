@@ -169,8 +169,8 @@ def test_mask_patterns_cover_folded_header_and_private_key_block() -> None:
     assert "MIIEsecretbody" not in masked and masked.endswith("after") and count >= 1
 
 
-# 4: prefetch excludes the conversation lane; direct search shows it --------------------------------
-def test_prefetch_excludes_conversations_and_direct_search_includes_them(tmp_path: Path) -> None:
+# 4: prefetch and direct search exclude the conversation lane -------------------------------------
+def test_prefetch_and_direct_search_exclude_conversations(tmp_path: Path) -> None:
     provider = _provider(tmp_path)
     try:
         provider.sync_turn("Where did I park the blue bicycle yesterday?",
@@ -184,7 +184,8 @@ def test_prefetch_excludes_conversations_and_direct_search_includes_them(tmp_pat
         entry = json.loads(log.read_text(encoding="utf-8").splitlines()[-1])
         assert all(item["lane"] != "conversation" for item in entry["injected"] + entry["dropped"])
         direct = json.loads(provider.handle_tool_call("neospike_memory_search", {"query": query}))["results"]
-        hits = [item for item in direct if item.get("kind") == conv.KIND]
+        assert [item for item in direct if item.get("kind") == conv.KIND] == []
+        hits = [item for item in provider._chat_lane(query, limit=8) if item.get("kind") == conv.KIND]
         assert len(hits) == 1 and hits[0]["origin"].startswith("conv:") and "library fountain" in hits[0]["text"]
         provider._settings = replace(provider._settings, conversation_prefetch=True)
         assert "conv:" in provider.prefetch(query, session_id=SESSION)

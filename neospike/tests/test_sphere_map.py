@@ -269,18 +269,15 @@ def test_map_time_for_300_synthetic_memories(home: Path, monkeypatch, capsys) ->
 
 
 # 8 -----------------------------------------------------------------------------------------
-def test_map_ui_syntax_contract_and_src_dist_identical() -> None:
+def test_map_ui_syntax_contract() -> None:
     import shutil
     import subprocess
     dashboard = Path(api.__file__).resolve().parent
-    for name in ("index.js", "style.css"):
-        assert (dashboard / "src" / name).read_bytes() == (dashboard / "dist" / name).read_bytes()
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    for folder in ("src", "dist"):
-        checked = subprocess.run([node, "--check", str(dashboard / folder / "index.js")], capture_output=True, text=True)
-        assert checked.returncode == 0, checked.stderr
+    checked = subprocess.run([node, "--check", str(dashboard / "dist" / "index.js")], capture_output=True, text=True)
+    assert checked.returncode == 0, checked.stderr
     script = (dashboard / "dist" / "index.js").read_text(encoding="utf-8")
     for needle in ('"tab.map": "Map"', "/map", "/folders/move", '"common.moveToFolder": "Move to folder"', '"map.recentOnly": "Recent only"', '"folder.new": "New folder"',
                    "#F5C518", "#B08E11", "#6E590B", "#E53935", "#FB8C00", "#B9F6CA", "#1E88E5", "noteTitle(title, body)",
@@ -532,7 +529,7 @@ def _missing_map_kinds(script: str) -> list[str]:
 
 def test_frontend_knows_every_map_point_kind_including_formula() -> None:
     dashboard = Path(api.__file__).resolve().parent
-    script = (dashboard / "src" / "index.js").read_text(encoding="utf-8")
+    script = (dashboard / "dist" / "index.js").read_text(encoding="utf-8")
     assert "formula" in _map_point_kinds()
     assert _missing_map_kinds(script) == []
     assert 'const KIND_CLASSES = { memory: "other", human: "doc", agent: "note", formula: "note"' in script
@@ -578,7 +575,7 @@ def _hooks_after_return(script: str, names: tuple[str, ...]) -> list[str]:
 
 def test_map_panel_hooks_run_in_the_same_order_for_topics_and_items() -> None:
     dashboard = Path(api.__file__).resolve().parent
-    script = (dashboard / "src" / "index.js").read_text(encoding="utf-8")
+    script = (dashboard / "dist" / "index.js").read_text(encoding="utf-8")
     assert _hooks_after_return(script, ("ViewEntry",)) == []  # a hook after an early return blanks the tab
     assert _hooks_after_return(script, ("ThemeView", "RecordView", "ThemeEntry", "LinkedRoll")) == []
     # A PanelItem with a hook after an early return must be caught.

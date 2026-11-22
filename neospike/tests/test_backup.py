@@ -148,9 +148,9 @@ def test_embedding_change_starts_a_new_chain(env, key: str, value: str) -> None:
     assert _backup(store, directory) == {"created": False}
 
 
-# A search hit changes only accessed_at/access_count (updated_at stays); the next
-# increment still carries the row, so a restore keeps the read bookkeeping. The note's chunks are not resent.
-def test_access_only_change_goes_into_next_increment(env, tmp_path: Path) -> None:
+# A search hit changes only accessed_at/access_count (updated_at stays); read bookkeeping is no change
+# signal, so no increment is written (the read values reach the next full snapshot or the row's next edit).
+def test_access_only_change_makes_no_increment(env) -> None:
     store, notes, directory = env
     memory_id = store.insert(NAMESPACE, "The user waters plants at dawn.", _vector(1), source="agent:s1")
     note = notes.save("Garden plan", "# Garden\nTomatoes and basil.", author="human")
@@ -163,15 +163,7 @@ def test_access_only_change_goes_into_next_increment(env, tmp_path: Path) -> Non
         updated, count = store._conn.execute("SELECT updated_at,access_count FROM items WHERE id=?",
                                              (row_id,)).fetchone()
         assert (updated, count) == (before[row_id], 1), row_id
-    increment = _backup(store, directory)
-    assert increment.get("kind") == "incremental"
-    manifest = db_backup.read_manifest(Path(increment["path"]))
-    assert manifest["rows"]["items"] == 2  # the memory and the note's head row; its parts are not resent
-    target = tmp_path / "restored" / "memory.db"
-    db_backup.restore(directory, target)
-    original, restored = _state(store.path), _state(target)
-    for table in ("items", "item_links"):
-        assert restored[table] == original[table], table
+    assert _backup(store, directory) == {"created": False}
 
 
 # 3: broken chain -> refused -----------------------------------------------------------------
@@ -211,6 +203,8 @@ def test_v4_database_migrates_with_updated_at(tmp_path: Path) -> None:
         for name in CHANGE_TRIGGER_SPECS:
             connection.execute(f"DROP TRIGGER {name}")
         connection.execute("DROP TABLE tombstones")
+        connection.execute("DROP INDEX IF EXISTS items_vector_updated")
+        connection.execute("DROP INDEX IF EXISTS items_updated")
         connection.execute("ALTER TABLE items DROP COLUMN updated_at")
         connection.execute("UPDATE meta_entries SET value='4' WHERE key='schema_version'")
         connection.commit()

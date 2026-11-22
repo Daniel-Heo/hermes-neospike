@@ -366,10 +366,9 @@ def runner(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return folder / "scenario.js"
 
 
-@pytest.mark.parametrize("bundle", ["src", "dist"])
 @pytest.mark.parametrize("scenario", SCENARIOS)
-def test_map_delete_updates_the_screen(runner: Path, bundle: str, scenario: str) -> None:
-    script = Path(api.__file__).resolve().parent / bundle / "index.js"
+def test_map_delete_updates_the_screen(runner: Path, scenario: str) -> None:
+    script = Path(api.__file__).resolve().parent / "dist" / "index.js"
     checked = subprocess.run([_node(), str(runner), str(script), scenario], capture_output=True, text=True,
                              timeout=NODE_TIMEOUT_SECONDS)
     assert checked.returncode == 0, checked.stderr

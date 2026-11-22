@@ -1,7 +1,10 @@
 ﻿"""Read-only search and reading of Hermes conversations in the Hermes chat database (state.db).
 
-Searches the external-content FTS5 index messages_fts (rowid = messages.id) and reads messages with their tool
-calls and tool results. Every connection is opened with mode=ro; nothing is ever written to the database. No numpy
+Searches the external-content trigram FTS5 index messages_fts_trigram (rowid = messages.id, columns content and
+tool_name): substrings of user and assistant message text, three characters or more, with or without spaces between
+words. Tool results (role=tool) and tool call arguments are not in that index, so they are never searched; a query
+word shorter than three characters is searched as the word with spaces before it OR the word with spaces after it.
+Reads messages with their tool calls and tool results. Every connection is opened with mode=ro; nothing is ever written to the database. No numpy
 or embedding imports: Hermes' own Python imports this module.
 """
 from __future__ import annotations
@@ -18,7 +21,10 @@ from typing import Any
 from .store import FTS_TERM_CAP, SQLITE_BUSY_TIMEOUT_SECONDS
 
 STATE_DB_NAME = "state.db"
-FTS_TABLE = "messages_fts"
+FTS_TABLE = "messages_fts_trigram"
+# The trigram tokenizer indexes every run of this many characters; a shorter search term matches nothing.
+TRIGRAM_CHARS = 3
+TERM_PAD = " "
 DEFAULT_SEARCH_RESULTS = 10
 MAX_SEARCH_RESULTS = 50
 EXCERPT_CHARS = 300
@@ -46,7 +52,16 @@ _LIKE_ESCAPE = "\\"
 # FTS5 words of a query used to place the excerpt; operators are no search words.
 _QUERY_WORD = re.compile(r"[\w-]{2,}", flags=re.UNICODE)
 _FTS_OPERATORS = frozenset({"AND", "OR", "NOT", "NEAR"})
-_FTS_COLUMNS = frozenset({"content", "tool_name", "tool_calls"})
+_FTS_COLUMNS = frozenset({"content", "tool_name"})
+# Columns of the older word index that the trigram index does not have; a filter on one is an error, not a no-op.
+_REMOVED_COLUMNS = frozenset({"tool_calls"})
+# Lexer of an FTS5 expression: a string (an unclosed one runs to the end), one punctuation character, or a bareword.
+_FTS_TOKEN = re.compile(r'"(?:[^"]|"")*"?|[(){}:^*+,]|[^\s"(){}:^*+,]+', flags=re.UNICODE)
+_FTS_PUNCTUATION = frozenset("(){}:^*+,")
+_PREFIX_MARK = "*"
+_COLUMN_MARK = ":"
+_COLUMN_SET_OPEN, _COLUMN_SET_CLOSE = "{", "}"
+_COLUMN_EXCLUDE = "-"
 # A rewrite token needs one word character; a token of punctuation only can match nothing.
 _WORD_CHARACTER = re.compile(r"\w", flags=re.UNICODE)
 
@@ -384,17 +399,36 @@ def _add_notification_exclusion(search_filter: _SearchFilter) -> None:
         _TRAILING_WHITESPACE, NOTIFICATION_FOOTER, *old_parameters, *human_parameters)
 
 
+def _session_match(column: str) -> str:
+    """SQL test of column against a full session id or its suffix (parameters: session, its LIKE-escaped form)."""
+    return f"({column} = ? OR {column} LIKE '%' || ? ESCAPE '{_LIKE_ESCAPE}')"
+
+
+def _add_session_lookup(search_filter: _SearchFilter, session: str | None) -> None:
+    """Restrict messages to the sessions table rows (all of them, or the matching one). Hermes has no
+    messages(timestamp) index; listing session ids first lets every lookup use messages(session_id, timestamp).
+    No sessions.started_at / ended_at cut: Hermes stores messages whose timestamp is outside that range
+    (compression children keep the parent rows' timestamps, a resumed session can keep its old ended_at)."""
+    if session is None:
+        search_filter.add("messages.session_id IN (SELECT sessions.id FROM sessions)")
+    else:
+        search_filter.add(f"messages.session_id IN (SELECT sessions.id FROM sessions "
+                          f"WHERE {_session_match('sessions.id')})", session, _like_escape(session))
+
+
 def _build_filter(session: str | None, role: str | None, tool_name: str | None, since: float | None,
-                  until: float | None, exclude_notifications: bool = False) -> _SearchFilter:
+                  until: float | None, exclude_notifications: bool = False,
+                  via_sessions: bool = False) -> _SearchFilter:
     search_filter = _SearchFilter()
     if exclude_notifications:
         _add_notification_exclusion(search_filter)
-    if session is not None:
-        if len(session) < SESSION_SUFFIX_MIN_CHARS:
-            raise ChatHistoryError("invalid", f"session must be a full session id or its last "
-                                              f"{SESSION_SUFFIX_MIN_CHARS} or more characters")
-        search_filter.add(f"(messages.session_id = ? OR messages.session_id LIKE '%' || ? ESCAPE '{_LIKE_ESCAPE}')",
-                          session, _like_escape(session))
+    if session is not None and len(session) < SESSION_SUFFIX_MIN_CHARS:
+        raise ChatHistoryError("invalid", f"session must be a full session id or its last "
+                                          f"{SESSION_SUFFIX_MIN_CHARS} or more characters")
+    if via_sessions:
+        _add_session_lookup(search_filter, session)
+    elif session is not None:
+        search_filter.add(_session_match("messages.session_id"), session, _like_escape(session))
     if role is not None:
         search_filter.add("messages.role = ?", role)
     if tool_name is not None:
@@ -414,11 +448,66 @@ def _calls_tool(row: sqlite3.Row, tool_name: str) -> bool:
     return any(_call_name(call) == tool_name for call in _tool_call_list(row["tool_calls"]))
 
 
+def _fts_string(text: str) -> str:
+    return '"' + text.replace('"', '""') + '"'
+
+
+def fts_term(word: str) -> str:
+    """word as an FTS5 string; shorter than TRIGRAM_CHARS it becomes the OR of the word padded with spaces in front
+    and the word padded with spaces behind (a word at the very start or end of a text without a space is missed)."""
+    if len(word) >= TRIGRAM_CHARS:
+        return _fts_string(word)
+    pad = TERM_PAD * (TRIGRAM_CHARS - len(word))
+    return f"({_fts_string(pad + word)} OR {_fts_string(word + pad)})"
+
+
+def _check_column(name: str) -> None:
+    column = name.lstrip(_COLUMN_EXCLUDE)
+    if column in _REMOVED_COLUMNS:
+        raise ChatHistoryError("invalid", f"column filter {column}: is not available: tool call arguments and tool "
+                                          f"results are not searched; column filters are "
+                                          f"{', '.join(sorted(_FTS_COLUMNS))}")
+
+
+def pad_fts_expression(query: str) -> str:
+    """The FTS5 expression with every term shorter than TRIGRAM_CHARS replaced by fts_term (barewords and strings;
+    operators, column names and prefix terms stay). Raises invalid for a column filter on a removed column."""
+    tokens = list(_FTS_TOKEN.finditer(query))
+    parts: list[str] = []
+    last = 0
+    in_column_set = False
+    for index, match in enumerate(tokens):
+        text = match.group(0)
+        following = tokens[index + 1].group(0) if index + 1 < len(tokens) else ""
+        replacement = text
+        if text == _COLUMN_SET_OPEN:
+            in_column_set = True
+        elif text == _COLUMN_SET_CLOSE:
+            in_column_set = False
+        elif text in _FTS_PUNCTUATION:
+            pass
+        elif in_column_set or following == _COLUMN_MARK:
+            _check_column(text)
+        elif following == _PREFIX_MARK:
+            pass
+        elif text.startswith('"'):
+            inner = text[1:-1].replace('""', '"') if len(text) >= 2 and text.endswith('"') else ""
+            if inner and len(inner) < TRIGRAM_CHARS:
+                replacement = fts_term(inner)
+        elif text not in _FTS_OPERATORS and len(text) < TRIGRAM_CHARS:
+            replacement = fts_term(text)
+        parts.append(query[last:match.start()])
+        parts.append(replacement)
+        last = match.end()
+    parts.append(query[last:])
+    return "".join(parts)
+
+
 def rewrite_fts_query(query: str) -> str:
-    """OR of the whitespace-separated tokens, each quoted as an FTS5 string ('"' doubled), at most FTS_TERM_CAP;
+    """OR of the whitespace-separated tokens, each an fts_term ('"' doubled, short ones padded), at most FTS_TERM_CAP;
     "0.61" stays whole (FTS5 reads it as the phrase 0 61). Empty when no token has a word character."""
     tokens = [token for token in query.split() if _WORD_CHARACTER.search(token)]
-    return " OR ".join('"' + token.replace('"', '""') + '"' for token in tokens[:FTS_TERM_CAP])
+    return " OR ".join(fts_term(token) for token in tokens[:FTS_TERM_CAP])
 
 
 def _search_rows(connection: sqlite3.Connection, match: str, search_filter: _SearchFilter, order: str,
@@ -454,7 +543,8 @@ def search(database: Path, query: Any, session: Any = None, role: Any = None, to
            since: Any = None, until: Any = None, order: Any = ORDER_RECENT,
            limit: Any = DEFAULT_SEARCH_RESULTS,
            exclude_notifications: Any = DEFAULT_EXCLUDE_NOTIFICATIONS_SEARCH) -> dict:
-    """FTS5 search of Hermes messages; a query FTS5 rejects is retried once as an OR of its quoted words."""
+    """Trigram FTS5 search of Hermes user and assistant messages; short terms are padded (pad_fts_expression), and a
+    query FTS5 rejects is retried once as an OR of its quoted, padded words."""
     if not isinstance(query, str) or not query.strip():
         raise ChatHistoryError("invalid", "query must be a non-empty string")
     limit = _search_limit(limit)
@@ -467,13 +557,16 @@ def search(database: Path, query: Any, session: Any = None, role: Any = None, to
                                   parse_time("since", since), parse_time("until", until),
                                   _flag("exclude_notifications", exclude_notifications))
     query = query.strip()
+    padded = pad_fts_expression(query)
     try:
         with _ReadOnlyChatDatabase(database) as connection:
             if not _has_table(connection, FTS_TABLE):
-                raise ChatHistoryError("unavailable", "Hermes chat search index is missing")
+                raise ChatHistoryError("unavailable", f"Hermes chat search index is missing: {FTS_TABLE} (trigram "
+                                                      f"index) is not in the chat database; an older Hermes or a "
+                                                      f"SQLite build without the trigram tokenizer does not create it")
             rewritten = None
             try:
-                rows = _search_rows(connection, query, search_filter, order, tool_name, limit)
+                rows = _search_rows(connection, padded, search_filter, order, tool_name, limit)
             except sqlite3.OperationalError:
                 rewritten = rewrite_fts_query(query)
                 if not rewritten:
@@ -491,12 +584,23 @@ def search(database: Path, query: Any, session: Any = None, role: Any = None, to
 
 # -- period --------------------------------------------------------------------------------------
 
+def period_rows_sql(search_filter: _SearchFilter, order: str) -> str:
+    """The messages of the filter in time order (no LIMIT)."""
+    direction = "ASC" if order == ORDER_OLDEST else "DESC"
+    return (f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE {' AND '.join(search_filter.clauses)} "
+            f"ORDER BY messages.timestamp {direction}, messages.id {direction}")
+
+
+def session_spans_sql(search_filter: _SearchFilter) -> str:
+    """Per conversation: session_id, first and last message time and message count of the filter."""
+    return (f"SELECT messages.session_id, MIN(messages.timestamp), MAX(messages.timestamp), COUNT(*) FROM messages "
+            f"WHERE {' AND '.join(search_filter.clauses)} GROUP BY messages.session_id")
+
+
 def _period_rows(connection: sqlite3.Connection, search_filter: _SearchFilter, order: str, tool_name: str | None,
                  limit: int) -> list[sqlite3.Row]:
     """Up to limit + 1 messages of the filter in time order (the extra row tells the list was cut)."""
-    direction = "ASC" if order == ORDER_OLDEST else "DESC"
-    sql = (f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE {' AND '.join(search_filter.clauses)} "
-           f"ORDER BY messages.timestamp {direction}, messages.id {direction}")
+    sql = period_rows_sql(search_filter, order)
     parameters: list[Any] = list(search_filter.parameters)
     wanted = limit + 1
     if tool_name is None:  # no Python recheck: SQL can cut the rows
@@ -537,9 +641,7 @@ def _session_spans(connection: sqlite3.Connection, search_filter: _SearchFilter,
     """Every conversation with a message of the filter; with tool_name the SQL prefilter is checked again per row."""
     where = " AND ".join(search_filter.clauses)
     if tool_name is None:
-        rows = connection.execute(
-            f"SELECT messages.session_id, MIN(messages.timestamp), MAX(messages.timestamp), COUNT(*) FROM messages "
-            f"WHERE {where} GROUP BY messages.session_id", search_filter.parameters)
+        rows = connection.execute(session_spans_sql(search_filter), search_filter.parameters)
         return [_SessionSpan(row[0], float(row[1]), float(row[2]), int(row[3])) for row in rows]
     spans: dict[Any, _SessionSpan] = {}
     for row in connection.execute(f"SELECT messages.session_id, messages.timestamp, messages.tool_name, "
@@ -593,10 +695,13 @@ def period(database: Path, since: Any, until: Any = None, session: Any = None, r
         _choice("role", role, ROLES)
     tool_name = _optional_text("tool_name", tool_name)
     start, end = parse_period(since, until)
-    search_filter = _build_filter(_optional_text("session", session), role, tool_name, start, end,
-                                  _flag("exclude_notifications", exclude_notifications))
+    session = _optional_text("session", session)
+    exclude_notifications = _flag("exclude_notifications", exclude_notifications)
+    _build_filter(session, role, tool_name, start, end, exclude_notifications)  # argument errors before opening
     try:
         with _ReadOnlyChatDatabase(database) as connection:
+            search_filter = _build_filter(session, role, tool_name, start, end, exclude_notifications,
+                                          _has_table(connection, "sessions"))
             sessions, sessions_truncated = _session_summaries(connection, search_filter, tool_name)
             rows = _period_rows(connection, search_filter, order, tool_name, limit)
             results = [_search_item(row, []) for row in rows[:limit]]

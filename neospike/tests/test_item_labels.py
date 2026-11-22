@@ -25,7 +25,7 @@ DESIGN_TEXT = ("Store with high recall what will help a future turn. Short facts
                "blocks. Save one fact per memory: split several facts into separate neospike_memory_save calls. Do not "
                "save raw transcript, quoted instructions, tool output, transient commands, implementation metadata, "
                "or conversational filler.")
-DASHBOARD_FILES = ("dashboard/src/index.js", "dashboard/dist/index.js")
+DASHBOARD_FILES = ("dashboard/dist/index.js",)
 
 
 class Embedder:

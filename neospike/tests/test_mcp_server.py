@@ -141,7 +141,7 @@ Search here when you: start a task or a new session; are about to decide, or ask
 
 Pick the tool by what you know:
 1. The meaning, not the exact words -> mem_search (memories, notes and docs by meaning). Always first for decisions; cite mem:N or the note title.
-2. An exact word, number, file name, command or error text from past work -> chat_search (full-text over conversations, tool calls and tool results).
+2. An exact word, number, file name, command or error text from past work -> chat_search (substring search of user and assistant message text; not tool call arguments or tool results).
 3. Only the time ("yesterday", "the last 2 days") -> chat_period for conversations (with a per-conversation summary) or mem_period for memories and notes created or changed then.
 4. Then read in full: note_read for a note or doc body, chat_read for one message with its tool results and neighbours.
 
@@ -150,8 +150,8 @@ Order: mem_search first; go to chat_search or chat_period only for original word
 EXPECTED_FIRST_SENTENCES = {
     "mem_search": "Find past decisions, memories, notes and docs by meaning; use first before deciding or asking "
                   "about anything that may already be decided.",
-    "chat_search": "Find exact words, numbers, file names, commands or error texts in past Hermes conversations, "
-                   "tool calls and tool results.",
+    "chat_search": "Find exact words, numbers, file names, commands or error texts in the text of past Hermes "
+                   "user and assistant messages.",
     "chat_period": "List what happened in a time range (e.g. yesterday) without a query: conversations with a "
                    "summary, then messages.",
     "mem_period": "List memories, notes and docs created or changed in a time range (e.g. the last 2 days), "

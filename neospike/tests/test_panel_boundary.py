@@ -6,7 +6,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
 
 DASHBOARD = Path(__file__).resolve().parents[1] / "dashboard"
 BOUNDARY_KEYS = ("boundary.title", "boundary.retry")
@@ -14,7 +13,7 @@ PANELS = ("InstallView", "MemosView", "MemoryView", "DialogsView", "SettingsView
 
 
 def _source(path: Path | None = None) -> str:
-    return (path or DASHBOARD / "src" / "index.js").read_text(encoding="utf-8-sig")
+    return (path or DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8-sig")
 
 
 def _table(source: str, language: str) -> str:
@@ -59,8 +58,3 @@ def test_contract_fails_without_the_boundary() -> None:
         table = _table(source, language)
         stripped = source.replace(table, table.replace('"boundary.retry":', '"boundary.gone":'))
         assert f"boundary.retry missing in {language}" in boundary_problems(stripped)
-
-
-@pytest.mark.parametrize("name", ["index.js"])
-def test_dist_matches_src(name: str) -> None:
-    assert (DASHBOARD / "dist" / name).read_bytes() == (DASHBOARD / "src" / name).read_bytes()

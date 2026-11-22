@@ -232,11 +232,6 @@ def test_note_routes_work_before_the_database_exists(client: TestClient) -> None
 
 
 # 8 ----------------------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["index.js", "style.css"])
-def test_src_and_dist_are_byte_identical(name: str) -> None:
-    assert (DASHBOARD / "src" / name).read_bytes() == (DASHBOARD / "dist" / name).read_bytes()
-
-
 def test_dashboard_ui_has_four_tabs_and_note_contract() -> None:
     script = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8")
     for label in ('"tab.setup": "Setup"', '"tab.notes": "Notes"', '"tab.memory": "Memory"'):

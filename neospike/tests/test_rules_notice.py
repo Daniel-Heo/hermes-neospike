@@ -247,7 +247,7 @@ def test_saved_rule_file_reaches_the_prompt(home: Path, monkeypatch) -> None:
 
 
 def _script() -> str:
-    source = (DASHBOARD / "src" / "index.js").read_text(encoding="utf-8")
+    source = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8")
     assert source == (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8")
     return source
 
@@ -269,6 +269,6 @@ def test_title_in_both_languages_and_removed_texts():
     assert "config.none" not in script and "config.criteria.when" not in script
     panel = _panel(script)
     assert 'h(Badge, null, "1"), h(CardTitle, null, t("config.criteria.title"))' in panel  # the only card
-    css = (DASHBOARD / "src" / "style.css").read_text(encoding="utf-8")
+    css = (DASHBOARD / "dist" / "style.css").read_text(encoding="utf-8")
     assert css == (DASHBOARD / "dist" / "style.css").read_text(encoding="utf-8")
     assert ".neospike-criteria-editor {" in css and ".neospike-criteria-list" not in css

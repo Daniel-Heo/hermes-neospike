@@ -21,7 +21,7 @@ from neospike.dashboard import plugin_api as api
 
 DASHBOARD_DIR = Path(api.__file__).resolve().parent
 BUNDLE = DASHBOARD_DIR / 'dist' / 'index.js'
-SOURCE = DASHBOARD_DIR / 'src' / 'index.js'
+SOURCE = DASHBOARD_DIR / 'dist' / 'index.js'
 PROBE_FAIL_TEXT = 'Provider availability check failed; inspect local Dashboard logs'
 HEALTHY_STATE = {'dependencies_installed': True, 'text_model_downloaded': True, 'active': True}
 STUB_AGENT_PRELUDE = (

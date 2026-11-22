@@ -202,7 +202,7 @@ def test_dashboard_switch_saves_reports_the_service_and_shows_the_state(http, mo
 
 
 def test_dashboard_tables_carry_the_switch_in_both_languages():
-    source = Path(api.__file__).resolve().parent / "src" / "index.js"
+    source = Path(api.__file__).resolve().parent / "dist" / "index.js"
     text = source.read_text(encoding="utf-8-sig")
     assert (source.parent.parent / "dist" / "index.js").read_bytes() == source.read_bytes()
     for key in ("config.enabled.title", "config.enabled.label", "config.enabled.copy", "config.enabled.stopped",

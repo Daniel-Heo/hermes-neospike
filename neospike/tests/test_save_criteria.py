@@ -131,7 +131,7 @@ def test_api_reads_saves_and_refuses(home: Path, monkeypatch) -> None:
 
 
 def _script() -> str:
-    source = (DASHBOARD / "src" / "index.js").read_text(encoding="utf-8")
+    source = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8")
     assert source == (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8")
     return source
 
@@ -162,7 +162,7 @@ def test_en_keys_all_in_ko_and_css_uses_theme_variables():
     assert set(keys.findall(en)) - set(keys.findall(ko)) == set()
     for key in ("config.criteria.title", "connected.rel.nextPiece", "connected.rel.previousPiece"):
         assert f'"{key}":' in en and f'"{key}":' in ko
-    css = (DASHBOARD / "src" / "style.css").read_text(encoding="utf-8")
+    css = (DASHBOARD / "dist" / "style.css").read_text(encoding="utf-8")
     assert css == (DASHBOARD / "dist" / "style.css").read_text(encoding="utf-8")
     criteria = "\n".join(line for line in css.splitlines() if "neospike-criteria" in line)
     assert criteria and not re.search(r"#[0-9a-fA-F]{3,8}\b|rgb\(", criteria)

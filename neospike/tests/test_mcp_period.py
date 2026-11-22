@@ -158,7 +158,8 @@ def test_chat_period_filters_order_and_limit(home: Path) -> None:
 def test_chat_period_relative_since(home: Path) -> None:
     database = home / "state.db"
     connection = sqlite3.connect(database)
-    with connection:
+    with connection:  # Hermes' messages.session_id references sessions(id): the row comes first
+        connection.execute("INSERT INTO sessions VALUES (?, NULL)", (SESSION_C,))
         connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES "
                            "(20, ?, 'user', 'just now', ?)", (SESSION_C, time.time() - 60))
     connection.close()

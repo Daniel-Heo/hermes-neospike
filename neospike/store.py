@@ -119,6 +119,17 @@ _INT_WITH_DEFAULT = "INTEGER NOT NULL DEFAULT {}"
 _REAL_NULLABLE = "REAL"
 
 
+def vector_present_sql(col: str = "embedding") -> str:
+    """SQL condition: the row has a stored vector (not an embedding-pending memory)."""
+    return f"length({col})>0"
+
+
+def vector_pending_sql(col: str = "embedding") -> str:
+    """SQL condition: an embedding-pending row (PENDING_EMBED_MARK). The items pending partial index has this
+    same WHERE, so a query must use this text for SQLite to take that index."""
+    return f"length({col})=0"
+
+
 # items (v22): memories, notes and docs in one table. type memory = one short memory (owner =
 # namespace, title NULL); type note = a document written by an agent or an automatic (formula) note; type doc = a
 # document written by a person. A document is a head row (the document id: title, tags, project, author, rev,
@@ -191,6 +202,26 @@ CREATE TRIGGER IF NOT EXISTS items_fts_au AFTER UPDATE OF title, text ON items B
 END;
 CREATE TABLE IF NOT EXISTS meta_entries (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+
+# Partial indexes of items by vector presence (created on every open, after an old layout gains updated_at):
+# stored vectors by change time (the byte width in the index keeps the vector count covering), pending rows by type.
+ITEMS_VECTOR_INDEXES_DDL = (
+    "CREATE INDEX IF NOT EXISTS items_vector_updated ON items(updated_at, length(embedding)) "
+    f"WHERE {vector_present_sql()};\n"
+    f"CREATE INDEX IF NOT EXISTS items_embed_pending ON items(type, id) WHERE {vector_pending_sql()};\n"
+)
+# Rows changed since a watermark (backup increments): created on every open, after updated_at exists.
+ITEMS_UPDATED_INDEX = "items_updated"
+ITEMS_UPDATED_INDEX_DDL = f"CREATE INDEX IF NOT EXISTS {ITEMS_UPDATED_INDEX} ON items(updated_at)"
+# Newest-first dashboard lists (memories, conversations) without a temporary sort: the rowid (id) the index
+# carries after the key also orders the id tie-break. Created on every open. The memory index leads with type:
+# without it (and with no ANALYZE statistics) SQLite prefers items_type_owner (type=?) and sorts.
+MEMORY_CREATED_INDEX = "items_memory_created"
+CONVERSATIONS_LAST_MESSAGE_INDEX = "conversations_last_message"
+SORT_INDEXES_DDL = (
+    f"CREATE INDEX IF NOT EXISTS {MEMORY_CREATED_INDEX} ON items(type, created_at) WHERE type='{ITEM_MEMORY}';\n"
+    f"CREATE INDEX IF NOT EXISTS {CONVERSATIONS_LAST_MESSAGE_INDEX} ON conversations(last_message_at);\n"
+)
 
 
 def _topic_page_tables():
@@ -531,10 +562,6 @@ def memory_time_expr(alias_name: str = "m") -> str:
     return (f"MAX({alias_name}.created_at,COALESCE((SELECT MAX(r.edited_at) FROM item_revisions r "
             f"WHERE r.item_id={alias_name}.id),{alias_name}.created_at))")
 
-
-def vector_present_sql(col: str = "embedding") -> str:
-    """SQL condition: the row has a stored vector (not an embedding-pending memory)."""
-    return f"length({col})>0"
 
 # Tombstone row_key per table: the primary key, or the natural key when there is none.
 TOMBSTONE_FIELDS = {
@@ -896,6 +923,13 @@ class MemoryStore:
                 if "updated_at" not in {rec[1] for rec in self._conn.execute(f"PRAGMA table_info({tbl})")}:
                     self._conn.execute(f"ALTER TABLE {tbl} ADD COLUMN updated_at REAL")
                 self._conn.execute(f"UPDATE {tbl} SET updated_at=created_at WHERE updated_at IS NULL")
+            for stmt in ITEMS_VECTOR_INDEXES_DDL.split(";"):
+                if stmt.strip():
+                    self._conn.execute(stmt)
+            self._conn.execute(ITEMS_UPDATED_INDEX_DDL)
+            for stmt in SORT_INDEXES_DDL.split(";"):
+                if stmt.strip():
+                    self._conn.execute(stmt)
             for stmt in TOMBSTONES_DDL.split(";"):
                 if stmt.strip():
                     self._conn.execute(stmt)
@@ -1632,7 +1666,7 @@ class MemoryStore:
         with self._lock:
             recs = self._conn.execute(
                 f"SELECT id,owner,text,project,json_extract(metadata_json,'$.session_id') AS session_id "
-                f"FROM items WHERE type='{ITEM_MEMORY}' AND NOT {vector_present_sql()} {where} ORDER BY id",
+                f"FROM items WHERE type='{ITEM_MEMORY}' AND {vector_pending_sql()} {where} ORDER BY id",
                 args).fetchall()
         return [{"id": int(rec["id"]), "namespace": str(rec["owner"]), "text": str(rec["text"]),
                  "project": str(rec["project"] or ""), "session_id": str(rec["session_id"] or "")} for rec in recs]
@@ -1642,7 +1676,7 @@ class MemoryStore:
         with self._lock:
             recs = self._conn.execute(
                 f"SELECT id,text FROM items WHERE type IN {DOC_TYPES_SQL} AND title IS NULL "
-                f"AND NOT {vector_present_sql()} ORDER BY id").fetchall()
+                f"AND {vector_pending_sql()} ORDER BY id").fetchall()
         return [{"id": int(rec["id"]), "text": str(rec["text"])} for rec in recs]
 
     def write_missing_embedding(self, mid: int, embedding: Iterable[float]) -> bool:
@@ -1650,7 +1684,7 @@ class MemoryStore:
         packed_blob = self._pack_embedding(embedding)
         with self._write_scope():
             cur = self._conn.execute(
-                f"UPDATE items SET embedding=? WHERE id=? AND title IS NULL AND NOT {vector_present_sql()}",
+                f"UPDATE items SET embedding=? WHERE id=? AND title IS NULL AND {vector_pending_sql()}",
                 (packed_blob, mid))
         return cur.rowcount == 1
 

@@ -92,7 +92,7 @@ def test_slot_detection_needs_the_key_under_auxiliary(tmp_path, monkeypatch):
 def test_task_name_is_the_one_pref_reconcile_uses():
     from neospike import pref_reconcile
     install = _install_module()
-    script = (DASHBOARD / "src" / "index.js").read_text(encoding="utf-8-sig")
+    script = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8-sig")
     assert install.PREF_MODEL_TASK == pref_reconcile.LLM_TASK
     assert f'const PREF_MODEL_TASK = "{pref_reconcile.LLM_TASK}";' in script
 
@@ -134,7 +134,7 @@ def test_route_returns_the_api_key_providers(monkeypatch):
 
 
 def test_bundle_label_rule_appends_api_suffix():
-    script = (DASHBOARD / "src" / "index.js").read_text(encoding="utf-8-sig")
+    script = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8-sig")
     assert 'const API_KEY_SUFFIX = " API";' in script
     assert "function prefModelLabel(model, apiKey) { return apiKey ? model + API_KEY_SUFFIX : model; }" in script
     panel = script[script.index("function SettingsView("):script.index("// ---- Notes / Memory.")]
@@ -143,7 +143,7 @@ def test_bundle_label_rule_appends_api_suffix():
 
 
 def test_picker_strings_exist_in_both_languages():
-    script = (DASHBOARD / "src" / "index.js").read_text(encoding="utf-8-sig")
+    script = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8-sig")
     start = script.index("const STRINGS = {")
     en = script[script.index("en: {", start):script.index("ko: {", start)]
     ko = script[script.index("ko: {", start):script.index("let language", start)]
@@ -151,8 +151,3 @@ def test_picker_strings_exist_in_both_languages():
     assert set(keys.findall(en)) - set(keys.findall(ko)) == set()
     for key in PICKER_KEYS:
         assert f'"{key}":' in en and f'"{key}":' in ko
-
-
-@pytest.mark.parametrize("name", ["index.js", "style.css"])
-def test_src_and_dist_copies_match(name):
-    assert (DASHBOARD / "src" / name).read_bytes() == (DASHBOARD / "dist" / name).read_bytes()

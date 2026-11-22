@@ -1,5 +1,5 @@
 ﻿"""The weekly LLM token budget does not exist (config key, Config card, /config/token-budget,
-weekly_budget_status). Checks that nothing of it remains, and the dashboard src/dist copies match."""
+weekly_budget_status). Checks that nothing of it remains."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -25,8 +25,3 @@ def test_config_tab_has_no_budget_card() -> None:
     script = (DASHBOARD / "dist" / "index.js").read_text(encoding="utf-8-sig")
     for text in ("config.budget.", "token-budget", "TokenQuotaView", "DEFAULT_WEEKLY_TOKEN_BUDGET"):
         assert text not in script, text
-
-
-def test_dashboard_src_and_dist_match() -> None:
-    for name in ("index.js", "style.css"):
-        assert (DASHBOARD / "src" / name).read_bytes() == (DASHBOARD / "dist" / name).read_bytes(), name

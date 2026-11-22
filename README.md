@@ -112,7 +112,7 @@ The agent gets these tools from the provider:
 | `neospike_memory_update` | Correct an item in place, or supersede it when a decision changed. |
 | `neospike_memory_delete` | Remove one item. |
 | `neospike_memory_reconcile` | Settle the older, similar items returned by a save. |
-| `neospike_memory_search` | Search stored knowledge. |
+| `neospike_memory_search` | Search stored memories, notes and docs. |
 | `neospike_note_read` | Read a whole note (agent or automatic). |
 | `neospike_note_write` | Create or update a note. |
 | `neospike_doc_read` | Read a whole doc (a note the user wrote). |
@@ -125,7 +125,7 @@ MCP clients (server `neospike-mcp`; in Claude Code the tools are named `mcp__neo
 | `mem_search` | Search memories, notes and docs at once. |
 | `note_read` | Read one note or doc by id or exact title. |
 | `mem_period` | List memories, notes and docs created or changed in a time range (e.g. `since: "2d"`), newest first. |
-| `chat_search` | Search past Hermes conversations: messages, tool calls and tool results (read-only). |
+| `chat_search` | Find words in the text of past Hermes user and assistant messages, also inside longer words (read-only). Tool calls, tool results, cron jobs and sub-agent sessions are not searched. |
 | `chat_read` | Read one past chat message with its tool calls, their results and nearby messages. |
 | `chat_period` | List past chat messages in a time range without a query, with a per-conversation summary (e.g. yesterday's work). |
 

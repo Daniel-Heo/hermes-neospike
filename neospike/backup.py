@@ -8,9 +8,10 @@
 Change detection per table:
 - timestamp tables (TIMESTAMP_COLUMNS): rows whose timestamp > previous watermark. items (memories,
   document heads and parts) and the conversation family get updated_at from store.py triggers; tombstones
-  record every delete (a document save deletes its old part rows and inserts new ones). A table with read
-  bookkeeping (accessed_at/access_count: items) also sends rows whose accessed_at > watermark: a search hit
-  leaves updated_at alone, so accessed_at is the change signal.
+  record every delete (a document save deletes its old part rows and inserts new ones). Read bookkeeping
+  (items accessed_at/access_count) is not a change signal: a search hit leaves updated_at alone, so a row
+  whose only change is a read is not in the increment; its read values are backed up by the next full
+  snapshot or with the row's next edit.
 - every other data table (item_links, folder_items, meta without backup_* keys, any unknown
   table) has no timestamp: the whole table is stored when its content hash differs from the last backup.
 - folders is a timestamp table; trashing a folder only sets deleted_at.
@@ -74,9 +75,6 @@ TIMESTAMP_COLUMNS = {
     # Preferences/constraints (v23): edited in place; store.py triggers keep updated_at current.
     "preferences": "updated_at",
 }
-# Read bookkeeping time (store.READ_TRACKING_COLUMNS): a row read after the watermark goes into the
-# increment too.
-ACCESS_COLUMN = "accessed_at"
 # Child table -> (parent key column, parent table): replaced per changed parent row (none since v22: document
 # parts are items rows of their own).
 CHILD_TABLES: dict[str, tuple[str, str]] = {}
@@ -131,13 +129,20 @@ def _columns(connection: sqlite3.Connection, table: str) -> list[str]:
     return [row[1] for row in connection.execute(f"PRAGMA table_info({_quote(table)})")]
 
 
-def _ordered_select(connection: sqlite3.Connection, table: str, where: str = "", args: tuple = ()) -> sqlite3.Cursor:
+def _select(connection: sqlite3.Connection, table: str, where: str = "", args: tuple = (), *,
+            ordered: bool) -> sqlite3.Cursor:
+    """All columns of *table* (optionally filtered); ordered=True sorts by every column for deterministic output,
+    ordered=False leaves the planner free to use an index on the filter (increment rows are upserts, order-free)."""
     columns = _columns(connection, table)
-    order = ",".join(str(index + 1) for index in range(len(columns)))
     clause = f" WHERE {where}" if where else ""
+    order = " ORDER BY " + ",".join(str(index + 1) for index in range(len(columns))) if ordered else ""
     return connection.execute(
-        f"SELECT {','.join(_quote(column) for column in columns)} FROM {_quote(table)}{clause} ORDER BY {order}", args,
+        f"SELECT {','.join(_quote(column) for column in columns)} FROM {_quote(table)}{clause}{order}", args,
     )
+
+
+def _ordered_select(connection: sqlite3.Connection, table: str, where: str = "", args: tuple = ()) -> sqlite3.Cursor:
+    return _select(connection, table, where, args, ordered=True)
 
 
 def table_rows(connection: sqlite3.Connection, table: str) -> list[tuple]:
@@ -274,11 +279,9 @@ def _full_snapshot(connection: sqlite3.Connection, db_path: Path, backup_dir: Pa
             "seconds": round(time.perf_counter() - started, 4)}
 
 
-def _changed_condition(connection: sqlite3.Connection, table: str, column: str, since: float) -> tuple[str, tuple]:
-    """WHERE clause of the rows changed after *since*: the timestamp column, or the read time when the table has one."""
-    if ACCESS_COLUMN in _columns(connection, table):
-        return f"({_quote(column)}>? OR {_quote(ACCESS_COLUMN)}>?)", (since, since)
-    return f"{_quote(column)}>?", (since,)
+def changed_rows(connection: sqlite3.Connection, table: str, since: float) -> sqlite3.Cursor:
+    """Rows of a timestamp table changed after *since*, unordered so the timestamp index serves the filter."""
+    return _select(connection, table, f"{_quote(TIMESTAMP_COLUMNS[table])}>?", (since,), ordered=False)
 
 
 def _increment(connection: sqlite3.Connection, backup_dir: Path, watermark: float, previous: str,
@@ -287,10 +290,9 @@ def _increment(connection: sqlite3.Connection, backup_dir: Path, watermark: floa
     parts: dict[str, bytes] = {}
     counts: dict[str, int] = {}
     tables = set(data_tables(connection))
-    for table, column in TIMESTAMP_COLUMNS.items():
+    for table in TIMESTAMP_COLUMNS:
         if table in tables:
-            condition, parameters = _changed_condition(connection, table, column, since)
-            parts[table], counts[table] = _jsonl(_ordered_select(connection, table, condition, parameters))
+            parts[table], counts[table] = _jsonl(changed_rows(connection, table, since))
     child_parents: dict[str, list[int]] = {}
     for table, (key, parent) in CHILD_TABLES.items():
         if table not in tables:
@@ -299,7 +301,7 @@ def _increment(connection: sqlite3.Connection, backup_dir: Path, watermark: floa
             f"SELECT id FROM {_quote(parent)} WHERE {_quote(TIMESTAMP_COLUMNS[parent])}>? ORDER BY id", (since,))]
         child_parents[table] = ids
         selected = f"{_quote(key)} IN (SELECT id FROM {_quote(parent)} WHERE {_quote(TIMESTAMP_COLUMNS[parent])}>?)"
-        parts[table], counts[table] = _jsonl(_ordered_select(connection, table, selected, (since,)))
+        parts[table], counts[table] = _jsonl(_select(connection, table, selected, (since,), ordered=False))
     replaced: list[str] = []
     for table in _hashed_tables(connection):
         current = _content_hash(connection, table)
