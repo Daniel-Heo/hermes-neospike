@@ -13,6 +13,10 @@ from neospike import backup as db_backup
 from neospike.store import ITEMS_UPDATED_INDEX, MemoryStore
 from neospike.tests.test_backup import NAMESPACE, _backup, _vector
 from neospike.tests.test_notes import DIMENSIONS
+from neospike.tests.support_backup_clock import fast_backup_boundary  # noqa: F401 (pytest fixture)
+
+# A read right after the full snapshot must not count as a change: the lag window must be short.
+pytestmark = pytest.mark.usefixtures("fast_backup_boundary")
 
 ITEMS_FROM = 'FROM "items"'
 

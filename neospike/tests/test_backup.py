@@ -17,6 +17,10 @@ from neospike.notes import NoteService
 from neospike.store import CHANGE_TRIGGER_SPECS, SCHEMA_VERSION, MemoryStore
 from neospike.tests.test_notes import DIMENSIONS, BowEmbedder
 from neospike.tests.support_items import chunk_rows
+from neospike.tests.support_backup_clock import fast_backup_boundary  # noqa: F401 (pytest fixture)
+
+# Several tests back up again right after writing and expect no file: the lag window must be short.
+pytestmark = pytest.mark.usefixtures("fast_backup_boundary")
 
 NAMESPACE = "owner"
 

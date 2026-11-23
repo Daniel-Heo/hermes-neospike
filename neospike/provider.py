@@ -33,6 +33,7 @@ from .recall_log import (DROP_REASON_KEY, LOG_DIRECTORY, REASON_CHAR_LIMIT, REAS
                          REASON_SUPERSEDED, RecallLog, append_failure, failure_cause)
 from .service import MODE_CORRECT_INPLACE, MODE_SUPERSEDE_NEW, VALID_UPDATE_MODES, NeospikeService, cut_memory_text
 
+from . import memory_reconcile as pending_pairs
 from . import preferences as prefs
 from .store import (DEFAULT_SEMANTIC_CUTOFF, DOC_TYPES_SQL, EVIDENCE_CHAR_LIMIT, ITEM_DOC, HISTORY_OMIT, HISTORY_SHOW, HISTORY_COLLAPSE, ITEM_MEMORY,
                     PART_SOURCE_KEY, MemoryStore, SearchResult, dot_similarities, memory_time_expr, normalize_rows,
@@ -243,7 +244,7 @@ _SITUATION_SCHEMA = {"type": "string", "maxLength": prefs.SITUATION_CEILING,
 RECONCILE_TOOL_TEXT = (
     "A save reply's older items are earlier similar ones, oldest first; the memory just saved is newest. If "
     "they conflict the newest wins in one call: text = corrected body (partly stale), no text = delete "
-    "(fully replaced); skip items without conflict; never merge. Only this session's listed items."
+    "(fully replaced), keep = true when there is no conflict; never merge. Only this session's listed items."
 )
 # Direct search always; prefetch only with conversation_prefetch=true.
 _CHAT_LANE = ('conversation', 'conversation')
@@ -263,26 +264,34 @@ def _hit_score(item: dict[str, Any]) -> float:
     return float(item.get("score", 0.0))
 
 
-def _parse_reconcile_changes(value: Any) -> list[tuple[str, int, str | None]]:
-    """neospike_memory_reconcile changes -> [(\"id\" | \"chunk_id\", target, new text or None)]; shape only."""
+def _parse_reconcile_changes(value: Any) -> tuple[list[tuple[str, int, str | None]], list[tuple[str, int]]]:
+    """neospike_memory_reconcile changes -> ([(\"id\" | \"chunk_id\", target, new text or None)], [(lane, target)
+    kept as they are]); shape only."""
     if not isinstance(value, list) or not 1 <= len(value) <= _RECONCILE_BATCH_MAX:
         raise ValueError(f"changes must be a list of 1 to {_RECONCILE_BATCH_MAX} items")
-    result, seen = [], set()
+    result, kept, seen = [], [], set()
     for change in value:
-        if not isinstance(change, dict) or change.keys() - {"id", "chunk_id", "text"} \
+        if not isinstance(change, dict) or change.keys() - {"id", "chunk_id", "text", "keep"} \
                 or len(change.keys() & {"id", "chunk_id"}) != 1:
-            raise ValueError("each change is {id or chunk_id, optional text}")
+            raise ValueError("each change is {id or chunk_id, optional text or keep}")
         key = "id" if "id" in change else "chunk_id"
         target, text = change[key], change.get("text")
         if type(target) is not int or not 1 <= target <= _SQLITE_ID_MAX:
             raise ValueError(f"{key} must be an integer from 1 to {_SQLITE_ID_MAX}")
         if text is not None and not isinstance(text, str):
             raise ValueError("text must be a string")
+        if "keep" in change and change["keep"] is not True:
+            raise ValueError("keep must be true")
+        if "keep" in change and "text" in change:
+            raise ValueError("keep and text cannot be used together")
         if (key, target) in seen:
             raise ValueError("each item may appear once")
         seen.add((key, target))
-        result.append((key, target, text))
-    return result
+        if "keep" in change:
+            kept.append((key, target))
+        else:
+            result.append((key, target, text))
+    return result, kept
 
 
 # neospike_memory_save updates: the number a recalled line shows, id:N (memory) or note:N.C (automatic-note chunk C).
@@ -1155,7 +1164,7 @@ class NeospikeProvider(HermesMemoryProvider):
             _tool_spec(
                 "neospike_memory_save",
                 # What to save is the system prompt's save criteria only.
-                "Store one semantic memory item. Text over 2000 characters, or with two or more # headings, becomes an agent note named by subject plus a linked memory summary. Items in the reply's older list go to neospike_memory_reconcile. "
+                "Store one semantic memory item. Text over 2000 characters, or with two or more # headings, becomes an agent note named by subject plus a linked memory summary. Settle every item in the reply's older list in one neospike_memory_reconcile call (keep when no conflict). "
                 "kind preference/constraint is stored apart as pref:N with situation (a constraint always needs "
                 "one); scope is not used for it. "
                 "If a recalled neospike line ([id:N ...] or [note:N.C ...]) proved wrong in this conversation, pass "
@@ -1225,7 +1234,8 @@ class NeospikeProvider(HermesMemoryProvider):
             _tool_spec("neospike_memory_delete", "Remove one local-memory record by ID if visible in the current scope. To correct, use neospike_memory_update.", {"id": _ID_SCHEMA, "target": _TARGET_SCHEMA}, ["id"], strict=True),
             _tool_spec("neospike_memory_reconcile", RECONCILE_TOOL_TEXT,
                    {"changes": {"type": "array", "items": {"type": "object", "properties": {
-                       "id": {"type": "integer"}, "chunk_id": {"type": "integer"}, "text": {"type": "string"}}}}},
+                       "id": {"type": "integer"}, "chunk_id": {"type": "integer"}, "text": {"type": "string"},
+                       "keep": {"type": "boolean"}}}}},
                    ["changes"], strict=True),
         ]
 
@@ -1434,7 +1444,7 @@ class NeospikeProvider(HermesMemoryProvider):
             tidy = {"embedding": "pending"}
         else:
             # Neighbours are every memory visible here (global, this project, this session), whatever the new one's save_scope.
-            tidy = self._dedupe_after_save(memory_id, self._project_dir, session_id, key)
+            tidy = self._dedupe_after_save(memory_id, self._project_dir, session_id, key, saved_text=text)
         if note is None:
             return json.dumps({"stored": stored, **tidy})
         return json.dumps({"stored": True, "memory_stored": stored, **tidy,
@@ -1651,8 +1661,8 @@ class NeospikeProvider(HermesMemoryProvider):
         if not args.keys() <= {"changes"}:
             raise ValueError("Unknown reconcile fields")
         try:
-            return json.dumps(self._apply_reconcile(_parse_reconcile_changes(args.get("changes")), session_id, key),
-                              ensure_ascii=False)
+            changes, kept = _parse_reconcile_changes(args.get("changes"))
+            return json.dumps(self._apply_reconcile(changes, kept, session_id, key), ensure_ascii=False)
         except (OSError, RuntimeError, _DB_ERROR):
             self._turn_log.failure(key, "Reconcile failed; change not confirmed")
             return json.dumps({"error": "Reconcile failed"})
@@ -1694,7 +1704,8 @@ class NeospikeProvider(HermesMemoryProvider):
         except OSError:
             pass  # diagnostics only; never fails the save
 
-    def _dedupe_after_save(self, memory_id: int, project: str, session_id: str, debug_key: str) -> dict:
+    def _dedupe_after_save(self, memory_id: int, project: str, session_id: str, debug_key: str, *,
+                           saved_text: str = "") -> dict:
         """Right after a memory item is stored, its RememberTuning.NEIGHBORS closest valid
         memory items and live automatic-note chunks (together, closest first) are compared (notes.tidy_saved_memory;
         a deleted duplicate visible more widely lifts the new memory to its scope, reported as "scope").
@@ -1703,7 +1714,8 @@ class NeospikeProvider(HermesMemoryProvider):
           content) and the new memory is deleted.
         - otherwise cos >= contradiction: listed in "older" ({"id", "text"} or {"chunk_id", "text"}, full bodies,
           oldest first: _older_sorted) with the new memory's "id", for the saving agent's one neospike_memory_reconcile
-          call; those items and the new memory become reconcilable in this session. Nothing is filed anywhere.
+          call; those items and the new memory become reconcilable in this session, and each (new memory, older
+          item) pair waits in memory_reconcile's list until a reconcile call or the daily LLM check settles it.
         Archived (kept by the user) memories are never neighbours. Never fails the save: an error is logged and
         the work done so far is returned. Returns {"deleted", "replaced_chunk", "id", "older"} without empty ones."""
         deleted: list[int] = []
@@ -1721,6 +1733,8 @@ class NeospikeProvider(HermesMemoryProvider):
                 allowed["id" if "id" in item else "chunk_id"].add(next(iter(item.values())))
             if older and replaced is None:
                 allowed["id"].add(memory_id)
+            if older:
+                pending_pairs.add_pending(self._memory_db, memory_id, saved_text, older)
         except Exception as exc:  # noqa: BLE001 - the memory is already stored; tidying is best effort
             self._turn_log.record_unsure_outcome(debug_key, f"Post-save dedupe stopped: {type(exc).__name__}")
         if deleted:
@@ -1765,26 +1779,31 @@ class NeospikeProvider(HermesMemoryProvider):
     def _forget_reconcile_allowed(self, session_id: str) -> None:
         self.__dict__.setdefault("_reconcile_allow", {}).pop(session_id, None)
 
-    def _apply_reconcile(self, changes: list[tuple[str, int, str | None]], session_id: str, debug_key: str) -> dict:
+    def _apply_reconcile(self, changes: list[tuple[str, int, str | None]], kept: list[tuple[str, int]],
+                         session_id: str, debug_key: str) -> dict:
         """neospike_memory_reconcile: checked as a whole first (targets of this session's save replies only,
         texts as strict as a save), then applied: a memory body through the neospike_memory_update correct path (the old
-        body stays in item_revisions, a new embedding), a memory deletion through store.delete, chunk edits in
-        one transaction per call (body joined once per note, an emptied automatic note trashed). The changed items
-        are not compared again. A body over the item limit is split; a memory's later pieces are new
+        body stays in item_revisions, a new embedding), a memory deletion through store.delete, chunk edits
+        (body joined once per note, an emptied automatic note trashed); kept items are not written. The changed
+        items are not compared again. A body over the item limit is split; a memory's later pieces are new
         items chained after it (piece_ids), a chunk's later pieces follow it in the note (piece_chunk_ids).
-        Returns the changed, added and deleted ids only."""
+        Returns the changed, added, deleted and kept ids only."""
         allowed = self._reconcile_allowed(session_id)
-        outside = [{key: target} for key, target, _ in changes if target not in allowed[key]]
+        outside = [{key: target} for key, target in [*((key, target) for key, target, _ in changes), *kept]
+                   if target not in allowed[key]]
         if outside:
             self._turn_log.failure(debug_key, "reconcile refused: item not listed in this session")
             return {"error": "not_allowed", "message": "Only items listed in this session's save replies",
                     "items": outside}
-        return self._write_changes(changes, session_id, debug_key)[0]
+        return self._write_changes(changes, session_id, debug_key, kept=kept)[0]
 
     def _write_changes(self, changes: list[tuple[str, int, str | None]], session_id: str,
-                       debug_key: str) -> tuple[dict, dict[tuple[str, int], list[int]]]:
+                       debug_key: str, *, kept: list[tuple[str, int]] = ()) -> tuple[dict, dict[tuple[str, int], list[int]]]:
         """The write path of _apply_reconcile for already allowed items: (its reply, {(lane, target): the item's
-        ids now, first = its place, the rest = split pieces}) for each changed body."""
+        ids now, first = its place, the rest = split pieces}) for each changed body. Every embedding is computed
+        first; the memory corrections and deletions, the chunk edits and the waiting-pair list then commit in one
+        transaction (memory_reconcile.one_write): an error on the way leaves nothing written. Every item changed,
+        deleted or kept takes its waiting pairs off the list."""
         allowed = self._reconcile_allowed(session_id)
         placed: dict[tuple[str, int], list[int]] = {}
         # A body over the item limit is split like neospike_memory_update (paragraph, sentence, limit);
@@ -1812,41 +1831,59 @@ class NeospikeProvider(HermesMemoryProvider):
             places = formula_chunk_places(store._conn, chunk_texts)
         if chunk_texts.keys() - places.keys():
             return {"error": "not_found", "chunk_ids": sorted(chunk_texts.keys() - places.keys())}, placed
-        replace = {target: [(piece, normalize_rows(self._vectorizer.embed_document(piece)).tobytes())
+        embedder = self._core.embedder
+        replace = {target: [(piece, normalize_rows(embedder.embed_document(piece)).tobytes())
                             for piece in pieces_of[("chunk_id", target)]]
                    for target, text in chunk_texts.items() if text is not None}
-        result: dict[str, list[int]] = {"changed_ids": [], "deleted_ids": [], "changed_chunk_ids": [],
-                                        "deleted_chunk_ids": [], "piece_ids": [], "piece_chunk_ids": []}
+        # Memory corrections, prepared like neospike_memory_update (MODE_CORRECT_INPLACE) and embedded up front.
+        corrections: dict[int, tuple[list[dict], list[list[float]]]] = {}
         for key, target, text in changes:
-            if key != "id":
-                continue
-            if text is None:
-                if store.delete(self._ns_label, target, project=self._project_dir, session_id=session_id):
-                    result["deleted_ids"].append(target)
-                    self._turn_log.record_deletion(debug_key, target)
-                continue
-            metadata = json.loads(rows[target].get("metadata_json") or "{}")
-            done = self._core.update_memory_item(
-                target, expected_text=rows[target]["text"], new_text=text.strip(), mode=MODE_CORRECT_INPLACE,
-                subject=str(metadata.get("subject") or "memory"), durability=str(metadata.get("durability") or "ongoing"))
-            if done.get("updated"):
-                result["changed_ids"].append(target)
-                added = [piece for piece in done.get("ids", [])[1:]]
-                result["piece_ids"].extend(added)
-                allowed["id"].update(added)
-                placed[("id", target)] = [target, *added]
+            if key == "id" and text is not None:
+                metadata = json.loads(rows[target].get("metadata_json") or "{}")
+                items = pending_pairs.correction_items(text.strip(), str(metadata.get("subject") or "memory"),
+                                                       str(metadata.get("durability") or "ongoing"))
+                corrections[target] = (items, [list(embedder.embed_document(item["text"])) for item in items])
+        result: dict[str, list[int]] = {"changed_ids": [], "deleted_ids": [], "changed_chunk_ids": [],
+                                        "deleted_chunk_ids": [], "piece_ids": [], "piece_chunk_ids": [],
+                                        "kept_ids": [], "kept_chunk_ids": []}
+        scope_project, scope_session = self._core._project_scope(), self._core.session_id
+        deleted_chunks = [target for target, text in chunk_texts.items() if text is None]
+        chunks_done: dict[str, Any] = {}
+        with pending_pairs.one_write(store) as connection:
+            for key, target, text in changes:
+                if key != "id":
+                    continue
+                if text is None:
+                    if store.delete(self._ns_label, target, project=self._project_dir, session_id=session_id):
+                        result["deleted_ids"].append(target)
+                    continue
+                status, ids = pending_pairs.correct_memory(store, self._ns_label, rows[target], *corrections[target],
+                                                           project=scope_project, session_id=scope_session)
+                if status == "updated":
+                    result["changed_ids"].append(target)
+                    result["piece_ids"].extend(ids[1:])
+                    placed[("id", target)] = ids
+            if chunk_texts:
+                chunks_done = reconcile_formula_chunks(connection, replace, deleted_chunks, editor=_AGENT_EDITOR,
+                                                       now=time.time())
+            settled = [*(("id", target) for target in (*result["changed_ids"], *result["deleted_ids"])),
+                       *(("chunk_id", target) for target in chunk_texts), *kept]
+            pending_pairs.drop_pending(connection, settled)
+        for target in result["deleted_ids"]:
+            self._turn_log.record_deletion(debug_key, target)
+        for key, target, text in changes:
+            if ("id", target) in placed and key == "id":
+                allowed["id"].update(placed[("id", target)][1:])
                 self._turn_log.change(debug_key, text.strip(), str(rows[target].get("scope") or "unknown"),
                                       action="Corrected")
-        if chunk_texts:
-            deleted_chunks = [target for target, text in chunk_texts.items() if text is None]
-            with store._lock, store._conn:
-                done = reconcile_formula_chunks(store._conn, replace, deleted_chunks, editor=_AGENT_EDITOR,
-                                                now=time.time())
-            result["changed_chunk_ids"] = [done["changed"][target] for target in replace]
-            result["piece_chunk_ids"] = [piece for target in replace for piece in done["pieces"][target][1:]]
+        if chunks_done:
+            result["changed_chunk_ids"] = [chunks_done["changed"][target] for target in replace]
+            result["piece_chunk_ids"] = [piece for target in replace for piece in chunks_done["pieces"][target][1:]]
             result["deleted_chunk_ids"] = deleted_chunks
             allowed["chunk_id"].update(result["changed_chunk_ids"], result["piece_chunk_ids"])
-            placed.update({("chunk_id", target): list(done["pieces"][target]) for target in replace})
+            placed.update({("chunk_id", target): list(chunks_done["pieces"][target]) for target in replace})
+        result["kept_ids"] = [target for key, target in kept if key == "id"]
+        result["kept_chunk_ids"] = [target for key, target in kept if key == "chunk_id"]
         if result["changed_ids"] or result["piece_ids"] or result.get("changed_chunk_ids"):
             self._mark_saved(session_id)
         return {key: value for key, value in result.items() if value}, placed

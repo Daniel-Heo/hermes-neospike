@@ -3,7 +3,6 @@
   "label": "Neospike",
   "description": "Install and configure private local text memory",
   "icon": "Database",
-  "version": "1.0.3",
   "tab": {
     "path": "/neospike",
     "position": "after:memory"

@@ -25,7 +25,6 @@ def _find_repo_root() -> Path:
 
 
 REPO_ROOT = _find_repo_root()
-EXPECTED_VERSION = "1.0.3"
 # 자격 증명 모양 문자열은 소스에 통째로 적지 않고 실행 시 조립한다.
 FAKE_VCS_TOKEN = "gh" + "p_" + string.ascii_lowercase + string.digits
 
@@ -306,12 +305,13 @@ def test_delete_of_unknown_id_reports_not_removed(tmp_path):
 # ---------------------------------------------------------------- packaging
 
 def test_packaging_versions_and_entry_point_agree():
+    """plugin.yaml holds the only version; pyproject takes it from there and the dashboard manifest has none."""
     metadata = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    version = metadata["project"]["version"]
     manifest = json.loads((REPO_ROOT / "neospike" / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
     plugin_yaml = (REPO_ROOT / "neospike" / "plugin.yaml").read_text(encoding="utf-8")
 
-    assert version == EXPECTED_VERSION
+    assert "version" not in metadata["project"] and metadata["project"]["dynamic"] == ["version"]
+    assert metadata["tool"]["hatch"]["version"]["path"] == "neospike/plugin.yaml"
     assert metadata["project"]["entry-points"]["hermes_agent.memory_providers"] == {"neospike": "neospike:register"}
-    assert f"version: {version}" in plugin_yaml
-    assert manifest["version"] == version
+    assert sum(1 for line in plugin_yaml.splitlines() if line.startswith("version: ")) == 1
+    assert "version" not in manifest

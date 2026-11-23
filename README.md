@@ -6,7 +6,7 @@
 
 **An AI agent whose knowledge gathers, assembles, and grows on its own. Second brain + RAG, for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-Neospike is a memory provider plugin for Hermes Agent. The agent saves short facts and decisions as it works, keeps long documents as notes, and indexes past conversations. Code then tidies that knowledge in the background without calling an LLM: related memories are linked, linked groups become topics, and a topic that grows large becomes a note. One daily stage is the exception: it asks your Hermes model whether similar preferences should be kept, merged or removed (it can be turned off). Embeddings are computed on your machine and everything is stored in one SQLite file.
+Neospike is a memory provider plugin for Hermes Agent. The agent saves short facts and decisions as it works, keeps long documents as notes, and indexes past conversations. Code then tidies that knowledge in the background without calling an LLM: related memories are linked, linked groups become topics, and a topic that grows large becomes a note. One daily stage is the exception: it asks your Hermes model whether similar preferences should be kept, merged or removed, and settles similar memory pairs the agent left open (it can be turned off). Embeddings are computed on your machine and everything is stored in one SQLite file.
 
 > Status: used daily on Windows 10. Linux and macOS have not been verified on real machines.
 
@@ -33,12 +33,12 @@ On top of that storage:
 ## How knowledge grows
 
 1. **Saving.** The agent saves one fact per memory. Text over 2,000 characters, or with two or more headings, is stored as a note instead.
-2. **At save time.** The new memory is compared with its 3 nearest neighbours. An older memory that says the same thing (cosine 0.90 or more, word counts within 2) is removed. Older items with cosine 0.80 or more are returned to the agent, which corrects or deletes them in one `neospike_memory_reconcile` call so that the newest content wins.
+2. **At save time.** The new memory is compared with its 3 nearest neighbours. An older memory that says the same thing (cosine 0.90 or more, word counts within 2) is removed. Older items with cosine 0.80 or more are returned to the agent, which corrects, deletes or keeps them in one `neospike_memory_reconcile` call so that the newest content wins. Pairs it leaves unsettled wait and are judged once a day by the LLM of the `neospike-pref-reconcile` idle task.
 3. **Linking.** Each memory is linked to up to 3 others with cosine 0.6 or more. A memory with cosine 0.8 or more to a section of an automatic note joins that note.
 4. **Topics.** A linked group of more than 5 memories without a topic becomes a topic. A topic with more than 10 memories becomes an automatic note with one section per memory, and those memories and the topic are removed.
 5. **Your edits win.** A correction applies at once and the old text is kept as history. Automated jobs never change a note you wrote.
 
-Steps 3 and 4 are plain code. They run after a save and in the daily job; no LLM is called. Preferences and constraints that are similar but not exact duplicates are judged once a day by an LLM, inside Hermes (see [Preference tidy-up](#preference-tidy-up)).
+Steps 3 and 4 are plain code. They run after a save and in the daily job; no LLM is called. Preferences and constraints that are similar but not exact duplicates, and memory pairs from step 2 that the agent left unsettled, are judged once a day by an LLM, inside Hermes (see [Preference tidy-up](#preference-tidy-up)).
 
 ## Requirements
 
@@ -113,7 +113,7 @@ The agent gets these tools from the provider:
 | `neospike_memory_save` | Save one memory, preference or constraint. It can also fix, in the same call, a recalled memory or automatic-note line that turned out wrong. |
 | `neospike_memory_update` | Correct an item in place, or supersede it when a decision changed. |
 | `neospike_memory_delete` | Remove one item. |
-| `neospike_memory_reconcile` | Settle the older, similar items returned by a save. |
+| `neospike_memory_reconcile` | Settle the older, similar items returned by a save: correct, delete, or keep when there is no conflict. |
 | `neospike_memory_search` | Search stored memories, notes and docs. |
 | `neospike_note_read` | Read a whole note (agent or automatic). |
 | `neospike_note_write` | Create or update a note. |
@@ -146,7 +146,7 @@ Settings are in `$HERMES_HOME/neospike/config.json`.
 | `map_recent_days` | `7` | Age below which the Map shows an item as recent. |
 | `map_stale_days` | `14` | Age above which the Map shows an item as old. |
 | `extraction_language` | `en` | Language (`en` or `ko`) Neospike uses when it extracts memories from conversations. Set it in the Config tab. |
-| `pref_reconcile_enabled` | `true` | Run the daily preference tidy-up (the Hermes idle task `neospike-pref-reconcile`), the only Neospike job that calls an LLM. |
+| `pref_reconcile_enabled` | `true` | Run the daily tidy-up of similar preferences and unsettled memory pairs (the Hermes idle task `neospike-pref-reconcile`), the only Neospike job that calls an LLM. |
 
 The rules that tell the agent what to save are the text of `$HERMES_HOME/neospike/MEMORY_RULE.md`. Edit it in the Config tab or in any editor.
 
@@ -180,6 +180,8 @@ The schedule is Hermes cron's. If Hermes is not running at 12pm, Hermes runs the
 ### Preference tidy-up
 
 Hermes runs this as the plugin idle task `neospike-pref-reconcile`: at most once every 24 hours, and only after Hermes has been idle for 2 hours (the Hermes default). It finds preference or constraint pairs of the same user with cosine 0.8 or more that are not exact duplicates, and asks an LLM (32 pairs per call, at most 4 calls a run) to keep both, merge them, or delete one. A preference the user stated is never deleted because of one the agent inferred. Pairs judged "keep" are not asked again until one of them changes. A merged row is embedded by the next daily job.
+
+In the same run it then judges the memory pairs that a save returned and the agent left unsettled (see step 2 of [How knowledge grows](#how-knowledge-grows)), with the same limits and the same rules: the newer memory wins a conflict, the two are never merged, and a memory the user stated is never changed or deleted because of one the agent inferred. A pair whose memories changed or were deleted meanwhile is dropped without asking.
 
 - **Model.** It uses the LLM model selected in the Config tab ("Preference and constraint cleanup model"). The default follows your chat model.
 - **When it is scheduled.** Only when Hermes loads Neospike as a general plugin as well as the memory provider: `plugin.yaml` declares `kind: standalone` and `install.py` adds `neospike` to `plugins.enabled`. If `neospike` is not in `plugins.enabled`, the tidy-up does not run.

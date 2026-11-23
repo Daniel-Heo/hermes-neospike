@@ -19,6 +19,7 @@ from array import array
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from . import memory_reconcile as memory_pairs
 from . import preferences as pref_ops
 from .config import EMBEDDING_DIMENSIONS, EXTRACTION_LANGUAGE_DEFAULT, LANGUAGE_NAMES, NeospikeConfig, read_enabled
 from .database import canonical_database_path
@@ -105,22 +106,24 @@ class IdleReconcile:
         store = MemoryStore(canonical_database_path(self._home / "neospike", "memory"),
                             dimensions=EMBEDDING_DIMENSIONS)
         try:
-            result = run(store, self._home, self._llm)
+            result = run(store, self._home, self._llm, embedder=memory_pairs.LazyEmbedder(self._home))
         finally:
             store.close()
         if result.get("disabled"):
             logger.info("Neospike pref-reconcile skipped: pref_reconcile_enabled is false")
             return "disabled"
         summary = summary_line(result)
-        if result["errors"]:
-            raise RuntimeError(f"{summary}; LLM call failed: {result['errors'][0]}")
+        errors = [*result["errors"], *result.get("memory", {}).get("errors", [])]
+        if errors:
+            raise RuntimeError(f"{summary}; LLM call failed: {errors[0]}")
         return summary
 
 
 def summary_line(result: dict) -> str:
-    return (f"asked {result['asked']} of {result['candidates']} pairs in {result['calls']} calls: "
+    line = (f"asked {result['asked']} of {result['candidates']} pairs in {result['calls']} calls: "
             f"keep {result[ACTION_KEEP]}, update {result[ACTION_UPDATE]}, delete {result[ACTION_DELETE]}, "
             f"skipped {result['skipped']}, deferred {result['deferred']}")
+    return f"{line}; {memory_pairs.summary_part(result['memory'])}" if "memory" in result else line
 
 
 def register_idle_task(ctx: Any, home: str | Path | None = None) -> bool:
@@ -405,11 +408,17 @@ def reconcile(store: MemoryStore, llm: Callable[[list[dict]], str], *, language:
             "skip_reasons": tally.skipped, "errors": errors, "language": language}
 
 
-def run(store: MemoryStore, home: str | Path, llm: Callable[[list[dict]], str] | None) -> dict:
-    """One pref-reconcile run: settings from <home>/neospike/config.json. Without an llm: {"error": ...}."""
+def run(store: MemoryStore, home: str | Path, llm: Callable[[list[dict]], str] | None, *,
+        embedder: Any = None) -> dict:
+    """One pref-reconcile run: settings from <home>/neospike/config.json. Without an llm: {"error": ...}.
+    With an embedder, the waiting save-time memory pairs (memory_reconcile.judge) follow the preferences; their
+    counts are under "memory"."""
     config = NeospikeConfig.load(home)
     if not config.pref_reconcile_enabled:
         return {"disabled": True}
     if llm is None:
         return {"error": NO_LLM_MESSAGE}
-    return reconcile(store, llm, language=config.extraction_language)
+    result = reconcile(store, llm, language=config.extraction_language)
+    if embedder is not None:
+        result["memory"] = memory_pairs.judge(store, llm, embedder, language=config.extraction_language)
+    return result

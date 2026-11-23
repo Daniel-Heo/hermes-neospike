@@ -1,12 +1,12 @@
 ﻿"""Monthly incremental backup of memory.db.
 
 - full-<UTC>.db: VACUUM INTO snapshot (first run, --full, or when the last backup file is missing).
-- inc-<UTC>.zip: rows changed after the previous backup's watermark, one JSONL per table, BLOBs as
-  base64, plus manifest.json (previous backup name, watermark, row counts, schema version).
+- inc-<UTC>.zip: rows stamped at or after the previous boundary, one JSONL per table, BLOBs as
+  base64, plus manifest.json (previous backup name, since/boundary, row counts, schema version).
   FTS tables are never backed up; restore rebuilds them.
 
 Change detection per table:
-- timestamp tables (TIMESTAMP_COLUMNS): rows whose timestamp > previous watermark. items (memories,
+- timestamp tables (TIMESTAMP_COLUMNS): rows whose timestamp >= since. items (memories,
   document heads and parts) and the conversation family get updated_at from store.py triggers; tombstones
   record every delete (a document save deletes its old part rows and inserts new ones). Read bookkeeping
   (items accessed_at/access_count) is not a change signal: a search hit leaves updated_at alone, so a row
@@ -20,14 +20,23 @@ Change detection per table:
   so does a change of meta embedding_model/embedding_dimensions (reembed keeps updated_at).
   items.invalid_at/superseded_by changes bump items.updated_at through the tracking trigger.
 
-The watermark is time.time() taken after BEGIN IMMEDIATE: writers set their timestamps while holding
-the write lock, so every commit is either inside this snapshot or strictly after the watermark.
+Overlapping increments: an increment takes every row stamped >= since up to the backup moment N (no upper
+bound), so its timestamp rows and its hashed tables are one point in time. N = time.time() is taken after
+BEGIN IMMEDIATE; B = (N - BOUNDARY_LAG_SECONDS) rounded down to the minute is stored as the last backup time
+(the next increment's since) and N as the last backup moment. Writers stamp while holding the write lock, so
+a write after this backup stamps at least N minus clock skew (the SQLite trigger clock can read ~2 ms behind
+time.time()) > B and lands in the next increment. Rows of [B, N) come again in the next increment; restore
+upserts them and skips a tombstone it already holds, so the result is the same.
+No-file rule: the overlap alone is not a change. A backup writes a file only when a row is stamped
+>= max(since, last moment - BOUNDARY_LAG_SECONDS) or a hashed table changed; otherwise file and meta stay.
+A chain from before the moment key reads its last backup time as the last moment.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -47,6 +56,8 @@ MANIFEST_NAME = "manifest.json"
 BACKUP_META_PREFIX = "backup_"
 META_LAST_AT = "backup_last_at"
 META_LAST_NAME = "backup_last_name"
+# Wall clock N of the last backup run (META_LAST_AT holds its boundary B, the next since).
+META_LAST_MOMENT = "backup_last_moment"
 # schema_version of the last backup: a migration in between starts a new chain (restore refuses an
 # increment whose schema_version differs from its full snapshot).
 META_LAST_SCHEMA = "backup_last_schema"
@@ -56,12 +67,15 @@ META_LAST_SCHEMA = "backup_last_schema"
 META_LAST_EMBEDDING = "backup_last_embedding"
 EMBEDDING_KEYS = ("embedding_model", "embedding_dimensions")
 META_HASH_PREFIX = "backup_hash:"
+# Boundary B = floor((now - BOUNDARY_LAG_SECONDS) / BOUNDARY_STEP_SECONDS) * BOUNDARY_STEP_SECONDS.
+BOUNDARY_LAG_SECONDS = 1.0
+BOUNDARY_STEP_SECONDS = 60.0
 BLOB_KEY = "$b64"
 TIMESTAMP_FORMAT = "%Y%m%dT%H%M%S%fZ"
 JSONL_SUFFIX = ".jsonl"
 PARTIAL_SUFFIX = ".partial"
 
-# Row timestamp per table; rows newer than the watermark go into the increment.
+# Row timestamp per table; rows stamped >= since go into the increment.
 TIMESTAMP_COLUMNS = {
     "items": "updated_at",
     "item_revisions": "edited_at",  # append-only
@@ -206,6 +220,16 @@ def _fsync_file(path: Path) -> None:
         os.fsync(handle.fileno())
 
 
+def _now() -> float:
+    """Wall clock of a backup run (module level so tests can move it)."""
+    return time.time()
+
+
+def boundary_at(moment: float) -> float:
+    """Increment boundary B for a run at *moment*: (moment - BOUNDARY_LAG_SECONDS) rounded down to the minute."""
+    return math.floor((moment - BOUNDARY_LAG_SECONDS) / BOUNDARY_STEP_SECONDS) * BOUNDARY_STEP_SECONDS
+
+
 # -- backup -----------------------------------------------------------------------------------
 
 def run_backup(db_path: Path, backup_dir: Path, *, full: bool = False) -> dict:
@@ -214,11 +238,12 @@ def run_backup(db_path: Path, backup_dir: Path, *, full: bool = False) -> dict:
     backup_dir.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(db_path, isolation_level=None, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
     try:
-        # IMMEDIATE (not a plain read transaction): blocks writers so the watermark below cleanly
-        # splits committed rows from later ones; reads stay one consistent point in time.
+        # IMMEDIATE (not a plain read transaction): blocks writers so every later commit stamps after
+        # the clock read below; reads stay one consistent point in time.
         connection.execute("BEGIN IMMEDIATE")
         try:
-            watermark = time.time()
+            now = _now()
+            boundary = boundary_at(now)
             schema_version = _meta(connection, "schema_version")
             last_name, last_at = _meta(connection, META_LAST_NAME), _meta(connection, META_LAST_AT)
             reason = "requested" if full else None
@@ -232,15 +257,20 @@ def run_backup(db_path: Path, backup_dir: Path, *, full: bool = False) -> dict:
             if reason is None and _meta(connection, META_LAST_EMBEDDING) != embedding:
                 reason = "embedding_changed"
             if reason is not None:
-                result = _full_snapshot(connection, db_path, backup_dir, watermark)
+                result = _full_snapshot(connection, db_path, backup_dir, now)
                 result["reason"] = reason
             else:
-                result = _increment(connection, backup_dir, watermark, last_name, float(last_at), schema_version)
+                since = float(last_at)
+                last_moment = _meta(connection, META_LAST_MOMENT)
+                changed_since = max(since, (since if last_moment is None else float(last_moment)) - BOUNDARY_LAG_SECONDS)
+                result = _increment(connection, backup_dir, now, last_name, since, changed_since, boundary,
+                                    schema_version)
             if result["created"]:
                 path = backup_dir / result["name"]
                 try:
                     _set_meta(connection, META_LAST_NAME, result["name"])
-                    _set_meta(connection, META_LAST_AT, repr(watermark))
+                    _set_meta(connection, META_LAST_AT, repr(boundary))
+                    _set_meta(connection, META_LAST_MOMENT, repr(now))
                     if schema_version is not None:
                         _set_meta(connection, META_LAST_SCHEMA, schema_version)
                     _set_meta(connection, META_LAST_EMBEDDING, embedding)
@@ -259,8 +289,8 @@ def run_backup(db_path: Path, backup_dir: Path, *, full: bool = False) -> dict:
         connection.close()
 
 
-def _full_snapshot(connection: sqlite3.Connection, db_path: Path, backup_dir: Path, watermark: float) -> dict:
-    name = f"{FULL_PREFIX}{_stamp(watermark)}{FULL_SUFFIX}"
+def _full_snapshot(connection: sqlite3.Connection, db_path: Path, backup_dir: Path, now: float) -> dict:
+    name = f"{FULL_PREFIX}{_stamp(now)}{FULL_SUFFIX}"
     target = backup_dir / name
     if target.exists():
         raise BackupError(f"Backup already exists: {target}")
@@ -279,47 +309,62 @@ def _full_snapshot(connection: sqlite3.Connection, db_path: Path, backup_dir: Pa
             "seconds": round(time.perf_counter() - started, 4)}
 
 
+def _from(column: str) -> str:
+    """Open-ended time filter column >= since (no upper bound: rows up to the backup moment); binds (since,)."""
+    return f"{_quote(column)}>=?"
+
+
 def changed_rows(connection: sqlite3.Connection, table: str, since: float) -> sqlite3.Cursor:
-    """Rows of a timestamp table changed after *since*, unordered so the timestamp index serves the filter."""
-    return _select(connection, table, f"{_quote(TIMESTAMP_COLUMNS[table])}>?", (since,), ordered=False)
+    """Rows of a timestamp table stamped >= *since*, unordered so the timestamp index serves the filter."""
+    return _select(connection, table, _from(TIMESTAMP_COLUMNS[table]), (since,), ordered=False)
 
 
-def _increment(connection: sqlite3.Connection, backup_dir: Path, watermark: float, previous: str,
-               since: float, schema_version: str | None) -> dict:
+def _has_rows_from(connection: sqlite3.Connection, table: str, since: float) -> bool:
+    return connection.execute(f"SELECT EXISTS(SELECT 1 FROM {_quote(table)} WHERE {_from(TIMESTAMP_COLUMNS[table])})",
+                              (since,)).fetchone()[0] == 1
+
+
+def _increment(connection: sqlite3.Connection, backup_dir: Path, now: float, previous: str, since: float,
+               changed_since: float, boundary: float, schema_version: str | None) -> dict:
+    """Rows stamped >= *since* plus changed hashed tables; no file unless a row is stamped >= *changed_since*
+    (past the overlap with the last backup) or a hashed table changed."""
     started = time.perf_counter()
-    parts: dict[str, bytes] = {}
-    counts: dict[str, int] = {}
     tables = set(data_tables(connection))
-    for table in TIMESTAMP_COLUMNS:
-        if table in tables:
-            parts[table], counts[table] = _jsonl(changed_rows(connection, table, since))
-    child_parents: dict[str, list[int]] = {}
-    for table, (key, parent) in CHILD_TABLES.items():
-        if table not in tables:
-            continue
-        ids = [int(row[0]) for row in connection.execute(
-            f"SELECT id FROM {_quote(parent)} WHERE {_quote(TIMESTAMP_COLUMNS[parent])}>? ORDER BY id", (since,))]
-        child_parents[table] = ids
-        selected = f"{_quote(key)} IN (SELECT id FROM {_quote(parent)} WHERE {_quote(TIMESTAMP_COLUMNS[parent])}>?)"
-        parts[table], counts[table] = _jsonl(_select(connection, table, selected, (since,), ordered=False))
+    stamped = [table for table in TIMESTAMP_COLUMNS if table in tables]
     replaced: list[str] = []
+    hashes: dict[str, str] = {}
     for table in _hashed_tables(connection):
         current = _content_hash(connection, table)
         if current != _meta(connection, META_HASH_PREFIX + table):
             replaced.append(table)
-            parts[table], counts[table] = _jsonl(
-                _ordered_select(connection, table, META_FILTER if table == "meta_entries" else ""))
-            _set_meta(connection, META_HASH_PREFIX + table, current)
-    changed = sum(count for table, count in counts.items() if table not in replaced) + len(replaced)
-    if changed == 0:
+            hashes[table] = current
+    if not replaced and not any(_has_rows_from(connection, table, changed_since) for table in stamped):
         return {"created": False}
-    name = f"{INC_PREFIX}{_stamp(watermark)}{INC_SUFFIX}"
+    parts: dict[str, bytes] = {}
+    counts: dict[str, int] = {}
+    for table in stamped:
+        parts[table], counts[table] = _jsonl(changed_rows(connection, table, since))
+    child_parents: dict[str, list[int]] = {}
+    for table, (key, parent) in CHILD_TABLES.items():
+        if table not in tables:
+            continue
+        parent_filter = _from(TIMESTAMP_COLUMNS[parent])
+        ids = [int(row[0]) for row in connection.execute(
+            f"SELECT id FROM {_quote(parent)} WHERE {parent_filter} ORDER BY id", (since,))]
+        child_parents[table] = ids
+        selected = f"{_quote(key)} IN (SELECT id FROM {_quote(parent)} WHERE {parent_filter})"
+        parts[table], counts[table] = _jsonl(_select(connection, table, selected, (since,), ordered=False))
+    for table in replaced:
+        parts[table], counts[table] = _jsonl(
+            _ordered_select(connection, table, META_FILTER if table == "meta_entries" else ""))
+        _set_meta(connection, META_HASH_PREFIX + table, hashes[table])
+    name = f"{INC_PREFIX}{_stamp(now)}{INC_SUFFIX}"
     target = backup_dir / name
     if target.exists():
         raise BackupError(f"Backup already exists: {target}")
     manifest = {
-        "name": name, "previous": previous, "since": since, "created_at": watermark,
-        "created_at_utc": _stamp(watermark), "schema_version": None if schema_version is None else int(schema_version),
+        "name": name, "previous": previous, "since": since, "boundary": boundary, "created_at": now,
+        "created_at_utc": _stamp(now), "schema_version": None if schema_version is None else int(schema_version),
         "rows": counts, "replace_tables": replaced, "child_parents": child_parents,
     }
     temporary = backup_dir / f".{name}{PARTIAL_SUFFIX}"
@@ -487,4 +532,18 @@ def _apply_increment(connection: sqlite3.Connection, path: Path, manifest: dict)
             else:
                 connection.execute(f"DELETE FROM {_quote(table)}")
             _insert(connection, table, _read_rows(archive, table), replace=table == "meta_entries")
-        _insert(connection, "tombstones", tombstones, replace=False)
+        _insert_new_tombstones(connection, tombstones)
+
+
+def _insert_new_tombstones(connection: sqlite3.Connection, tombstones: Iterable[dict]) -> None:
+    """Insert tombstones the restored file does not hold yet (every column identical): a tombstone stamped
+    in [B, now) of a backup is in that backup and again in the next increment."""
+    for tombstone in tombstones:
+        names = list(tombstone)
+        values = [_decode_value(tombstone[name]) for name in names]
+        columns = ",".join(_quote(name) for name in names)
+        same = " AND ".join(f"{_quote(name)} IS ?" for name in names)
+        connection.execute(
+            f"INSERT INTO tombstones({columns}) SELECT {','.join('?' * len(names))} "
+            f"WHERE NOT EXISTS (SELECT 1 FROM tombstones WHERE {same})", values + values,
+        )

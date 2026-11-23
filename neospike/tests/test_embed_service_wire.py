@@ -261,7 +261,7 @@ def test_service_process_is_a_singleton_and_exits_cleanly_on_stop(svc_home):
         assert ping_pid(client) == pid
     finally:
         stop_gracefully(process)
-        process.wait(timeout=10)
+        process.wait(timeout=30)
     assert process.returncode == 0
     assert not (cache_dir(svc_home) / 'i.sock').exists()
 

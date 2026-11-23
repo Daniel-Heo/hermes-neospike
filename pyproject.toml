@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "neospike"
-version = "1.0.3"
+dynamic = ["version"]
 description = "Private local hybrid text memory provider for Hermes Agent"
 readme = "README.md"
 license = "Apache-2.0"
@@ -43,6 +43,11 @@ neospike = "neospike:register"
 
 [dependency-groups]
 dev = ["fastapi>=0.116,<1", "httpx>=0.28,<1", "pytest>=9,<10"]
+
+[tool.hatch.version]
+# The single version source is plugin.yaml (Hermes and the MCP server read it there).
+path = "neospike/plugin.yaml"
+pattern = "(?m)^version: (?P<version>\\S+)"
 
 [tool.hatch.build]
 exclude = ["neospike/provider 2.py", "neospike/evaluation/results/**", "**/*.db", "**/*.db-*", "**/*.sqlite*", "**/*.zip", "**/*.jsonl", ".env*"]

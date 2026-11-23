@@ -122,7 +122,9 @@ def test_idle_task_is_daily_and_uses_the_registered_auxiliary_slot(tmp_path: Pat
     assert summary.startswith("asked 1 of 1 pairs in 1 calls: keep 1")
     options = plugin_llm.calls[0][1]
     assert options["task"] == "neospike_pref_reconcile" and options["temperature"] == 0
-    assert task(FakeRun()) == "asked 0 of 1 pairs in 0 calls: keep 0, update 0, delete 0, skipped 0, deferred 0"
+    assert task(FakeRun()) == ("asked 0 of 1 pairs in 0 calls: keep 0, update 0, delete 0, skipped 0, deferred 0; "
+                               "memory pairs: judged 0 of 0 in 0 calls, applied 0, keep 0, skipped 0, dropped 0, "
+                               "deferred 0")
 
 
 def test_paused_neospike_runs_nothing(tmp_path: Path) -> None:
