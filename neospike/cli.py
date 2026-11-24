@@ -12,7 +12,6 @@ from pathlib import Path
 from .inference import EmbeddingClient, EmbeddingUnavailable
 from . import backup as backup_tools
 from . import topics as topic_ops
-from . import conversations as conv_ops
 from . import folders as folder_ops
 from .config import EMBEDDING_DIMENSIONS, NeospikeConfig
 from .database import canonical_database_path
@@ -44,7 +43,6 @@ _TOPIC_VERBS = {"topic-assign", "topic-discover", "topic-member-move", "note-abs
 PREF_RECONCILE_VERB = "pref-reconcile"  # runs as a Hermes idle task; the CLI only explains that
 EMBED_PENDING_VERB = "embed-pending"  # daily stage; ends with the save follow-up (note-absorb, topic-assign)
 EMBED_PENDING_EDITED_BY = topic_ops.FORMULA_EDITOR  # edited_by of a chunk that takes a filled duplicate's body
-_CONV_VERBS = {"conv-index", "conv-search", "conv-import", "conv-read"}
 _FOLDER_VERBS = {"folder-create", "folder-update", "folder-move", "folder-delete", "folder-list"}
 _NO_FOLDER_WORD = "none"
 _ITEM_UPDATE_KEYS = {"id", "expected_text", "new_text", "subject", "durability", "importance", "confidence", "tags"}
@@ -369,42 +367,6 @@ def _run_topic_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
         return _EXIT_REFUSED
 
 
-def _run_conv_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
-    """Conversation family. No LLM is called here."""
-    try:
-        if args.command == "conv-read":
-            with store._lock:
-                _emit_json(conv_ops.read_message(store._conn, args.conversation, args.seq))
-            return 0
-        if args.command == "conv-import":
-            log = conv_ops.ProgressLog(store.path.parent, "conv-import")
-            output = conv_ops.import_state_db(args.state_db, store=store, limit=args.limit, until=args.until,
-                                                         budget_seconds=args.budget_seconds, progress=log)
-            log.finish(output)
-            if args.index and "error" not in output:
-                # Chunks and embeddings are built after (outside) the import transactions.
-                embedder = EmbeddingClient(Path(args.home).expanduser())
-                output["index"] = _index_conversations(store, embedder, conv_ops.INDEX_BUDGET_SECONDS)
-            _emit_json(output)
-            return _EXIT_REFUSED if "error" in output else 0
-        embedder = EmbeddingClient(Path(args.home).expanduser())
-        if args.command == "conv-index":
-            _emit_json(_index_conversations(store, embedder, args.budget_seconds))
-            return 0
-        with store._lock:
-            searchable = conv_ops.has_searchable(store._conn)
-        results = (conv_ops.search(store, args.query, embedder.embed_query(args.query), limit=args.limit)
-                   if searchable and args.query.strip() else [])
-        _emit_json({"results": results})
-        return 0
-    except conv_ops.ConversationError as exc:
-        _emit_json(exc.as_dict())
-        return _EXIT_REFUSED
-    except (ValueError, OSError, RuntimeError) as exc:
-        _emit_json({"error": "invalid", "message": f"{type(exc).__name__}: {exc}"})
-        return _EXIT_REFUSED
-
-
 def _run_reembed_cmd(home: Path, budget_seconds: float | None) -> int:
     """Open without the embedding check (the DB still holds the old model's vectors) and re-embed.
     Exit 0 when complete; 3 when the budget stopped it (rerun to continue)."""
@@ -417,21 +379,6 @@ def _run_reembed_cmd(home: Path, budget_seconds: float | None) -> int:
         store.close()
     print(json.dumps(output, ensure_ascii=False))
     return 0 if output["complete"] else 3
-
-
-def _index_conversations(store: MemoryStore, embedder: "EmbeddingClient", budget_seconds: float | None) -> dict:
-    """conv-index with its progress/result lines in <neospike dir>/logs; an embedder error is
-    logged and propagates (vectors done so far are already saved)."""
-    log = conv_ops.ProgressLog(store.path.parent, "conv-index")
-    try:
-        output = conv_ops.ConversationIndexer(
-            store, embedder, embed_batch=conv_ops.EMBED_BATCH).index_pending(
-            budget_seconds=budget_seconds, progress=log)
-    except Exception as exc:
-        log.finish({"error": f"{type(exc).__name__}: {exc}"})
-        raise
-    log.finish(output)
-    return output
 
 
 def _run_folder_cmd(args: argparse.Namespace, store: MemoryStore) -> int:
@@ -463,28 +410,6 @@ def _parse_folder_id(text: str) -> int:
     if not text.strip().isdigit() or int(text) < 1:
         raise folder_ops.FolderError("--folder must be a folder id or 'none'")
     return int(text)
-
-
-def _dry_run_conv_import(args: argparse.Namespace, db: Path) -> int:
-    """conv-import --dry-run: the memory DB is opened mode=ro (never through MemoryStore, whose
-    open rewrites the file), so the file bytes stay the same."""
-    connection = None
-    try:
-        if db.is_file():
-            connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
-        output = conv_ops.import_state_db(args.state_db, read_connection=connection, limit=args.limit,
-                                                     until=args.until, budget_seconds=args.budget_seconds)
-        _emit_json(output)
-        return _EXIT_REFUSED if "error" in output else 0
-    except conv_ops.ConversationError as exc:
-        _emit_json(exc.as_dict())
-        return _EXIT_REFUSED
-    except (ValueError, OSError, sqlite3.Error) as exc:
-        _emit_json({"error": "invalid", "message": f"{type(exc).__name__}: {exc}"})
-        return _EXIT_REFUSED
-    finally:
-        if connection is not None:
-            connection.close()
 
 
 def _run_map_cmd(home: Path) -> int:
@@ -594,24 +519,6 @@ def _build_parser() -> argparse.ArgumentParser:
     backup_mode_p.add_argument("--list", action="store_true", help="List backups, sizes and chain state")
     restore_p = cmds.add_parser("backup-restore", help="Rebuild a NEW database file from the latest backup chain")
     restore_p.add_argument("--to", required=True, help="New database path; an existing file is refused")
-    conv_index_p = cmds.add_parser("conv-index", help="Chunk and embed conversation messages not indexed yet")
-    conv_index_p.add_argument("--budget-seconds", type=float, default=conv_ops.INDEX_BUDGET_SECONDS,
-                            help="Stop after this many seconds; the rest is left for the next run (0 = no limit)")
-    conv_import_p = cmds.add_parser("conv-import", help="Copy past Hermes sessions from state.db (read-only) as ended conversations")
-    conv_import_p.add_argument("--state-db", required=True, help="Hermes state.db; opened with mode=ro")
-    conv_import_p.add_argument("--dry-run", action="store_true", help="Count only; the memory database is not changed")
-    conv_import_p.add_argument("--limit", type=int, help="At most this many sessions (oldest first)")
-    conv_import_p.add_argument("--index", action="store_true", help="Run conv-index after the import (default off)")
-    conv_import_p.add_argument("--until", type=float,
-                             help="Boundary T (epoch seconds): only messages at or before T (default: now)")
-    conv_import_p.add_argument("--budget-seconds", type=float, default=conv_ops.IMPORT_BUDGET_SECONDS,
-                             help="Stop after this many seconds; the rest is left for the next run (0 = no limit)")
-    conv_read_p = cmds.add_parser("conv-read", help="One message of a conversation, its chunks joined along the chunk chain")
-    conv_read_p.add_argument("--conversation", type=int, required=True, help="conversations.id")
-    conv_read_p.add_argument("--seq", type=int, required=True, help="Message seq")
-    conv_search_p = cmds.add_parser("conv-search", help="Hybrid search over conversation chunks (adjacent hits merged)")
-    conv_search_p.add_argument("query")
-    conv_search_p.add_argument("--limit", type=int, default=5)
     folder_create_p = cmds.add_parser("folder-create", help="Create a folder (colour: next unused member colour)")
     folder_create_p.add_argument("--name", required=True)
     folder_create_p.add_argument("--color", help="#RRGGBB member colour")
@@ -635,12 +542,13 @@ def _build_parser() -> argparse.ArgumentParser:
     reembed_parser_p.add_argument("--budget-seconds", type=float, default=None,
                                 help="Stop cleanly after this many seconds; rerun to continue")
     register_eval_cli(cmds)
-    schema_p = cmds.add_parser(SCHEMA_MIGRATE_VERB, help="Rename a v21 database to schema v22 in one "
-                                                         "verified transaction (stop every neospike process first)")
+    schema_p = cmds.add_parser(SCHEMA_MIGRATE_VERB, help="Migrate the database one schema step (v21 -> v22, "
+                                                         "or v22/v23 -> v24) in verified transactions "
+                                                         "(stop every neospike process first)")
     schema_mode_p = schema_p.add_mutually_exclusive_group(required=True)
     schema_mode_p.add_argument("--dry-run", action="store_true", help="Migrate an in-memory copy and report (read only)")
     schema_mode_p.add_argument("--apply", action="store_true",
-                               help="Back up to memory.pre-v22.db (+ config/MEMORY_RULE copies), migrate, move config")
+                               help="Back up to memory.pre-v<N+1>.db (v21: + config/MEMORY_RULE copies), migrate")
     schema_mode_p.add_argument("--restore", action="store_true",
                                help="Put memory.pre-v22.db and the .pre-v22 config copies back")
     pref_add_p = cmds.add_parser("pref-add", help="Add one preference/constraint from a JSON object on stdin "
@@ -697,7 +605,6 @@ _STORE_DISPATCH = (
     (_ITEM_VERBS, _run_item_cmd),
     (_PREF_VERBS, _run_pref_cmd),
     (_TOPIC_VERBS, _run_topic_cmd),
-    (_CONV_VERBS, _run_conv_cmd),
     (_FOLDER_VERBS, _run_folder_cmd),
     (_LINK_VERBS, _run_link_cmd),
 )
@@ -728,8 +635,9 @@ def forward_old_command(argv: list[str], stderr=None) -> list[str]:
 
 
 def _run_schema_cmd(args: argparse.Namespace, home: Path) -> int:
-    """schema-migrate: the database is never opened through MemoryStore here."""
-    from . import schema_v22
+    """schema-migrate: the database is never opened through MemoryStore here. A v21 layout takes the v22 step (the
+    v23/v24 steps follow on the next open or the next --apply); a v22/v23 database takes the steps to v24."""
+    from . import schema_v22, schema_v24
     db = home / "neospike" / "memory.db"
     try:
         if args.restore:
@@ -738,10 +646,14 @@ def _run_schema_cmd(args: argparse.Namespace, home: Path) -> int:
             raise schema_v22.SchemaError(f"No memory database at {db}")
         elif args.dry_run:
             result = schema_v22.dry_run(db, embedder=EmbeddingClient(home))
+            if result.get("migrated") is False:
+                result = schema_v24.dry_run(db)
         else:
             # The re-split human/agent note parts are embedded now (a part whose embedding fails stays
             # embedding-pending for the daily embed-pending stage).
             result = schema_v22.apply(home, db, embedder=EmbeddingClient(home))
+            if result.get("applied") is False:
+                result = schema_v24.apply(db)
     except (schema_v22.SchemaError, sqlite3.Error, OSError) as exc:
         _emit_json({"error": "refused", "message": f"{type(exc).__name__}: {exc}"})
         return _EXIT_REFUSED
@@ -777,10 +689,6 @@ def _run_command(args: argparse.Namespace) -> int:
         return _run_map_cmd(home)
     if verb == "reembed":
         return _run_reembed_cmd(home, args.budget_seconds)
-    if verb == "conv-import" and args.dry_run:
-        # Not canonical_database_path: it creates the folder and may migrate a legacy file. A legacy
-        # .sqlite predates the conversation tables, so it holds no session to skip.
-        return _dry_run_conv_import(args, home / "neospike" / "memory.db")
 
     db = canonical_database_path(home / "neospike", "memory")
     NeospikeConfig.load(args.home)  # a broken config must stop the command before the store opens

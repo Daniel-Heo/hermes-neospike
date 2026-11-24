@@ -21,9 +21,8 @@ _FILE_GLOB = "recall-*.jsonl"
 
 LANE_MEMORY = "memory"
 LANE_NOTE = "note"
-LANE_CONVERSATION = "conversation"
 # Gold/stale ids in question sets are written "<prefix>:<id>".
-LANE_PREFIX = {LANE_MEMORY: "mem", LANE_NOTE: "note", LANE_CONVERSATION: "conv"}
+LANE_PREFIX = {LANE_MEMORY: "mem", LANE_NOTE: "note"}
 
 # Reasons the current code can observe.
 REASON_FUSION_LIMIT = "fusion_limit"  # a lane returned it, but RRF ranked it below the prefetch limit
@@ -49,8 +48,6 @@ def lane_of(item: dict[str, Any]) -> str:
     kind = item.get("kind")
     if kind == "note":
         return LANE_NOTE
-    if kind == "conversation":
-        return LANE_CONVERSATION
     return LANE_MEMORY
 
 

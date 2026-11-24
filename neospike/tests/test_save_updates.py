@@ -100,7 +100,6 @@ def _refusal_cases(provider: NeospikeProvider) -> list[tuple[str, str]]:
         ("chunk of another note", f"note:{agent['id']}.{automatic['chunk_ids'][0]}"),
         ("preference", "pref:1"),
         ("builtin copy", f"id:{mirror}"),
-        ("conversation", "conv:3"),
         ("bad format", "note:12"),
         ("bad format", "memory 4"),
     ]

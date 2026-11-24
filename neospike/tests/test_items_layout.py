@@ -10,7 +10,7 @@ from neospike import topics
 from neospike.notes import NoteService, note_body, part_ids
 from neospike.store import next_of
 from neospike.tests.support_items import chunk_rows, members_of, note_rows
-from neospike.tests.test_conversations import WordCounter
+from neospike.tests.support_items import WordCounter
 from neospike.tests.test_formula import NS as FORMULA_NS, _axis as _formula_axis, _remember as _formula_remember
 from neospike.tests.test_formula import _store as _formula_store, _texts
 from neospike.store import MemoryStore

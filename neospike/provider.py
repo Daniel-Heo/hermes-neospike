@@ -18,8 +18,8 @@ from typing import Any, ClassVar
 
 from agent.memory_provider import MemoryProvider as HermesMemoryProvider
 
-from . import conversations as conversation_family
 from . import topics as topic_pages  # noqa: F401 (without numpy the provider fails to load visibly)
+from .masking import mask_text
 from .config import (DEFAULT_RULES_DIGEST, PAUSED_MESSAGE, NeospikeConfig, read_enabled, read_extraction_language,
                      read_memory_rule, rules_digest, save_language_rule)
 from .debug import TurnTraceLog
@@ -88,13 +88,11 @@ _ELLIPSIS = "…"
 # Builtin Markdown memory mirror rows (on_memory_write): Hermes puts that memory in the system prompt itself,
 # so the prefetch recall and the profile block leave them out; the search tool keeps them.
 _BUILTIN_MIRROR_KIND = "durable"
-_MEMORY_LINE_KINDS_WITHOUT_ID = frozenset({"note", conversation_family.KIND})
+_MEMORY_LINE_KINDS_WITHOUT_ID = frozenset({"note"})
 # What Hermes sends again with every request, read from state.db per prefetch / search call (read only).
 _SEEN_SQL = ("SELECT content, api_content FROM messages WHERE session_id=? AND role='user' AND active=1 "
              "AND api_content IS NOT NULL")
 _CUT_SQL = "SELECT MAX(timestamp) FROM messages WHERE session_id=? AND compacted=1"
-# The conversation's messages Hermes resends (read only when the conversation lane runs).
-_ACTIVE_SQL = "SELECT role, content FROM messages WHERE session_id=? AND active=1 AND role IN ('user','assistant')"
 PROFILE_OPEN, PROFILE_CLOSE = "<neospike_profile>", "</neospike_profile>"
 PROFILE_HEADER = ("This user's standing preferences and constraints, loaded once per conversation. Stated = the user "
                   "said it. Inferred = derived from past corrections, lower trust. The user's current words win, and "
@@ -136,12 +134,10 @@ def situation_line(pref_id: int, pref_type: str, situation: str, text: str) -> s
 @dataclasses.dataclass(frozen=True)
 class LiveContext:
     """The live conversation as Hermes resends it. seen: the injected part of every active user row,
-    newline-joined and newline-framed so a line is matched whole; cut: time of the last compacted message (0: none);
-    messages: conversations.live_messages of the active user/assistant rows, None when not read."""
+    newline-joined and newline-framed so a line is matched whole; cut: time of the last compacted message (0: none)."""
     session_id: str
     seen: str
     cut: float
-    messages: frozenset[tuple[str, str]] | None = None
 
     def holds(self, line: str) -> bool:
         return f"\n{line}\n" in self.seen
@@ -246,8 +242,6 @@ RECONCILE_TOOL_TEXT = (
     "they conflict the newest wins in one call: text = corrected body (partly stale), no text = delete "
     "(fully replaced), keep = true when there is no conflict; never merge. Only this session's listed items."
 )
-# Direct search always; prefetch only with conversation_prefetch=true.
-_CHAT_LANE = ('conversation', 'conversation')
 
 
 def _fusion_score(rank: int) -> float:
@@ -297,10 +291,8 @@ def _parse_reconcile_changes(value: Any) -> tuple[list[tuple[str, int, str | Non
 # neospike_memory_save updates: the number a recalled line shows, id:N (memory) or note:N.C (automatic-note chunk C).
 _MEMORY_REF_PREFIX, _CHUNK_REF_PREFIX = "id:", "note:"
 _REF_EDGE_CHARS = " \t\r\n[]"
-_CONV_REF_PREFIXES = ("conv:", conversation_family.KIND + ":")
 _MSG_UPDATE_REF = "each update ref is id:N or note:N.C as shown on the recalled line"
 _MSG_PREF_REF = "pref:N is a preference; change it with neospike_memory_update and target=preference"
-_MSG_CONV_REF = "Conversation excerpts cannot be changed"
 _SAVE_UPDATES_SCHEMA = {
     "type": "array", "minItems": 1, "maxItems": _RECONCILE_BATCH_MAX,
     "description": "Corrections of recalled lines that proved wrong; each is changed in place, old text kept as history.",
@@ -344,8 +336,6 @@ def _parse_save_updates(value: Any) -> list[_SaveUpdate]:
         ref = ref.strip(_REF_EDGE_CHARS)
         if ref.startswith(prefs.PREF_REF_PREFIX):
             raise ValueError(_MSG_PREF_REF)
-        if ref.startswith(_CONV_REF_PREFIXES):
-            raise ValueError(_MSG_CONV_REF)
         if ref.startswith(_MEMORY_REF_PREFIX):
             parsed = _SaveUpdate(ref, "id", _ref_number(ref.removeprefix(_MEMORY_REF_PREFIX)), 0, text)
         elif ref.startswith(_CHUNK_REF_PREFIX):
@@ -478,8 +468,6 @@ class NeospikeProvider(HermesMemoryProvider):
         self._lane_causes: dict[str, str] = {}
         # (body hash, scope, scope identity) -> monotonic time of a save whose embedding failed.
         self._embed_failed_at: dict[tuple[str, str, str], float] = {}
-        self._talk_store: conversation_family.ConversationStore | None = None
-        self._talk_indexer: conversation_family.ConversationIndexer | None = None
         # Note-absorb -> topic-assign after a turn that saved or changed a memory (sessions marked by the tools).
         self._follow_up: topic_pages.SaveFollowUp | None = None
         self._saved_in_turn: set[str] = set()
@@ -491,7 +479,6 @@ class NeospikeProvider(HermesMemoryProvider):
         self._session_notes: dict[str, dict[int, float]] = {}
         # Conversations given a profile block by this process, used only while state.db cannot be read.
         self._profile_sent: set[str] = set()
-        self._chat_omitted = 0  # current-conversation excerpts the last conversation-lane search left out
 
     @property
     def name(self):
@@ -512,11 +499,6 @@ class NeospikeProvider(HermesMemoryProvider):
                   "Log one line per prefetch under neospike/logs (ids and scores only, never the query text)",
                   True, **either),
             entry("recall_log_months", "How many months of injection logs to keep", "12"),
-            entry("conversation_capture",
-                  "Store user and assistant turns (secrets masked) in the local conversation archive", True, **either),
-            entry("conversation_prefetch",
-                  "Let each turn's automatic recall include conversation excerpts too (off by default)", False,
-                  **either),
         ]
 
     def save_config(self, choices: dict[str, Any], home_path: str) -> None:
@@ -550,7 +532,6 @@ class NeospikeProvider(HermesMemoryProvider):
                                         namespace=self._ns_label, allowed_roots=[root])
         self._core.session_id = session_id
         self._sync_project_scope(session_id)
-        self._begin_capture()
         self._begin_follow_up()
         from .debug_hooks import track
         track(self)
@@ -585,7 +566,7 @@ class NeospikeProvider(HermesMemoryProvider):
             "neospike_memory_reconcile. "
             # Reading results.
             "In results, superseded_by=N (replaced by mem:N) marks mem:N as the current decision; archived means the "
-            "user archived it. Conversation excerpts carry message_parts/part; conv-read returns the whole message. "
+            "user archived it. "
             "Markdown memory is a separate, much narrower store: write there only stable user preferences or "
             "environment facts that apply across projects and must always be in context; project-scoped information "
             "belongs only in Neospike."
@@ -604,7 +585,7 @@ class NeospikeProvider(HermesMemoryProvider):
             marker = make_notice_marker(rules_hash) if notice else ""
             asked = bool(request_text.strip())
             self._enter_session(live_sid)
-            live = self._read_live_context(live_sid, messages=asked and self._settings.conversation_prefetch)
+            live = self._read_live_context(live_sid)
             profile, profile_stats = self._profile_block(live_sid, live)
             try:
                 recall = self._recall_text(request_text, live_sid, live, profile, profile_stats,
@@ -707,16 +688,14 @@ class NeospikeProvider(HermesMemoryProvider):
 
     def _build_recall(self, query: str, live_sid: str) -> str:
         self._enter_session(live_sid)
-        return self._recall_text(query, live_sid, self._read_live_context(
-            live_sid, messages=self._settings.conversation_prefetch))
+        return self._recall_text(query, live_sid, self._read_live_context(live_sid))
 
     def _recall_text(self, query: str, live_sid: str, live: LiveContext | None, profile: str = "",
                      profile_stats: dict[str, int] | None = None, *, situational: bool = False) -> str:
         """<neospike_recall>: the top RECALL_INJECT_LIMIT hits without builtin mirrors, then without what is
         in the live context or in this prefetch's profile block (not refilled), rendered as before.
         A degraded lane is logged only. situational (prefetch): the <neospike_situation> block goes first."""
-        results = self._fused_search(query, limit=RECALL_INJECT_LIMIT, history=HISTORY_COLLAPSE, live=live,
-                                     skip_builtin=True)
+        results = self._fused_search(query, limit=RECALL_INJECT_LIMIT, history=HISTORY_COLLAPSE, skip_builtin=True)
         situation, situation_stats = self._situation_block(query, live_sid) if situational else ("", None)
         kept, in_context = self._split_in_context(results, live, profile)
         text, shown, skipped = self._layout_recall([_as_result(item) for item in kept])
@@ -774,9 +753,8 @@ class NeospikeProvider(HermesMemoryProvider):
             self._turn_log.failure(self._trace_key(session_id), f"Recall log not written: {type(exc).__name__}",
                                 attempted_write=False)
 
-    def _read_live_context(self, session_id: str, *, messages: bool = False) -> LiveContext | None:
-        """Seen and cut of the conversation from Hermes' state.db (read only, two queries; messages: a third,
-        the active rows, only where the conversation lane runs); None (no in-context rule applies)
+    def _read_live_context(self, session_id: str) -> LiveContext | None:
+        """Seen and cut of the conversation from Hermes' state.db (read only, two queries); None (no in-context rule applies)
         without a conversation id, without state.db or when it cannot be read."""
         if not session_id or not self._home_root:
             return None
@@ -789,7 +767,6 @@ class NeospikeProvider(HermesMemoryProvider):
             try:
                 rows = connection.execute(_SEEN_SQL, (session_id,)).fetchall()
                 cut = connection.execute(_CUT_SQL, (session_id,)).fetchone()[0]
-                active = connection.execute(_ACTIVE_SQL, (session_id,)).fetchall() if messages else None
             finally:
                 connection.close()
             cut = 0.0 if cut is None else float(cut)
@@ -798,8 +775,7 @@ class NeospikeProvider(HermesMemoryProvider):
                                    attempted_write=False)
             return None
         parts = [injected_part(content, api) for content, api in rows if isinstance(api, str)]
-        return LiveContext(session_id, "\n" + "\n".join(parts) + "\n", cut,
-                           None if active is None else conversation_family.live_messages(active))
+        return LiveContext(session_id, "\n" + "\n".join(parts) + "\n", cut)
 
     def _made_here_after_cut(self, hits: list[dict[str, Any]], live: LiveContext) -> set[tuple[str, int]]:
         """("memory", id) of hits saved by this conversation (origin agent:<id>) after the cut, ("note", id) of
@@ -925,7 +901,7 @@ class NeospikeProvider(HermesMemoryProvider):
         """Start a new size-limited trace. The user message stays in memory only, masked and clipped, until
         the next turn: it is the evidence for a supersede made during this turn."""
         with self._guard:
-            masked = conversation_family.mask_text(user_message.strip())[0] if isinstance(user_message, str) else ""
+            masked = mask_text(user_message.strip())[0] if isinstance(user_message, str) else ""
             owner = kwargs.get("session_id") or self._sid_var.get() or self._active_sid
             self._turn_proof = (str(owner or ""), masked[:EVIDENCE_CHAR_LIMIT])
             self._refresh_debug_flag()
@@ -1034,15 +1010,6 @@ class NeospikeProvider(HermesMemoryProvider):
         out.append("</neospike_recall>")
         return "\n".join(out), shown, skipped
 
-    def _begin_capture(self) -> None:
-        """Conversation family: primary agent only; leftovers are indexed at start."""
-        if not self._settings.conversation_capture or not self._can_write or not self._memory_db:
-            return
-        self._talk_store = conversation_family.ConversationStore(self._memory_db)
-        self._talk_indexer = conversation_family.ConversationIndexer(self._memory_db, self._vectorizer)
-        self._talk_indexer.start()
-        self._talk_indexer.notify()
-
     def _begin_follow_up(self) -> None:
         """The save follow-up thread (primary agent only)."""
         if not self._can_write or not self._memory_db or self._follow_up is not None:
@@ -1065,10 +1032,9 @@ class NeospikeProvider(HermesMemoryProvider):
 
     def sync_turn(self, user_text: str, assistant_text: str, *, session_id: str = "",
                   messages: list[dict[str, Any]] | None = None) -> None:
-        """Store the user/assistant turn in the conversation family (a single short masked INSERT), then wake
-        the save follow-up when the turn saved or changed a memory.
+        """Wake the save follow-up when the turn saved or changed a memory (the turn itself is not stored here).
 
-        Chunking, embedding, absorbing and topic joining happen on background threads, off the turn path.
+        Absorbing and topic joining happen on a background thread, off the turn path.
         """
         live_sid = session_id or self._sid_var.get() or self._active_sid
         if self._paused():
@@ -1076,32 +1042,12 @@ class NeospikeProvider(HermesMemoryProvider):
                 self._saved_in_turn.discard(live_sid)
             return
         self._follow_up_turn(live_sid)
-        conversations = self._talk_store
-        if conversations is None:
-            return
-        try:
-            stored = conversations.append(live_sid, (("user", user_text), ("assistant", assistant_text)))
-        except sqlite3.Error as exc:
-            self._turn_log.failure(self._trace_key(live_sid), f"Conversation not stored: {type(exc).__name__}")
-            return
-        if stored and self._talk_indexer is not None:
-            self._talk_indexer.notify()
-
-    def _close_capture(self, session_id: str) -> None:
-        if self._talk_store is None or not session_id:
-            return
-        try:
-            self._talk_store.end_session(session_id)
-        except sqlite3.Error as exc:
-            self._turn_log.failure(self._trace_key(session_id), f"Conversation end not recorded: {type(exc).__name__}",
-                                attempted_write=False)
 
     def on_pre_compress(self, transcript: list[dict[str, Any]], **kwargs: Any) -> None:
         return None
 
     def on_session_end(self, transcript: list[dict[str, Any]], **kwargs: Any) -> None:
         self._forget_reconcile_allowed(self._sid_var.get() or self._active_sid)
-        self._close_capture(self._sid_var.get() or self._active_sid)
         self.drop_turn_trace(self._active_sid)
 
     def on_session_switch(self, next_session_id: str, **kwargs: Any) -> None:
@@ -1112,7 +1058,6 @@ class NeospikeProvider(HermesMemoryProvider):
                 self._inherit_known_criteria(previous, next_session_id)
             if moved:
                 self._forget_reconcile_allowed(previous)
-                self._close_capture(previous)
             self.drop_turn_trace(previous)
             self._active_sid = next_session_id
             self._sid_var.set(next_session_id)
@@ -1618,13 +1563,13 @@ class NeospikeProvider(HermesMemoryProvider):
         if not isinstance(with_history, bool):
             raise ValueError("include_history must be a boolean")
         history = HISTORY_SHOW if with_history else HISTORY_OMIT
-        live = self._read_live_context(session_id, messages=True)
+        live = self._read_live_context(session_id)
         hits = self._fused_search(str(args.get("query") or ""), limit=max(1, min(20, int(args.get("limit", 5)))),
-                                  conversations=False, history=history, live=live)
+                                  history=history)
         # The same in-context rules as the prefetch (builtin mirrors stay); omitted_in_context counts what they left out.
         kept, in_context = self._split_in_context(hits, live)
         return json.dumps({"results": kept, "warnings": self._search_notes,
-                           "omitted_in_context": len(in_context) + self._chat_omitted}, ensure_ascii=False)
+                           "omitted_in_context": len(in_context)}, ensure_ascii=False)
 
     def _tool_forget(self, tool_name: str, args: dict[str, Any], session_id: str, key: str) -> str:
         refusal = self._refuse_write(key, "delete")
@@ -1985,41 +1930,21 @@ class NeospikeProvider(HermesMemoryProvider):
         # A replacement service with the old signature: every note in the note lane, none in the memory lane.
         return [] if formula else search_notes(query, limit=limit)
 
-    def _chat_lane(self, query, *, limit=5, live: LiveContext | None = None):
-        """live: the live conversation's excerpts still in the context are left out before the limit."""
-        if not query.strip() or not self._memory_db or not self._core:
-            return []
-        with self._memory_db._lock:
-            if not conversation_family.has_searchable(self._memory_db._conn):
-                return []
-        hits = conversation_family.search(self._memory_db, query, self._core._embed_query_cached(query), limit=limit,
-                                          live_session=live.session_id if live else "",
-                                          live=live.messages if live else None)
-        self._chat_omitted = int(getattr(hits, "omitted", 0))
-        return hits
-
-    def _fused_search(self, query, *, limit=5, conversations=None, history=HISTORY_COLLAPSE,
-                      live: LiveContext | None = None, skip_builtin=False):
-        """RRF over the lanes. conversations=None follows conversation_prefetch (the prefetch path).
+    def _fused_search(self, query, *, limit=5, history=HISTORY_COLLAPSE, skip_builtin=False):
+        """RRF over the memory and note lanes.
         history: treatment of superseded memories (store.HISTORY_*); the default is the prefetch one.
-        live: the conversation lane leaves out excerpts still in that context; skip_builtin: builtin mirror rows are left out."""
+        skip_builtin: builtin mirror rows are left out."""
         self._search_notes = []
         self._failed_lanes = []
         self._lane_causes = {}
         self._replaced_hits = []
-        self._chat_omitted = 0
         branches = []
-        retrievers = {'text': self._memory_lane, 'note': self._note_lane,
-                      'conversation': self._chat_lane}
-        include_conversations = self._settings.conversation_prefetch if conversations is None else conversations
-        lanes = (*_FUSION_LANES, _CHAT_LANE) if include_conversations else _FUSION_LANES
-        # Branch order breaks RRF ties: memory, notes, then conversations.
-        for name, lane in lanes:
+        retrievers = {'text': self._memory_lane, 'note': self._note_lane}
+        # Branch order breaks RRF ties: memory, then notes.
+        for name, lane in _FUSION_LANES:
             try:
                 if name == 'text':
                     branches.append(self._memory_lane(query, limit=limit, history=history, skip_builtin=skip_builtin))
-                elif name == 'conversation':
-                    branches.append(self._chat_lane(query, limit=limit, live=live))
                 else:
                     branches.append(retrievers[name](query, limit=limit))
             except (ValueError, OSError, RuntimeError, _DB_ERROR) as exc:
@@ -2039,14 +1964,10 @@ class NeospikeProvider(HermesMemoryProvider):
         return []
 
     def shutdown(self):
-        if self._talk_indexer is not None:
-            self._talk_indexer.stop()
-            self._talk_indexer = None
         if self._follow_up is not None:
             self._follow_up.stop()
             self._follow_up = None
         self._saved_in_turn.clear()
-        self._talk_store = None
         self._turn_log = TurnTraceLog()
         self._trace_owner_ns.clear()
         if self._memory_db:

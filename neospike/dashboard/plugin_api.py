@@ -38,12 +38,13 @@ from neospike import runtime_check  # stdlib only; its checks run in the Hermes 
 from neospike.notes import (
     NoteError, head_row, list_notes, note_history, note_record, note_related, note_titles,
 )
-from neospike import conversations as conversation_family
+from neospike import chat_view
+from neospike.chat_history import ChatHistoryError
 from neospike import folders as folder_family
 from neospike import md_export
 from neospike import preferences as pref_rows  # stdlib only (numpy-free)
 from neospike.sphere_map import TOPIC_LANE, topic_key  # numpy-free at import (topic points)
-from neospike.store import (ITEM_MEMORY, NOTE_AUTHOR_NAMES, NOTE_HEAD_SQL, CONVERSATION_TABLE_NAMES, RELATION_NEXT,
+from neospike.store import (ITEM_MEMORY, NOTE_AUTHOR_NAMES, NOTE_HEAD_SQL, RELATION_NEXT,
                              RELATION_REFERS, RELATION_SUPERSEDES, RELATION_TOPIC, SQLITE_BUSY_TIMEOUT_SECONDS,
                              build_fts_match, memory_metadata, note_head_sql, topic_handles, topic_name_of)
 
@@ -282,7 +283,7 @@ def models_route(request: ModelsBody):
 
 def _overlay_config(path: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """The form fields over the existing config.json, so keys the form does not show (map_recent_days,
-    map_stale_days, recall log, conversation capture) survive a dashboard save."""
+    map_stale_days, recall log) survive a dashboard save."""
     merged = {**_read_json_dict(path), **payload}
     merged.pop("embedding_dimensions", None)  # fixed in code; an old key is dropped on save
     for key in (*OLD_CONFIG_KEYS, *REMOVED_CONFIG_KEYS):  # v21 and removed keys go on the next save
@@ -889,35 +890,40 @@ def note_restore_route(note_id: int, request: NoteRestoreBody):
     return _note_reply(*_cli_call(arguments), note_id)
 
 
-# ---- Conversations: read-only. Search needs a query embedding, so it runs the CLI. ----
+# ---- Conversations: read-only views of the Hermes chat database (state.db), shown as stored. ----
+
+_CHAT_HTTP_CODES = {"not_found": 404, "invalid": 422, "unavailable": 503}
+
+
+def _chat_view_fault(exc: ChatHistoryError) -> HTTPException:
+    detail = "Conversation not found" if exc.code == "not_found" else exc.message
+    return HTTPException(_CHAT_HTTP_CODES.get(exc.code, 503), detail)
+
 
 @router.get("/conversations")
 def convs_list_route():
-    with _RoConnection() as connection:
-        if not _tables_exist(connection, *CONVERSATION_TABLE_NAMES):
-            return {"conversations": []}
-        return {"conversations": conversation_family.list_conversations(connection)}
+    try:
+        return {"conversations": chat_view.list_sessions(_home_dir_path())}
+    except ChatHistoryError as exc:
+        raise _chat_view_fault(exc) from None
 
 
 @router.get("/conversations/search")
 def convs_search_route(q: str = ""):
     if not q.strip():
         return {"results": []}
-    code, result = _cli_call(["conv-search", q, "--limit", str(CONV_SEARCH_CAP)])
-    if code:
-        raise HTTPException(422, result.get("message", "Search failed"))
-    return {"results": result.get("results", [])}
+    try:
+        return {"results": chat_view.search_sessions(_home_dir_path(), q, CONV_SEARCH_CAP)}
+    except ChatHistoryError as exc:
+        raise _chat_view_fault(exc) from None
 
 
-@router.get("/conversations/{conversation_id}")
-def conv_get_route(conversation_id: int):
-    with _RoConnection() as connection:
-        if not _tables_exist(connection, *CONVERSATION_TABLE_NAMES):
-            raise HTTPException(404, "Conversation not found")
-        try:
-            return conversation_family.conversation_record(connection, conversation_id)
-        except conversation_family.ConversationError as exc:
-            raise HTTPException(404, "Conversation not found") from exc
+@router.get("/conversations/{session_id}")
+def conv_get_route(session_id: str):
+    try:
+        return chat_view.session_record(_home_dir_path(), session_id)
+    except ChatHistoryError as exc:
+        raise _chat_view_fault(exc) from None
 
 
 def _memory_row_dict(row: sqlite3.Row) -> dict[str, Any]:

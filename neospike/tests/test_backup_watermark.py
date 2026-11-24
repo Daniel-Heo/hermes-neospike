@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from neospike import backup as db_backup
-from neospike import conversations as conv
 from neospike import folders as folder_family
 from neospike.notes import NoteService
 from neospike.store import MemoryStore
@@ -23,7 +22,8 @@ from neospike.tests.test_notes import DIMENSIONS, BowEmbedder
 BASE = datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp()
 SKEW_SECONDS = 0.002  # a write after the lock can stamp ~2 ms before the backup's own clock read
 INSIDE_LAG_SECONDS = 0.5  # < BOUNDARY_LAG_SECONDS before the last backup moment
-MESSAGES = "conversation_messages"
+# The timestamp table the watermark tests write: memory rows of items (store.py triggers keep updated_at).
+MESSAGES = "items"
 NAMESPACE = "owner"
 NOTE_BODY = "# Tides\nThe moon pulls the sea.\n\n# Springs\nSun and moon line up.\n\n# Neaps\nThey pull apart."
 NOTE_EDIT = "# Tides\nThe moon and sun pull the sea.\n\n# Springs\nNew and full moon.\n\n# Neaps\nQuarter moons."
@@ -67,7 +67,7 @@ def _set_message(store: MemoryStore, message_id: int, stamp: float, content: str
         if content is None:
             store._conn.execute(f"UPDATE {MESSAGES} SET updated_at=? WHERE id=?", (stamp, message_id))
         else:
-            store._conn.execute(f"UPDATE {MESSAGES} SET content=?, updated_at=? WHERE id=?",
+            store._conn.execute(f"UPDATE {MESSAGES} SET text=?, updated_at=? WHERE id=?",
                                 (content, stamp, message_id))
 
 
@@ -84,7 +84,7 @@ def _delete_message(store: MemoryStore, message_id: int, stamp: float) -> dict:
 
 def _recreate_message(store: MemoryStore, row: dict, stamp: float, content: str) -> None:
     """Insert a message again under its old id with new content, stamped *stamp*."""
-    values = {**row, "content": content}
+    values = {**row, "text": content}
     names = list(values)
     with store._lock, store._conn:
         store._conn.execute(f"INSERT INTO {MESSAGES}({','.join(names)}) VALUES ({','.join('?' * len(names))})",
@@ -132,9 +132,9 @@ def _restore(directory: Path, target: Path) -> dict[str, list[tuple]]:
 
 
 def _three_messages(store: MemoryStore) -> list[int]:
-    conv.ConversationStore(store).append("s1", [("user", "Where do tides come from?"),
-                                                ("assistant", "The moon pulls the sea."),
-                                                ("user", "Why are spring tides larger?")])
+    """Three memory rows (the rows the watermark tests edit, delete and recreate)."""
+    for seed, text in enumerate(("Tides come from the moon.", "The moon pulls the sea.", "Spring tides are larger.")):
+        store.insert(NAMESPACE, text, _vector(seed), source="agent:s1")
     return _message_ids(store)
 
 

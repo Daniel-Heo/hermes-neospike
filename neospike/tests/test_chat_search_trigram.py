@@ -9,10 +9,8 @@ from pathlib import Path
 import pytest
 
 from neospike import chat_history
-from neospike import conversations as conv
 from neospike.config import NeospikeConfig
 from neospike.mcp_server import NeospikeTools, ToolError
-from neospike.tests.test_conversations import IDLE_SECONDS, _provider
 
 NS = "trigram-test"
 SESSION_A = "20261122_040000_aaaaaaaa"
@@ -170,16 +168,3 @@ def test_missing_trigram_index_is_an_error(tmp_path: Path) -> None:
     failure = _error(_tools(home), "인덱스")
     assert failure["error"] == "unavailable" and "messages_fts_trigram" in failure["message"]
 
-
-def test_memory_search_has_no_conversation_items(tmp_path: Path) -> None:
-    provider = _provider(tmp_path)
-    try:
-        provider.sync_turn("Where did I park the blue bicycle yesterday?",
-                           "You parked the blue bicycle beside the library fountain.")
-        assert provider._talk_indexer.wait_idle(IDLE_SECONDS)
-        query = "where did I park the blue bicycle beside the library fountain"
-        assert [item for item in provider._chat_lane(query, limit=8) if item.get("kind") == conv.KIND]
-        results = json.loads(provider.handle_tool_call("neospike_memory_search", {"query": query}))["results"]
-        assert [item for item in results if item.get("kind") == conv.KIND] == []
-    finally:
-        provider.shutdown()

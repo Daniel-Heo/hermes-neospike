@@ -12,13 +12,11 @@ from pathlib import Path
 
 import pytest
 
-from neospike import conversations as conv
 from neospike.config import NeospikeConfig, write_memory_rule
 from neospike.provider import (CRITERIA_CHANGED_NOTICE, PROFILE_CLOSE, PROFILE_HEADER, PROFILE_INFERRED, PROFILE_OPEN,
                                PROFILE_STATED, NeospikeProvider, ProfileTuning, injected_part)
 from neospike.preferences import BASIS_AGENT_INFERRED, PREF_TYPES
 from neospike.recall_log import REASON_IN_CONTEXT, REASON_SOURCE_CAP
-from neospike.store import HISTORY_OMIT
 
 SID = "20261118_live"
 OTHER_SID = "20261101_other"
@@ -50,18 +48,6 @@ class KeywordEmbedder:
         axes.append(0.0 if any(axes) else 1.0)
         norm = sum(axes) ** 0.5
         return [value / norm for value in axes]
-
-
-class WordCounter:
-    """One token per whitespace word (no tokenizer.json needed)."""
-
-    @staticmethod
-    def count(text: str) -> int:
-        return len(text.split())
-
-    @staticmethod
-    def cut(text: str, max_tokens: int) -> list[str]:
-        return []
 
 
 def broken_lane(*_args, **_kwargs) -> list:
@@ -102,7 +88,7 @@ def compact(home: Path, at: float) -> None:
 
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
-    NeospikeConfig(conversation_capture=False).save(tmp_path)
+    NeospikeConfig().save(tmp_path)
     return tmp_path
 
 
@@ -156,15 +142,6 @@ def pref_line(pref_id: int, text: str, pref_type: str = "preference") -> str:
 
 def search(provider: NeospikeProvider, query: str, limit: int = 5) -> dict:
     return json.loads(provider.handle_tool_call("neospike_memory_search", {"query": query, "limit": limit}))
-
-
-def conversation_search(provider: NeospikeProvider, query: str, limit: int = 5) -> dict:
-    """The search tool's in-context rules over the lanes with the conversation lane on (the tool itself leaves the
-    conversation lane out; the prefetch runs it when conversation_prefetch is on)."""
-    live = provider._read_live_context(SID, messages=True)
-    hits = provider._fused_search(query, limit=limit, conversations=True, history=HISTORY_OMIT, live=live)
-    kept, in_context = provider._split_in_context(hits, live)
-    return {"results": kept, "omitted_in_context": len(in_context) + provider._chat_omitted}
 
 
 def log_entries(home: Path) -> list[dict]:
@@ -252,102 +229,6 @@ def test_memories_saved_here_after_the_cut_are_left_out(home, provider):
     assert before_line in recall and "rust nightly" not in recall
     found = search(provider, "rust?")
     assert [hit["text"] for hit in found["results"]] == [before] and found["omitted_in_context"] == 1
-
-
-# 7. search tool: this conversation's excerpts still in the context (every message in an active state.db row) ----
-def _conversation(provider: NeospikeProvider, session_id: str, times: list[float], *,
-                  words: int = LONG_WORDS) -> list[tuple[str, str]]:
-    """Messages alternating bicycle / filler, each with its own tag word; the bicycle ones are at seq 1, 3, 5 ...
-    with the given created_at times (neospike's capture time). Returns the (role, content) turns in seq order."""
-    turns, stamps = [], []
-    for index, stamp in enumerate(times):
-        turns += [("user" if index % 2 == 0 else "assistant", " ".join(["bicycle"] * words) + f" m{index}a"),
-                  ("assistant" if index % 2 == 0 else "user", " ".join(["filler"] * words) + f" m{index}b")]
-        stamps += [stamp, stamp]
-    store = provider._memory_db
-    conv.ConversationStore(store).append(session_id, turns)
-    with store._lock, store._conn:
-        conversation_id = store._conn.execute("SELECT id FROM conversations WHERE session_id=?",
-                                              (session_id,)).fetchone()[0]
-        store._conn.executemany("UPDATE conversation_messages SET created_at=? WHERE conversation_id=? AND seq=?",
-                                [(stamp, conversation_id, seq) for seq, stamp in enumerate(stamps, 1)])
-    conv.ConversationIndexer(store, KeywordEmbedder(), token_counter=WordCounter(), max_tokens=120,
-                             context_tokens=0).index_pending()
-    return turns
-
-
-def to_state(home: Path, turns: list[tuple[str, str]], seqs: range, *, active: int, compacted: int,
-             timestamp: float) -> None:
-    """state.db rows of the messages at seqs (1-based), as Hermes keeps them."""
-    for seq in seqs:
-        role, content = turns[seq - 1]
-        add_row(home, content, None, role=role, active=active, compacted=compacted, timestamp=timestamp)
-
-
-def test_search_leaves_out_live_excerpts_and_counts_them(home, provider):
-    make_state(home)
-    now = time.time()
-    cut = now - CUT_AGO_S
-    turns = _conversation(provider, SID, [cut - 500, cut + 300, now])
-    to_state(home, turns, range(1, 3), active=0, compacted=1, timestamp=cut)  # seq 1-2 summarized
-    to_state(home, turns, range(3, 7), active=1, compacted=0, timestamp=now)  # seq 3-6 still in context
-    _conversation(provider, OTHER_SID, [now - 9000, now - 8000, now - 7000])
-    wide = conversation_search(provider, "bicycle", limit=4)
-    origins = {(hit["session_id"], hit["seq_start"]) for hit in wide["results"]}
-    assert origins == {(SID, 1), (OTHER_SID, 1), (OTHER_SID, 3), (OTHER_SID, 5)}
-    assert wide["omitted_in_context"] == 2
-    narrow = conversation_search(provider, "bicycle", limit=3)
-    assert len(narrow["results"]) == 3 and narrow["omitted_in_context"] == 2
-    assert all(hit["session_id"] != SID or hit["seq_start"] == 1 for hit in narrow["results"])
-    others = conversation_search(provider, "bicycle", limit=2)
-    assert len(others["results"]) == 2
-
-
-def test_excerpt_with_one_summarized_message_is_found(home, provider):
-    """A chunk over several messages: one of them only in a compacted row (no active copy) keeps the chunk."""
-    make_state(home)
-    now = time.time()
-    turns = _conversation(provider, SID, [now, now], words=8)
-    chunk = [tuple(row) for row in provider._memory_db._conn.execute(
-        "SELECT seq_start, seq_end FROM conversation_chunks ch JOIN conversations c ON c.id=ch.conversation_id "
-        "WHERE c.session_id=? AND seq_start>0", (SID,))]
-    assert chunk == [(1, 4)]  # one chunk over all four messages
-    to_state(home, turns, range(1, 2), active=0, compacted=1, timestamp=now - CUT_AGO_S)
-    to_state(home, turns, range(2, 5), active=1, compacted=0, timestamp=now)
-    found = conversation_search(provider, "bicycle")
-    assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 1)]
-    assert found["omitted_in_context"] == 0
-    to_state(home, turns, range(1, 2), active=1, compacted=0, timestamp=now)  # now every message is resent
-    found = conversation_search(provider, "bicycle")
-    assert found["results"] == [] and found["omitted_in_context"] == 1
-
-
-def test_active_copy_next_to_compacted_original_leaves_the_excerpt_out(home, provider):
-    make_state(home)
-    now = time.time()
-    cut = now - CUT_AGO_S
-    turns = _conversation(provider, SID, [cut - 500, cut - 400])
-    to_state(home, turns, range(1, 5), active=0, compacted=1, timestamp=cut)
-    to_state(home, turns, range(1, 3), active=1, compacted=0, timestamp=cut)  # compaction kept seq 1-2 as copies
-    found = conversation_search(provider, "bicycle")
-    assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 3)]
-    assert found["omitted_in_context"] == 1
-
-
-def test_late_capture_time_does_not_decide(home, provider):
-    """created_at well past the state.db time (a turn longer than 120 s): judged by content only."""
-    make_state(home)
-    now = time.time()
-    cut = now - CUT_AGO_S
-    late = cut + 300  # past cut + the former 120 s margin
-    turns = _conversation(provider, SID, [late, late, late])
-    to_state(home, turns, range(1, 3), active=0, compacted=1, timestamp=cut)  # summarized: found
-    to_state(home, turns, range(3, 5), active=0, compacted=1, timestamp=cut)
-    to_state(home, turns, range(3, 5), active=1, compacted=0, timestamp=cut)  # active copies: left out
-    to_state(home, turns, range(5, 7), active=1, compacted=0, timestamp=now)  # live: left out
-    found = conversation_search(provider, "bicycle")
-    assert [(hit["session_id"], hit["seq_start"]) for hit in found["results"]] == [(SID, 1)]
-    assert found["omitted_in_context"] == 2
 
 
 # 8. builtin mirrors: not in the prefetch (the next rank fills the slot), found by the search tool --------------

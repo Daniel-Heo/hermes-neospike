@@ -4,8 +4,8 @@ The store refuses a database whose meta embedding dimension/model differ from th
 EMBEDDING_MODEL). This command opens it without that check, re-embeds each table in id order and commits every
 BATCH_ROWS rows together with the table's progress (meta key PROGRESS_PREFIX + table = last id done), so a stopped
 run continues where it left off. Only when every table is done are meta embedding_dimensions/embedding_model
-updated and the progress keys removed. Rows without a vector (embedding-pending memories, unindexed conversation
-chunks) are left to their own fill stages. Row timestamps (updated_at, accessed_at) are kept as they were.
+updated and the progress keys removed. Rows without a vector (embedding-pending memories) are left to their own
+fill stage. Row timestamps (updated_at, accessed_at) are kept as they were.
 The database backup is the operator's job; this command makes none.
 """
 from __future__ import annotations
@@ -47,7 +47,6 @@ class _Table:
 MEMORY_TABLES = (
     # A document part is embedded without its outer whitespace (notes.part_embed_text); memory text has none.
     _Table("items", "embedding", "trim(text, char(32,9,10,13,12,11))", "length(embedding)>0"),
-    _Table("conversation_chunks", "embedding", "text", "embedding IS NOT NULL AND length(embedding)>0"),
     # v23 preferences: the text vector and the situation vector (common rows have none).
     _Table("preferences", "embedding", "text", "length(embedding)>0"),
     _Table("preferences", "situation_embedding", "situation", "length(situation_embedding)>0",

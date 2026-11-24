@@ -119,7 +119,7 @@ def test_existing_database_gains_the_indexes_on_open(tmp_path: Path) -> None:
         for name in (VECTOR_INDEX, PENDING_INDEX):
             connection.execute(f"DROP INDEX {name}")
         connection.commit()
-        assert connection.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0] == "23"
+        assert connection.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0] == "24"
         assert not connection.execute("SELECT name FROM sqlite_master WHERE type='index' AND name IN (?,?)",
                                       (VECTOR_INDEX, PENDING_INDEX)).fetchall()
     finally:

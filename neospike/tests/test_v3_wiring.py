@@ -17,7 +17,7 @@ from neospike.tests.test_live_context import (SID, add_row, deliver, home, make_
                                               remember)
 
 CRON_SCRIPT = Path(__file__).resolve().parents[1] / "cron" / "neospike_daily.py"
-DAILY_STAGES = ["backup", "link-prune", "conv-import", "conv-index", "embed-pending",
+DAILY_STAGES = ["backup", "link-prune", "embed-pending",
                 "topic-discover",
                 "topic-to-note"]
 GONE_COMMANDS = ("pattern-ingest", "pattern-tastes", "pattern-predict", "pattern-compare", "pattern-research")

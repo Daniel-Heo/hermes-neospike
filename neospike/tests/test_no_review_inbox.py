@@ -65,7 +65,7 @@ def test_migration_drops_the_three_tables_and_keeps_other_rows(tmp_path: Path) -
         assert not _tables(connection) & set(GONE_TABLES)
         after = _row_counts(connection, _tables(connection))
         version = connection.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0]
-    assert SCHEMA_VERSION == 23 and version == "23"  # v23 (the preferences table) is the current schema
+    assert SCHEMA_VERSION == 24 and version == "24"  # v24 (no conversation copy) is the current schema
     # Only the tombstones of the dropped tables go (their rows can never be restored again).
     assert after == {**before, "tombstones": before["tombstones"] - gone_tombstones}
     assert before["items"] == 1

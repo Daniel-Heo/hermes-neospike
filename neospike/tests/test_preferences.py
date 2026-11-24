@@ -100,8 +100,8 @@ def test_v22_preferences_move_to_their_table(tmp_path: Path) -> None:
                                     (common,)).fetchone()
         assert bytes(moved[0]) and not bytes(moved[1])  # text vector kept, situation vector left to embed-pending
         assert store._conn.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0] \
-            == str(SCHEMA_VERSION) == "23"
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 23
+            == str(SCHEMA_VERSION) == "24"  # v22 -> v23 -> v24 in one open
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 24
         store._conn.execute("INSERT INTO items_fts(items_fts) VALUES ('integrity-check')")
     finally:
         store.close()
@@ -112,7 +112,7 @@ def test_newer_database_is_not_opened_for_writing(tmp_path: Path) -> None:
     path = tmp_path / "memory.db"
     MemoryStore(path, dimensions=KeywordEmbedder.dimensions).close()
     with closing(sqlite3.connect(path)) as connection:
-        connection.execute("PRAGMA user_version=24")
+        connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
     with pytest.raises(Exception, match="newer"):
         MemoryStore(path, dimensions=KeywordEmbedder.dimensions)
 
@@ -548,10 +548,10 @@ def test_write_open_drops_the_origin_column_and_keeps_rows(tmp_path: Path) -> No
         columns, after = _rows_without_origin(path)
         assert "origin" not in columns and after == rows and len(after) == 2
     with closing(sqlite3.connect(path)) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 23
-        assert connection.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0] == "23"
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 24
+        assert connection.execute("SELECT value FROM meta_entries WHERE key='schema_version'").fetchone()[0] == "24"
         assert prefs.drop_origin_column(connection) is False
-    assert not (tmp_path / "memory.pre-v24.db").exists()
+    assert not (tmp_path / f"memory.pre-v{SCHEMA_VERSION + 1}.db").exists()
     store = MemoryStore(path, dimensions=KeywordEmbedder.dimensions)
     try:
         fields = prefs.clean_fields({"type": "preference", "text": "Use metric units.", "situation": ""})

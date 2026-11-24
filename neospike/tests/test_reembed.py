@@ -12,7 +12,6 @@ import pytest
 
 from neospike import backup as db_backup
 from neospike import cli
-from neospike import conversations as conv
 from neospike.config import EMBEDDING_DIMENSIONS, EMBEDDING_MODEL
 from neospike.reembed import DERIVED_TABLES, PROGRESS_PREFIX, TARGET_KEY, reembed
 from neospike.service import NeospikeService
@@ -21,7 +20,7 @@ from neospike.store import MemoryStore, read_embedding_meta
 OLD_DIMENSIONS = 512
 FLOAT_BYTES = 4
 NAMESPACE = "test:reembed"
-VECTOR_TABLES = ("items", "conversation_chunks")
+VECTOR_TABLES = ("items",)
 BATCH = 2
 
 
@@ -66,10 +65,6 @@ def _old_home(tmp_path: Path) -> Path:
             fact = f"Fact number {index} about the lighthouse keeper."
             store.add(NAMESPACE, fact, old.embed_document(fact), source=f"test:{index}")
         service.save_note("Lighthouse", "# Lighthouse\n\nForty meters tall.\n\n# Keeper\n\nLives nearby.", author="human")
-        conversations = conv.ConversationStore(store)
-        conversations.append("ended", [("user", "How tall is the lighthouse?"), ("assistant", "About forty meters.")])
-        conversations.end_session("ended")
-        conv.ConversationIndexer(store, old).index_pending()
         with store._conn:
             # One embedding-pending memory: left for embed-pending, never re-embedded here.
             store._conn.execute("UPDATE items SET embedding=x'' WHERE id=(SELECT MAX(id) FROM items WHERE type='memory')")
@@ -179,7 +174,7 @@ def test_cli_reembed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: py
 # A new vector is not a user-visible change. Every column but the vector (updated_at, accessed_at,
 # access_count, ...) stays as it was, so incremental backups, topic-assign, folder brightness and 'Recent only'
 # do not see every row as just changed.
-NON_VECTOR_TABLES = VECTOR_TABLES + ("conversations", "conversation_messages")
+NON_VECTOR_TABLES = VECTOR_TABLES
 
 
 def _non_vector_columns(path: Path) -> dict[str, list[tuple]]:
@@ -196,10 +191,8 @@ def test_reembed_keeps_row_timestamps(tmp_path: Path) -> None:
     with closing(sqlite3.connect(_database(home))) as connection, connection:
         # Distinct past values (the triggers would put "now" there): a read hit and an old update time.
         connection.execute("UPDATE items SET accessed_at=1000.5+id, access_count=3, updated_at=2000.25+id")
-        connection.execute("UPDATE conversation_chunks SET updated_at=3000.125+id")
-        connection.execute("UPDATE conversation_chunks SET updated_at=0 WHERE id=(SELECT MIN(id) FROM conversation_chunks)")
     before = _non_vector_columns(_database(home))
-    assert before["items"] and before["conversation_chunks"]
+    assert before["items"]
     store = _open_unchecked(home)
     try:
         assert reembed(store, AxisEmbedder(), batch_rows=BATCH, log=_quiet)["complete"] is True

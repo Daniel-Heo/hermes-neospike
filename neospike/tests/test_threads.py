@@ -8,7 +8,6 @@ import types
 import pytest
 
 from neospike import threads
-from neospike.conversations import ConversationIndexer
 from neospike.topics import SaveFollowUp
 
 
@@ -55,7 +54,6 @@ def test_falls_back_to_a_plain_daemon_thread_without_it(monkeypatch):
 
 
 @pytest.mark.parametrize(("owner", "name"), [
-    (ConversationIndexer, "neospike-conversation-indexer"),
     (SaveFollowUp, "neospike-save-follow-up"),
 ])
 def test_provider_workers_start_through_spawn_context_thread(monkeypatch, owner, name):

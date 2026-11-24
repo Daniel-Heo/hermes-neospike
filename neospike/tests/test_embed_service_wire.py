@@ -17,6 +17,7 @@ from neospike.tests.support_embed_service import (
     profile_root,
     spawn_service,
     stop_daemon_of,
+    wait_model_loaded,
 )
 
 from neospike._wincompat import connect_socket
@@ -238,6 +239,7 @@ def test_service_process_is_a_singleton_and_exits_cleanly_on_stop(svc_home):
     try:
         ready = read_line(process.stdout, 10)
         assert 'ready' in ready, process.stderr.read()
+        wait_model_loaded(process)  # a stop waits for a running model load; measure the stop alone
         pid = service_pid(process, ready)
         client = EmbeddingClient(svc_home)
         seen = set()
@@ -261,7 +263,7 @@ def test_service_process_is_a_singleton_and_exits_cleanly_on_stop(svc_home):
         assert ping_pid(client) == pid
     finally:
         stop_gracefully(process)
-        process.wait(timeout=30)
+        process.wait(timeout=10)
     assert process.returncode == 0
     assert not (cache_dir(svc_home) / 'i.sock').exists()
 

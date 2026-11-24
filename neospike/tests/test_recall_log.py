@@ -128,14 +128,14 @@ def test_record_deletes_files_older_than_retention_and_keeps_current(tmp_path):
 
 def test_entry_lists_fusion_overflow_with_reason_and_lane_ids():
     injected = [{'id': 4, 'kind': 'memory_item', 'score': 0.9}, {'id': 2, 'kind': 'note', 'score': 0.8}]
-    overflow = [{'id': 7, 'kind': 'conversation', 'score': 0.4}]
+    overflow = [{'id': 7, 'kind': 'durable', 'score': 0.4}]
     entry = build_entry(now=time.time(), session_id='s', query='q', injected=injected,
                         overflow=overflow, unavailable_lanes=['note'])
     assert entry['injected'] == [{'lane': 'memory', 'id': 4, 'score': 0.9, 'rank': 1},
                                  {'lane': 'note', 'id': 2, 'score': 0.8, 'rank': 2}]
-    assert entry['dropped'] == [{'lane': 'conversation', 'id': 7, 'score': 0.4, 'rank': 3, 'reason': REASON_FUSION_LIMIT}]
+    assert entry['dropped'] == [{'lane': 'memory', 'id': 7, 'score': 0.4, 'rank': 3, 'reason': REASON_FUSION_LIMIT}]
     assert entry['unavailable_lanes'] == ['note']
-    assert [item_ref(item) for item in injected + overflow] == ['mem:4', 'note:2', 'conv:7']
+    assert [item_ref(item) for item in injected + overflow] == ['mem:4', 'note:2', 'mem:7']
 
 
 def test_config_round_trip_and_validation(tmp_path):

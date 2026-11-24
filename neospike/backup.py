@@ -7,7 +7,7 @@
 
 Change detection per table:
 - timestamp tables (TIMESTAMP_COLUMNS): rows whose timestamp >= since. items (memories,
-  document heads and parts) and the conversation family get updated_at from store.py triggers; tombstones
+  document heads and parts) get updated_at from store.py triggers; tombstones
   record every delete (a document save deletes its old part rows and inserts new ones). Read bookkeeping
   (items accessed_at/access_count) is not a change signal: a search hit leaves updated_at alone, so a row
   whose only change is a read is not in the increment; its read values are backed up by the next full
@@ -80,10 +80,6 @@ TIMESTAMP_COLUMNS = {
     "items": "updated_at",
     "item_revisions": "edited_at",  # append-only
     "tombstones": "deleted_at",
-    # Conversation family: store.py triggers keep updated_at current.
-    "conversations": "updated_at",
-    "conversation_messages": "updated_at",
-    "conversation_chunks": "updated_at",
     # Folders: store.py triggers keep updated_at current.
     "folders": "updated_at",
     # Preferences/constraints (v23): edited in place; store.py triggers keep updated_at current.
@@ -95,11 +91,6 @@ CHILD_TABLES: dict[str, tuple[str, str]] = {}
 # Tombstone application in restore (key decoded from row_key). item_links/folder_items are hash-replaced.
 TOMBSTONE_DELETES = {
     "items": ("DELETE FROM items WHERE id=?",),
-    "conversations": ("DELETE FROM conversation_chunks WHERE conversation_id=?",
-                      "DELETE FROM conversation_messages WHERE conversation_id=?",
-                      "DELETE FROM conversations WHERE id=?"),
-    "conversation_messages": ("DELETE FROM conversation_messages WHERE id=?",),
-    "conversation_chunks": ("DELETE FROM conversation_chunks WHERE id=?",),
     "folders": ("DELETE FROM folder_items WHERE folder_id=?", "DELETE FROM folders WHERE id=?"),
     "preferences": ("DELETE FROM preferences WHERE id=?",),
 }

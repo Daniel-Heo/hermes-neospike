@@ -50,7 +50,7 @@ class _Tuning:
     NOTE_MEMBER_LIMIT = 10  # a topic with more live members than this becomes an automatic note
     ABSORB_COSINE = 0.8  # a live memory joins the automatic note whose closest chunk has cos >= this
     ABSORB_BLOCK_ROWS = 256  # memories scored per matrix product in note-absorb
-    FOLLOW_UP_JOIN_SECONDS = 5.0  # shutdown wait for the save follow-up thread (as the conversation indexer)
+    FOLLOW_UP_JOIN_SECONDS = 5.0  # shutdown wait for the save follow-up thread
 
 
 _NAME_WORD = re.compile(r"[^\W\d_][\w-]+", flags=re.UNICODE)

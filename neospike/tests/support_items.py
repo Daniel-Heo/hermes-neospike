@@ -71,3 +71,15 @@ def memory_count(connection: sqlite3.Connection) -> int:
 def note_count(connection: sqlite3.Connection, *, live: bool = False) -> int:
     alive = " AND deleted_at IS NULL" if live else ""
     return int(connection.execute(f"SELECT COUNT(*) FROM items WHERE {NOTE_HEAD_SQL}{alive}").fetchone()[0])
+
+
+class WordCounter:
+    """Deterministic token counter: one token per whitespace word (no tokenizer.json needed)."""
+
+    @staticmethod
+    def count(text: str) -> int:
+        return len(text.split())
+
+    @staticmethod
+    def cut(text: str, max_tokens: int) -> list[str]:
+        return []

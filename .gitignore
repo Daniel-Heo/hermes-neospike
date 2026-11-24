@@ -249,3 +249,4 @@ neospike/provider 2.py
 
 # Claude Code local settings and lock files of this checkout
 .claude/
+.serena/

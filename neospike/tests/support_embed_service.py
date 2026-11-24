@@ -14,7 +14,7 @@ from pathlib import Path
 from neospike import _wincompat as wc
 from neospike import hermes_runtime
 from neospike.inference import EmbeddingClient
-from neospike.tests.test_wincompat import HARD_KILL, wait_pid_exit
+from neospike.tests.test_wincompat import HARD_KILL, read_line, wait_pid_exit
 
 ON_WINDOWS = os.name == 'nt'
 SLEEPER_CODE = 'import time; time.sleep(60)'
@@ -167,6 +167,23 @@ def spawn_service(home: Path, *extra: str, **popen_kwargs) -> subprocess.Popen:
     argv = [sys.executable, '-m', 'neospike.inference', '--home', str(home), *extra]
     return subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             env=clean_env(), **popen_kwargs)
+
+
+# Upper bound for one bge-m3 load in a spawned service (a busy machine took over 10 s).
+MODEL_LOAD_SECONDS = 180
+
+
+def wait_model_loaded(process: subprocess.Popen, seconds: float = MODEL_LOAD_SECONDS) -> str:
+    """Read the service's stdout after its ready line up to the warm-up line, and return that line.
+    The service prints ready before it loads the model, and a stop waits for a running load, so a
+    test that stops the service measures the stop only after this line."""
+    deadline = time.monotonic() + seconds
+    while True:
+        line = read_line(process.stdout, max(0.1, deadline - time.monotonic()))
+        assert line, process.stderr.read()
+        assert 'warm_up_failed' not in line, line
+        if '"device"' in line:
+            return line
 
 
 def kill_and_wait(process: subprocess.Popen, seconds: float = 5) -> None:

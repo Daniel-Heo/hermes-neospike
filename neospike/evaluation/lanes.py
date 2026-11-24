@@ -5,10 +5,9 @@ Every lane calls the product search code on a snapshot home:
 - memory: mcp_server.search_memory_and_formula_readonly (the memory and automatic-note part lane of MCP mem_search,
   k = DEFAULT_RESULTS)
 - note: notes.search_note_parts with formula=False (the note and doc part lane of MCP mem_search, k = DEFAULT_RESULTS)
-- conv: NeospikeProvider._chat_lane (only when the home has conversation_prefetch on)
 
 Threshold None runs the product default untouched. A sweep threshold is applied where the product reads it at call
-time: MemoryStore.semantic_threshold (memory, note-chunk and conversation admission of prefetch) and the threshold
+time: MemoryStore.semantic_threshold (memory and note-chunk admission of prefetch) and the threshold
 arguments of the MCP functions. Every grid point is therefore the real path; only the query embedding is computed
 once (CachingEmbedder). The design's "collect at the lowest threshold, re-filter per grid point" is not used: the
 result rows expose the blended rank score, not the admission cosine (store.py search, SearchResult), and the
@@ -27,8 +26,8 @@ from ..recall_log import item_ref
 from ..store import DEFAULT_SEMANTIC_CUTOFF, memory_db_path
 from .core import Judged, judge
 
-LANE_PREFETCH, LANE_MEMORY, LANE_NOTE, LANE_CONVERSATION = "prefetch", "memory", "note", "conv"
-LANES = (LANE_PREFETCH, LANE_MEMORY, LANE_NOTE, LANE_CONVERSATION)
+LANE_PREFETCH, LANE_MEMORY, LANE_NOTE = "prefetch", "memory", "note"
+LANES = (LANE_PREFETCH, LANE_MEMORY, LANE_NOTE)
 DEFAULT_LANES = (LANE_PREFETCH, LANE_MEMORY, LANE_NOTE)
 DEFAULT_KEY = "default"  # report key of the untouched product threshold
 
@@ -137,9 +136,6 @@ class Session:
     def provider(self) -> Any:
         return self.evaluator.provider
 
-    def conversation_enabled(self) -> bool:
-        return bool(self.provider._settings.conversation_prefetch)
-
     def product_default(self, lane: str) -> float:
         from .. import mcp_server
         if lane == LANE_MEMORY:
@@ -152,8 +148,6 @@ class Session:
         """(refs, texts) of one lane, cut to its k, at threshold (None: the product default)."""
         if lane == LANE_PREFETCH:
             return self._with_store_threshold(threshold, _PrefetchCall(self, question))
-        if lane == LANE_CONVERSATION:
-            return self._with_store_threshold(threshold, _ConversationCall(self, question))
         from .. import mcp_server
         from ..notes import search_note_parts
         vector = self.embedder.embed_query(question.question)
@@ -196,16 +190,6 @@ class _PrefetchCall:
         return [item_ref(item) for item in results], _texts(results)
 
 
-class _ConversationCall:
-    def __init__(self, session: Session, question: Question) -> None:
-        self.session, self.question = session, question
-
-    def __call__(self) -> tuple[list[str], list[str]]:
-        from ..mcp_server import DEFAULT_RESULTS
-        hits = self.session.provider._chat_lane(self.question.question, limit=DEFAULT_RESULTS)
-        return [item_ref(item) for item in hits], _texts(hits)
-
-
 def threshold_key(threshold: float | None) -> str:
     if threshold is None:
         return DEFAULT_KEY
@@ -214,13 +198,9 @@ def threshold_key(threshold: float | None) -> str:
 
 def collect(session: Session, questions: Sequence[Question], lanes: Sequence[str],
             thresholds: Sequence[float | None]) -> dict[str, dict[str, list[Judged]]]:
-    """{lane: {threshold key: [Judged per question]}}. A conversation lane on a home without
-    conversation_prefetch is skipped with a warning (measured only when switched on)."""
+    """{lane: {threshold key: [Judged per question]}}."""
     output: dict[str, dict[str, list[Judged]]] = {}
     for lane in lanes:
-        if lane == LANE_CONVERSATION and not session.conversation_enabled():
-            session.warnings.append("conv lane skipped: conversation_prefetch is off in this home")
-            continue
         output[lane] = {}
         for threshold in thresholds:
             judged = []

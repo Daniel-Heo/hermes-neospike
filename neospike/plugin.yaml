@@ -1,5 +1,5 @@
 name: neospike
-version: 1.0.4
+version: 1.0.5
 description: "Private local hybrid text memory with profile isolation."
 requires_hermes: ">=0.23.3"
 # standalone: general discovery also loads it (plugins.enabled), giving register() ctx.llm for the

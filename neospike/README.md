@@ -27,7 +27,7 @@ The plugin does not ship the model. bge-m3 is MIT-licensed and not gated.
 ## What is stored
 
 - The agent stores a memory by calling `neospike_memory_save`. Entries written to the built-in Hermes memory files are mirrored into the database as well. Chat text is never turned into a memory automatically.
-- User and assistant turns are copied into the conversation store, with secrets masked, when `conversation_capture` is on (the default). They are searchable but stay out of automatic recall unless `conversation_prefetch` is on.
+- User and assistant turns are not copied into the database. Past conversations are read from Hermes's own `state.db` (read-only) by the dashboard and the MCP `chat_*` tools, and never added to automatic recall.
 - Preferences and constraints are kept in their own table. A preference without a situation is shown in every conversation, and only when the user said it directly. A constraint always needs a situation.
 - Memories have no retention period. They stay until they are deleted, superseded or archived.
 - Text that looks like a credential or a prompt-injection attempt is rejected before it is saved.

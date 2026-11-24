@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from neospike.conversations import ConversationIndexer
 from neospike.notes import NoteService
 from neospike.reembed import _pack as reembed_pack
 from neospike.store import MemoryStore
@@ -68,8 +67,6 @@ def test_every_write_path_stores_a_unit_vector(store: MemoryStore, tmp_path: Pat
         blobs[name] = store._conn.execute("SELECT embedding FROM items WHERE type='memory' AND id=?", (row_id,)).fetchone()[0]
     blobs["memories.replacement"] = store._pack_embedding(_scaled(DIMENSIONS))  # update/supersede/restore/split
     blobs["note_parts"] = NoteService(store, None, token_counter=_WordCounter())._pack(_scaled(DIMENSIONS))
-    blobs["conversation_chunks"] = ConversationIndexer(store, None, token_counter=_WordCounter())._pack(
-        _scaled(DIMENSIONS))
     blobs["reembed"] = reembed_pack(_scaled(DIMENSIONS), DIMENSIONS, allow_zero=False)
     for name, blob in blobs.items():
         assert abs(_norm(blob) - 1.0) <= NORM_TOLERANCE, name

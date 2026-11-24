@@ -19,17 +19,6 @@ from neospike.tests.support_embed_service import fake_hermes_checkout
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_TIMEOUT_SECONDS = 600
-# Minimal Hermes state.db (tables conv-import reads; see test_conv_import.py), no sessions.
-STATE_SCHEMA = """
-CREATE TABLE sessions (id TEXT PRIMARY KEY, origin TEXT NOT NULL, started_at REAL NOT NULL, ended_at REAL, title TEXT);
-CREATE TABLE messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT,
-    tool_call_id TEXT, tool_calls TEXT, tool_name TEXT, timestamp REAL NOT NULL,
-    _compressed_summary INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, compacted INTEGER NOT NULL DEFAULT 0
-);
-"""
-
-
 def _install_module():
     spec = importlib.util.spec_from_file_location("install_under_test", REPO_ROOT / "install.py")
     module = importlib.util.module_from_spec(spec)
@@ -52,11 +41,6 @@ def home(tmp_path, install) -> Path:
     return root
 
 
-def _state_db(home: Path) -> None:
-    with closing(sqlite3.connect(home / "state.db")) as connection:
-        connection.executescript(STATE_SCHEMA)
-
-
 def _run_script(home: Path, name: str) -> subprocess.CompletedProcess:
     # The CLI child starts through hermes_launch.py on this interpreter and a fake checkout, never Hermes.
     env = {**os.environ, "HERMES_PYTHON": sys.executable, "PYTHONIOENCODING": "utf-8",
@@ -68,18 +52,11 @@ def _run_script(home: Path, name: str) -> subprocess.CompletedProcess:
 
 
 def test_daily_success_prints_nothing(home):
-    _state_db(home)
+    # No Hermes state.db: no daily stage reads one (conversations are not copied into memory.db).
+    assert not (home / "state.db").exists()
     done = _run_script(home, "neospike_daily.py")
     assert (done.returncode, done.stdout) == (0, ""), (done.stdout, done.stderr[-2000:])
     assert list((home / "neospike" / "backups").glob("full-*.db"))  # the backup stage really ran
-
-
-def test_daily_failure_names_the_stage_and_keeps_going(home):
-    """No state.db: conv-import fails; the stages before and after it still run."""
-    done = _run_script(home, "neospike_daily.py")
-    lines = done.stdout.strip().splitlines()
-    assert done.returncode == 1 and len(lines) == 1, (done.stdout, done.stderr[-2000:])
-    assert lines[0].startswith(f"{home.resolve()}: FAILED conv-import (exit 1):") and "state.db not found" in lines[0], lines
 
 
 def test_daily_backup_failure_is_listed_first(home, monkeypatch, capsys):
@@ -96,8 +73,7 @@ def test_daily_backup_failure_is_listed_first(home, monkeypatch, capsys):
     assert daily.main() == 1
     # topic-to-note after topic-discover; embed-pending first (it runs the save follow-up, so
     # note-absorb and topic-assign are no stages). Inbox-maintain, lint and inbox-review-code are gone.
-    assert stages.order == ["backup", "link-prune", "conv-import", "conv-index", "embed-pending",
-                            "topic-discover", "topic-to-note"]
+    assert stages.order == ["backup", "link-prune", "embed-pending", "topic-discover", "topic-to-note"]
     assert capsys.readouterr().out.splitlines() == [f"{home}: FAILED backup | FAILED topic-to-note"]
 
 
@@ -133,7 +109,6 @@ TOPIC_CLUSTER_SIZE = 6  # topics._Tuning.GROUP_MAX_WITHOUT_TOPIC + 1: the smalle
 def test_daily_discovers_topics(home):
     """The daily run creates a topic from a cluster of unassigned memories. A topic is a
     tag and 6 members (not more than 10) stay a topic."""
-    _state_db(home)
     store = MemoryStore(home / "neospike" / "memory.db", dimensions=EMBEDDING_DIMENSIONS)
     try:
         for index in range(TOPIC_CLUSTER_SIZE):
@@ -233,6 +208,13 @@ class _StagesPerHome:
     def __call__(self, home: Path, name: str, args: list[str]) -> str | None:
         self.calls.append((home, name))
         return f"FAILED {name}" if home == self.failing and name in ("backup", "topic-to-note") else None
+
+
+def test_daily_has_no_conversation_stages(home):
+    daily = _load_script(home, "neospike_daily.py", "daily_stages_under_test")
+    listed = daily.stages(home)
+    assert [name for name, _ in listed] == ["backup", "link-prune", "embed-pending", "topic-discover", "topic-to-note"]
+    assert not [arguments for _, arguments in listed if any(word.startswith("conv") for word in arguments)]
 
 
 def test_daily_keeps_going_after_a_failed_home(home, monkeypatch, capsys):

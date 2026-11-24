@@ -45,7 +45,6 @@ HUMAN_NOTE_READ_ONLY = "Automation cannot edit a human note"
 MAX_BODY_BYTES = 10_000_000
 MAX_TITLE_CHARS = 200
 MAX_TAGS, MAX_TAG_CHARS = 16, 64
-CHUNK_OVERLAP_TOKENS = 64  # conversation chunks (conversations.py); document parts never overlap
 # Window 2048 - 48 = 2000-token note chunks.
 CHUNK_TOKEN_MARGIN = 48
 # Notes carry no importance column; use the memories column default.

@@ -60,7 +60,7 @@
         "setup.ragActive": "Neospike active", "setup.runHealth": "Run health check",
         "config.criteria.title": "Memory creation rules", "config.criteria.default": "Default",
         "config.enabled.title": "Neospike on/off", "config.enabled.label": "Neospike is on",
-        "config.enabled.copy": "Off pauses Neospike in this home without uninstalling it: no automatic recall, no conversation saving, no save follow-up, tool calls return an error and the daily job skips this home. Turn it back on to resume from the next turn; no restart is needed.",
+        "config.enabled.copy": "Off pauses Neospike in this home without uninstalling it: no automatic recall, no save follow-up, tool calls return an error and the daily job skips this home. Turn it back on to resume from the next turn; no restart is needed.",
         "config.enabled.stopped": "Paused. The embedding service was asked to stop.",
         "config.enabled.not_running": "Paused. The embedding service was not running.",
         "config.enabled.in_use": "Paused. The embedding service keeps running for: {homes}",
@@ -104,10 +104,10 @@
         "memory.archivedTag": " · archived", "memory.hideHistory": "Hide history", "memory.history": "History",
         "memory.unarchive": "Unarchive", "memory.archive": "Archive", "memory.deleteTitle": "Delete this memory item?",
         "memory.loadFailed": "Could not load memory: {error}", "memory.search": "Search memory", "memory.empty": "No memory items.",
-        "conv.masked": "Masked when stored", "conv.loadFailed": "Could not load conversations: {error}",
+        "conv.loadFailed": "Could not load conversations: {error}",
         "conv.search": "Search conversations", "conv.searching": "Searching…", "conv.results": "Search results",
         "conv.noMatch": "No matching conversation excerpts.", "conv.sessions": "Sessions", "conv.messages": " · {n} messages",
-        "conv.maskedCount": " · {n} masked", "conv.empty": "No conversations stored.", "conv.transcript": "Transcript",
+        "conv.empty": "No conversations stored.", "conv.transcript": "Transcript",
         "conv.openHint": "Open a session to read its transcript (read-only).",
         "class.topic": "Topics", "class.doc": "Docs", "class.note": "Other notes", "class.other": "Memory, TASK",
         "kind.memory": "Memory", "kind.human": "Docs", "kind.agent": "Agent notes", "kind.task": "TASK",
@@ -183,7 +183,7 @@
         "setup.ragActive": "Neospike 활성", "setup.runHealth": "상태 점검 실행",
         "config.criteria.title": "기억 생성 규칙", "config.criteria.default": "디폴트",
         "config.enabled.title": "Neospike 켜기/끄기", "config.enabled.label": "Neospike 켜짐",
-        "config.enabled.copy": "끄면 제거하지 않고 이 홈에서 Neospike를 멈춥니다. 자동 회상, 대화 저장, 저장 후속 작업을 하지 않고, 도구 호출은 오류를 돌려주며, 일별 작업은 이 홈을 건너뜁니다. 다시 켜면 재시작 없이 다음 턴부터 동작합니다.",
+        "config.enabled.copy": "끄면 제거하지 않고 이 홈에서 Neospike를 멈춥니다. 자동 회상, 저장 후속 작업을 하지 않고, 도구 호출은 오류를 돌려주며, 일별 작업은 이 홈을 건너뜁니다. 다시 켜면 재시작 없이 다음 턴부터 동작합니다.",
         "config.enabled.stopped": "멈췄습니다. 임베딩 서비스에 종료를 요청했습니다.",
         "config.enabled.not_running": "멈췄습니다. 임베딩 서비스는 실행 중이 아니었습니다.",
         "config.enabled.in_use": "멈췄습니다. 임베딩 서비스는 다음 홈이 쓰고 있어 계속 실행됩니다: {homes}",
@@ -227,10 +227,10 @@
         "memory.archivedTag": " · 보관됨", "memory.hideHistory": "기록 숨기기", "memory.history": "기록",
         "memory.unarchive": "보관 해제", "memory.archive": "보관", "memory.deleteTitle": "이 기억을 삭제할까요?",
         "memory.loadFailed": "기억을 불러오지 못했습니다: {error}", "memory.search": "기억 검색", "memory.empty": "기억이 없습니다.",
-        "conv.masked": "저장할 때 가림", "conv.loadFailed": "대화를 불러오지 못했습니다: {error}",
+        "conv.loadFailed": "대화를 불러오지 못했습니다: {error}",
         "conv.search": "대화 검색", "conv.searching": "검색 중…", "conv.results": "검색 결과",
         "conv.noMatch": "맞는 대화 발췌가 없습니다.", "conv.sessions": "세션", "conv.messages": " · 메시지 {n}개",
-        "conv.maskedCount": " · {n}곳 가림", "conv.empty": "저장된 대화가 없습니다.", "conv.transcript": "대화 기록",
+        "conv.empty": "저장된 대화가 없습니다.", "conv.transcript": "대화 기록",
         "conv.openHint": "세션을 열면 대화 기록을 읽을 수 있습니다 (읽기 전용).",
         "class.topic": "토픽", "class.doc": "문서", "class.note": "기타 노트", "class.other": "기억, TASK",
         "kind.memory": "기억", "kind.human": "문서", "kind.agent": "에이전트 노트", "kind.task": "TASK",
@@ -1687,18 +1687,14 @@
       })) : h("p", { className: "neospike-muted" }, t("pref.empty")));
   }
 
-  // ---- Conversations: read-only transcripts; masks are highlighted, never undone. ----
-  const MASK_PATTERN = /(\[REDACTED\]|\[BLOCKED LINE\])/;
+  // ---- Conversations: read-only transcripts of the Hermes chat database, shown as stored. ----
 
   function timeLabel(seconds) {
     return seconds ? new Date(seconds * 1000).toLocaleString() : t("common.open");
   }
 
-  function RedactedBody(props) {
-    return h("p", { className: "neospike-transcript-text", style: { whiteSpace: "pre-wrap" } },
-      String(props.text || "").split(MASK_PATTERN).map(function (part, index) {
-        return index % 2 === 1 ? h("mark", { key: index, title: t("conv.masked") }, part) : part;
-      }));
+  function TranscriptText(props) {
+    return h("p", { className: "neospike-transcript-text", style: { whiteSpace: "pre-wrap" } }, String(props.text || ""));
   }
 
   function DialogsView(props) {
@@ -1718,7 +1714,7 @@
 
     function showDialog(id) {
       setMessage(null);
-      return SDK.fetchJSON(API + "/conversations/" + id).then(setSelected)
+      return SDK.fetchJSON(API + "/conversations/" + encodeURIComponent(id)).then(setSelected)
         .catch(function (e) { setMessage({ ok: false, text: apiFault(e).text }); });
     }
 
@@ -1739,19 +1735,19 @@
       h(Notice, { message: message }),
       results !== null ? h(Card, null, h(CardHeader, null, h(CardTitle, null, t("conv.results"))),
         h(CardContent, null, results.length ? h("ul", { className: "neospike-item-list" }, results.map(function (hit) {
-          return h("li", { key: hit.origin, className: "neospike-item" },
-            h("button", { type: "button", className: "neospike-link", onClick: function () { showDialog(hit.id); } }, hit.origin + (hit.title ? " · " + hit.title : "")),
-            h(RedactedBody, { text: hit.text })
+          return h("li", { key: hit.message_id, className: "neospike-item" },
+            h("button", { type: "button", className: "neospike-link", onClick: function () { showDialog(hit.session_id); } }, (hit.title || hit.session_id) + " · " + timeLabel(hit.created_at)),
+            h(TranscriptText, { text: hit.text })
           );
         })) : h("p", { className: "neospike-muted" }, t("conv.noMatch")))
       ) : null,
       h("div", { className: "neospike-layout" },
         h(Card, null, h(CardHeader, null, h(CardTitle, null, t("conv.sessions"))),
           h(CardContent, null, conversations.length ? h("ul", { className: "neospike-note-items" }, conversations.map(function (item) {
-            return h("li", { key: item.id },
-              h("button", { type: "button", className: "neospike-note-item" + (selected && selected.id === item.id ? " is-selected" : ""), onClick: function () { showDialog(item.id); } },
+            return h("li", { key: item.session_id },
+              h("button", { type: "button", className: "neospike-note-item" + (selected && selected.session_id === item.session_id ? " is-selected" : ""), onClick: function () { showDialog(item.session_id); } },
                 h("strong", null, item.title || item.session_id),
-                h("span", { className: "neospike-muted" }, timeLabel(item.started_at) + t("conv.messages", { n: item.messages }) + (item.masked ? t("conv.maskedCount", { n: item.masked }) : ""))
+                h("span", { className: "neospike-muted" }, timeLabel(item.started_at) + t("conv.messages", { n: item.messages }))
               )
             );
           })) : h("p", { className: "neospike-muted" }, t("conv.empty")))
@@ -1759,8 +1755,8 @@
         h(Card, null, h(CardHeader, null, h(CardTitle, null, selected ? (selected.title || selected.session_id) : t("conv.transcript"))),
           h(CardContent, null, selected ? h("ul", { className: "neospike-item-list" }, selected.transcript.map(function (entry) {
             return h("li", { key: entry.seq, className: "neospike-item" },
-              h("span", { className: "neospike-muted" }, "#" + entry.seq + " · " + entry.role + " · " + timeLabel(entry.created_at) + (entry.masked_count ? t("conv.maskedCount", { n: entry.masked_count }) : "")),
-              h(RedactedBody, { text: entry.content })
+              h("span", { className: "neospike-muted" }, "#" + entry.seq + " · " + entry.role + " · " + timeLabel(entry.created_at)),
+              h(TranscriptText, { text: entry.content })
             );
           })) : h("p", { className: "neospike-muted" }, t("conv.openHint")))
         )

@@ -30,7 +30,7 @@ SAVE = {"scope": "global", "subject": "build", "durability": "stable", "kind": "
 
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
-    NeospikeConfig(conversation_capture=False).save(tmp_path)
+    NeospikeConfig().save(tmp_path)
     return tmp_path
 
 

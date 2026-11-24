@@ -1,4 +1,4 @@
-"""Schema v22: the v21-or-older layout becomes the items layout in ONE transaction that is
+﻿"""Schema v22: the v21-or-older layout becomes the items layout in ONE transaction that is
 verified before COMMIT (any failed check rolls everything back).
 
 v21 -> v22:
@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_V22 = 22
-SUPPORTED_USER_VERSION = 23  # schema_v23.SCHEMA_V23: the newest layout this code writes (v22 -> v23 in schema_v23.py)
+SUPPORTED_USER_VERSION = 24  # schema_v24.SCHEMA_V24: the newest layout this code writes (v22 -> v23 -> v24)
 APPLICATION_ID = 0x4E53504B  # "NSPK"
 LEGACY_MEMORY_TABLE = "memories"
 SNAPSHOT_NAME = "memory.pre-v22.db"
@@ -780,7 +780,8 @@ def migrate_v22(conn: sqlite3.Connection, *, embedder: Any = None, splitter: Any
         present = _tables(conn)
         conn.execute(layout.NEXT_CHAIN_TRIGGER_DDL)
         if "conversation_chunks" in present:
-            _run_triggers(conn, layout._CONVERSATION_DDL, "conversation_chunks")
+            from .schema_v24 import LEGACY_CONVERSATION_TRIGGERS_DDL
+            _run_triggers(conn, LEGACY_CONVERSATION_TRIGGERS_DDL, "conversation_chunks")
         conn.execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')")
         if "conversation_chunks_fts" in present:
             conn.execute("INSERT INTO conversation_chunks_fts(conversation_chunks_fts) VALUES ('rebuild')")
@@ -788,7 +789,7 @@ def migrate_v22(conn: sqlite3.Connection, *, embedder: Any = None, splitter: Any
                 and all("updated_at" in _columns(conn, table) for table in layout.STAMP_TRACKED_TABLES):
             layout.install_change_triggers(conn)
         conn.execute("INSERT OR REPLACE INTO meta_entries(key, value) VALUES ('schema_version', ?)",
-                     (str(SCHEMA_V22),))  # schema_v23.migrate_v23 takes it on to v23
+                     (str(SCHEMA_V22),))  # schema_v23 / schema_v24 take it on to v24
         conn.execute(f"PRAGMA user_version={SCHEMA_V22}")
         conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
         tombstones_left = None if tombstones_before is None else tombstones_before - remapped["tombstones_dropped"]
@@ -853,7 +854,12 @@ def dry_run(db_path: Path, *, embedder: Any = None) -> dict[str, Any]:
 
 def _snapshot(db_path: Path) -> Path:
     """memory.pre-v22.db through the backup API, checked with quick_check and per-table row counts."""
-    target_path = db_path.with_name(SNAPSHOT_NAME)
+    return snapshot_database(db_path, SNAPSHOT_NAME)
+
+
+def snapshot_database(db_path: Path, name: str) -> Path:
+    """<name> next to db_path through the backup API, checked with quick_check and per-table row counts."""
+    target_path = db_path.with_name(name)
     if target_path.exists():
         raise SchemaError(f"{target_path.name} already exists; move it away before --apply")
     source = sqlite3.connect(db_path)

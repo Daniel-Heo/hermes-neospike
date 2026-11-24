@@ -33,7 +33,7 @@ from .renames import forward_old_options
 from . import vector_index
 from . import chat_history
 from .notes import NoteError, NoteNotFound, _NOT_TOPIC_PAGE_SQL, note_record
-from .store import (DEFAULT_NAMESPACE, DEFAULT_SEMANTIC_CUTOFF, FORMULA_AUTHOR, ITEM_DOC, ITEM_MEMORY, ITEM_NOTE,
+from .store import (DEFAULT_NAMESPACE, FORMULA_AUTHOR, ITEM_DOC, ITEM_MEMORY, ITEM_NOTE,
                     NOTE_CHUNKS_SQL, SQLITE_BUSY_TIMEOUT_SECONDS, OLD_VERSION_SCORE_FACTOR,
                     MemoryStore, note_head_sql, vector_present_sql, pick_namespace)
 
@@ -58,8 +58,10 @@ _VERSION_KEY = "version:"
 # The store's admission floor; read from MemoryStore so the value lives in one place.
 SEMANTIC_THRESHOLD = float(inspect.signature(MemoryStore.__init__).parameters["semantic_threshold"].default)
 # mem_search keeps memories, note chunks and doc chunks with cosine >= this, highest cosine first, cut to
-# limit. One constant, the store's (Hermes recall keeps SEMANTIC_THRESHOLD).
-MEMORY_SEARCH_COSINE_THRESHOLD = DEFAULT_SEMANTIC_CUTOFF
+# limit. It is a search the caller runs on demand, not an injection, so its floor is lower than the
+# recall floor (Hermes recall keeps SEMANTIC_THRESHOLD): a short query scores about 0.45-0.66 against a
+# matching long memory with bge-m3.
+MEMORY_SEARCH_COSINE_THRESHOLD = 0.50
 KIND_NOTE_CHUNK = "note_chunk"  # search_memory_and_formula_readonly kind of an automatic-note chunk (evaluation lane)
 # mem_search result kinds: a memory item, a chunk of a note (agent or automatic) and a chunk of a doc.
 KIND_MEMORY, KIND_NOTE, KIND_DOC = "memory", "note", "doc"

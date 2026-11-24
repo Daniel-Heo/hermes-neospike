@@ -13,7 +13,7 @@ from neospike.config import PAUSED_MESSAGE, NeospikeConfig, read_enabled
 from neospike.cron import neospike_cron_common as common
 from neospike.dashboard import plugin_api as api
 from neospike.inference import EmbeddingClient, EmbeddingDaemon
-from neospike.tests.support_embed_service import RecordingBackend, cache_dir, spawn_service
+from neospike.tests.support_embed_service import RecordingBackend, cache_dir, spawn_service, wait_model_loaded
 from neospike.tests.support_provider import make_provider, save_item
 from neospike.tests.test_cron_scripts import _HomeOf, _load_script, _profile
 from neospike.tests.test_embed_service_wire import svc_home  # noqa: F401  (fixture)
@@ -30,17 +30,6 @@ def _switch(home: Path, on: bool) -> None:
     values = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({**values, "enabled": on}), encoding="utf-8")
-
-
-class _Conversations:
-    """ConversationStore stand-in: records what sync_turn appends."""
-
-    def __init__(self) -> None:
-        self.appended: list[str] = []
-
-    def append(self, session_id: str, turns) -> bool:
-        self.appended.append(session_id)
-        return False
 
 
 class _Always:
@@ -71,19 +60,16 @@ def test_paused_provider_recalls_stores_and_answers_nothing_until_switched_back_
     provider = make_provider(home)
     try:
         assert save_item(provider, "The user plays guitar every evening", "global", "hobby").get("stored", True)
-        conversations = provider._talk_store = _Conversations()
         _switch(home, False)
         assert provider.prefetch("guitar") == ""
         reply = json.loads(provider.handle_tool_call("neospike_memory_search", {"query": "guitar"}))
         assert reply == {"error": PAUSED_MESSAGE}
         provider._mark_saved("s-one")
         provider.sync_turn("guitar?", "yes", session_id="s-one")
-        assert conversations.appended == [] and provider._saved_in_turn == set()
+        assert provider._saved_in_turn == set()
         _switch(home, True)  # no restart: the next call reads the switch again
         assert "guitar" in provider.prefetch("guitar")
         assert json.loads(provider.handle_tool_call("neospike_memory_search", {"query": "guitar"}))["results"]
-        provider.sync_turn("guitar?", "yes", session_id="s-one")
-        assert conversations.appended == ["s-one"]
     finally:
         provider.shutdown()
 
@@ -127,6 +113,7 @@ def test_service_process_exits_cleanly_on_a_shutdown_request(svc_home):  # noqa:
     process = spawn_service(svc_home)
     try:
         assert "ready" in read_line(process.stdout, SERVICE_EXIT_SECONDS), process.stderr.read()
+        wait_model_loaded(process)  # a stop waits for a running model load; measure the stop alone
         assert EmbeddingClient(svc_home).request_shutdown() is True
         assert process.wait(timeout=SERVICE_EXIT_SECONDS) == 0
     finally:

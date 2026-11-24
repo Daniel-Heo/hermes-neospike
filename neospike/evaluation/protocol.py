@@ -22,7 +22,7 @@ from .core import GateTuning
 PROTOCOL_VERSION = 1
 LEDGER_NAME = "ledger.jsonl"
 # Tables whose (row count, max id) fingerprint a database state.
-FINGERPRINT_TABLES = ("items", "item_links", "conversation_chunks")
+FINGERPRINT_TABLES = ("items", "item_links")
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 

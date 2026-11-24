@@ -14,7 +14,7 @@ PROMPT_KEYWORDS = {
     "correct vs supersede": ("mode=correct", "mode=supersede", "only part", "one-off exception", "session id"),
     "docs = human notes": ("Edit a doc (a note the user wrote) only if the user asks",),
     "save-time older items": ("older list", "neospike_memory_reconcile"),
-    "result reading": ("replaced by mem:N", "archived", "message_parts", "conv-read"),
+    "result reading": ("replaced by mem:N", "archived"),
 }
 
 

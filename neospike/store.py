@@ -20,6 +20,7 @@ from .config import EMBEDDING_MODEL, NeospikeConfig
 from .folders import FOLDERS_SCHEMA
 from . import schema_v22
 from . import schema_v23
+from . import schema_v24
 from . import vector_index
 from . import preferences
 from .preferences import PREFERENCES_DDL, PREFERENCES_TABLE
@@ -27,7 +28,7 @@ from .preferences import PREFERENCES_DDL, PREFERENCES_TABLE
 _LOG = logging.getLogger(__name__)
 
 
-SCHEMA_VERSION = 23  # current layout: schema_v22.py + the preferences table of schema_v23.py
+SCHEMA_VERSION = 24  # current layout: schema_v22.py + preferences (schema_v23.py), no conversation copy (schema_v24.py)
 
 # Namespace a standalone tool (CLI, MCP, eval) uses when nothing else is known.
 DEFAULT_NAMESPACE = "default:local"
@@ -38,13 +39,15 @@ AGENT_EDITOR, HUMAN_EDITOR = "agent", "human"  # item_revisions.edited_by of cor
 # How widely a memory item is visible (a wider old duplicate lifts the new memory to its scope).
 SCOPE_ORDER = {"session": 0, "project": 1, "global": 2}
 
-# Hybrid ranking shared by memories and document parts (documents omit the kind bonus).
-# Admission is cosine-only: a shared query word adds no score, so FTS is not
-# consulted for ranking. The FTS tables stay for the dashboard's lexical memory filter.
+# Search-time ranking shared by memory search and document-part search (documents omit the kind bonus).
+# Saving never uses these values. Whether a candidate enters the search results is decided by cosine
+# alone (DEFAULT_SEMANTIC_CUTOFF below): a query word shared with the text adds no score, so FTS is not
+# consulted for search results. The FTS tables stay for the dashboard's lexical memory filter.
 SEMANTIC_WEIGHT, IMPORTANCE_WEIGHT, FRESHNESS_WEIGHT = 0.68, 0.07, 0.05
 DURABLE_BOOST = 0.08
-# 관련 없는 기억 주입을 막는 코사인 하한(cos 단독 문턱).
-# 회상 주입과 MCP mem_search가 함께 쓰는 하나의 상수(mcp_server.MEMORY_SEARCH_COSINE_THRESHOLD가 이 값을 import).
+# 검색 결과에 올릴 후보의 코사인 하한(코사인 단독 문턱). 저장에는 쓰지 않는다.
+# 쓰는 곳: 기억 검색(자동 회상 주입, neospike_memory_search), 노트 검색, 대화 시작 때 환경설정 고르기.
+# MCP mem_search는 주입이 아닌 검색이라 자기 문턱(mcp_server.MEMORY_SEARCH_COSINE_THRESHOLD = 0.50)을 쓴다.
 DEFAULT_SEMANTIC_CUTOFF = 0.70
 RECENCY_HALF_LIFE_DAYS = 90.0
 FTS_TERM_CAP = 16
@@ -57,7 +60,8 @@ def freshness(now: float, made_ts: float) -> float:
 
 
 def blend_score(sem: float, importance: float, recency: float) -> float:
-    """Ranking only; admission is the caller's `semantic >= semantic_threshold` gate."""
+    """Search-result ranking only; whether a candidate enters the results is the caller's
+    `semantic >= semantic_threshold` gate."""
     return SEMANTIC_WEIGHT * sem + IMPORTANCE_WEIGHT * importance + FRESHNESS_WEIGHT * recency
 
 
@@ -213,14 +217,12 @@ ITEMS_VECTOR_INDEXES_DDL = (
 # Rows changed since a watermark (backup increments): created on every open, after updated_at exists.
 ITEMS_UPDATED_INDEX = "items_updated"
 ITEMS_UPDATED_INDEX_DDL = f"CREATE INDEX IF NOT EXISTS {ITEMS_UPDATED_INDEX} ON items(updated_at)"
-# Newest-first dashboard lists (memories, conversations) without a temporary sort: the rowid (id) the index
+# Newest-first dashboard memory list without a temporary sort: the rowid (id) the index
 # carries after the key also orders the id tie-break. Created on every open. The memory index leads with type:
 # without it (and with no ANALYZE statistics) SQLite prefers items_type_owner (type=?) and sorts.
 MEMORY_CREATED_INDEX = "items_memory_created"
-CONVERSATIONS_LAST_MESSAGE_INDEX = "conversations_last_message"
 SORT_INDEXES_DDL = (
     f"CREATE INDEX IF NOT EXISTS {MEMORY_CREATED_INDEX} ON items(type, created_at) WHERE type='{ITEM_MEMORY}';\n"
-    f"CREATE INDEX IF NOT EXISTS {CONVERSATIONS_LAST_MESSAGE_INDEX} ON conversations(last_message_at);\n"
 )
 
 
@@ -425,65 +427,6 @@ CREATE TABLE IF NOT EXISTS session_save_criteria (
 """
 
 
-# conversation transcripts (v6): copied from Hermes turns, masked before INSERT.
-# conversation_chunks.embedding is NULL until the background indexer fills it (conversations.py).
-_CONVERSATION_DDL = f"""
-CREATE TABLE IF NOT EXISTS conversations (
-    {_PK_COL},
-    session_id TEXT NOT NULL UNIQUE,
-    started_at REAL NOT NULL,
-    ended_at REAL,
-    last_message_at REAL NOT NULL,
-    title TEXT NOT NULL DEFAULT '',
-    summary_note_id INTEGER,
-    indexed_seq INTEGER NOT NULL DEFAULT 0,
-    updated_at REAL,
-    synced_through REAL,
-    source_max_id INTEGER
-);
-CREATE TABLE IF NOT EXISTS conversation_messages (
-    {_PK_COL},
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-    seq INTEGER NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('user','assistant')),
-    content TEXT NOT NULL,
-    {_CREATED_COL},
-    masked_count INTEGER NOT NULL DEFAULT 0,
-    updated_at REAL,
-    UNIQUE(conversation_id, seq)
-);
-CREATE TABLE IF NOT EXISTS conversation_chunks (
-    {_PK_COL},
-    conversation_id INTEGER NOT NULL REFERENCES conversations(id),
-    seq_start INTEGER NOT NULL,
-    seq_end INTEGER NOT NULL,
-    part INTEGER NOT NULL DEFAULT 0,
-    text TEXT NOT NULL,
-    prefix_chars INTEGER NOT NULL DEFAULT 0,
-    text_hash TEXT NOT NULL,
-    embedding BLOB,
-    updated_at REAL,
-    next_id INTEGER,
-    UNIQUE(conversation_id, seq_start, part)
-);
-CREATE INDEX IF NOT EXISTS conversation_chunks_hash ON conversation_chunks(text_hash);
-CREATE INDEX IF NOT EXISTS conversation_chunks_pending ON conversation_chunks(id) WHERE embedding IS NULL;
-CREATE VIRTUAL TABLE IF NOT EXISTS conversation_chunks_fts USING fts5(
-    text, content='conversation_chunks', content_rowid='id', tokenize='unicode61'
-);
-CREATE TRIGGER IF NOT EXISTS conversation_chunks_fts_ai AFTER INSERT ON conversation_chunks BEGIN
-    INSERT INTO conversation_chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
-CREATE TRIGGER IF NOT EXISTS conversation_chunks_fts_ad AFTER DELETE ON conversation_chunks BEGIN
-    INSERT INTO conversation_chunks_fts(conversation_chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-END;
-CREATE TRIGGER IF NOT EXISTS conversation_chunks_fts_au AFTER UPDATE OF text ON conversation_chunks BEGIN
-    INSERT INTO conversation_chunks_fts(conversation_chunks_fts, rowid, text) VALUES ('delete', old.id, old.text);
-    INSERT INTO conversation_chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
-"""
-CONVERSATION_TABLE_NAMES = ("conversations", "conversation_messages", "conversation_chunks")
-
 # change tracking (v5) for incremental backups (backup.py). Triggers, not call sites, so every
 # write path is covered. SQL time is taken while the writer holds the write lock; backup.py reads
 # its watermark under BEGIN IMMEDIATE, so a commit is either before it or strictly after it.
@@ -493,11 +436,10 @@ SQL_NOW_EXPR = "((julianday('now') - 2440587.5) * 86400.0)"
 TABLES_WITH_UPDATE_STAMP = ("items",)
 # Tables of the removed review inbox: a v20 database still has them; _run_migrations drops them with their tombstones.
 RETIRED_TABLES = ("candidates", "inbox_decisions", "lint_state")
-# Tables whose updated_at the triggers maintain: the v5 table plus the v6 conversation family
-# (created with the column, so the v5 ALTER/backfill step does not apply to them).
-# v7 folders is created with updated_at as well; folder_items is hash-replaced by backup.py.
+# Tables whose updated_at the triggers maintain: the v5 table, then tables created with the column (the v5
+# ALTER/backfill step does not apply to them): v7 folders; folder_items is hash-replaced by backup.py.
 # v23 preferences (preferences.py) as well: edited in place, so updated_at is its change signal.
-STAMP_TRACKED_TABLES = TABLES_WITH_UPDATE_STAMP + CONVERSATION_TABLE_NAMES + ("folders", PREFERENCES_TABLE)
+STAMP_TRACKED_TABLES = TABLES_WITH_UPDATE_STAMP + ("folders", PREFERENCES_TABLE)
 # Read bookkeeping (a search hit) is not a change; an UPDATE of only these columns leaves
 # updated_at alone on every tracked table that has them.
 READ_TRACKING_COLUMNS = ("accessed_at", "access_count")
@@ -568,9 +510,6 @@ TOMBSTONE_FIELDS = {
     "items": "CAST(old.id AS TEXT)",
     "item_revisions": "json_array(old.item_id, old.rev)",
     "item_links": "CAST(old.id AS TEXT)",
-    "conversations": "CAST(old.id AS TEXT)",
-    "conversation_messages": "CAST(old.id AS TEXT)",
-    "conversation_chunks": "CAST(old.id AS TEXT)",
     "folders": "CAST(old.id AS TEXT)",
     "folder_items": "json_array(old.item_type, old.item_id)",
     PREFERENCES_TABLE: "CAST(old.id AS TEXT)",
@@ -584,14 +523,6 @@ CREATE TABLE IF NOT EXISTS tombstones (
 CREATE INDEX IF NOT EXISTS tombstones_deleted_at ON tombstones(deleted_at);
 """
 
-
-# Chunk chain (v10): the parts of one message split over the chunk budget point forward, part
-# k -> part k+1; the last part, and every chunk of an unsplit message, has next_chunk_id NULL.
-CHUNK_CHAIN_FIELD = "next_id"  # v22: was next_chunk_id
-# Batch start time T up to which conv-import matched the conversation to state.db (NULL = never).
-SYNCED_UPTO_FIELD = "synced_through"
-# Largest state.db messages.id matched; a larger id is a late message even with an old timestamp.
-SOURCE_LAST_ID_FIELD = "source_max_id"
 
 # Piece chain: the pieces of one split memory text (neospike_memory_update, neospike_memory_reconcile,
 # dashboard and CLI edits) point forward through item_links relation 'next', piece k -> piece k+1, like
@@ -630,27 +561,6 @@ def link_piece_chain(sql_conn: sqlite3.Connection, head_id: int, part_ids: Seque
         order.append(rest_tail)
     write_chain(sql_conn, order)
 
-
-def chain_message_chunks(sql_conn: sqlite3.Connection, conv_id: int | None = None, seq_begin: int = 0) -> int:
-    """Re-link next_chunk_id of the chunks with seq_start >= seq_from (of one conversation, or of
-    all when conversation_id is None). Runs in the caller's transaction; only changed rows are
-    written. Returns the number of rows updated."""
-    where, args = ("conversation_id=? AND seq_start>=?", (conv_id, seq_begin)) if conv_id is not None         else ("seq_start>=?", (seq_begin,))
-    recs = sql_conn.execute(
-        f"SELECT id,conversation_id,seq_start,seq_end,part,{CHUNK_CHAIN_FIELD} FROM conversation_chunks "
-        f"WHERE {where} ORDER BY conversation_id,seq_start,part", args,
-    ).fetchall()
-    pending_sets: list[tuple[int | None, int]] = []
-    for index, rec in enumerate(recs):
-        successors = recs[index + 1] if index + 1 < len(recs) else None
-        desired = None
-        if (successors is not None and rec[2] == rec[3] and successors[1] == rec[1] and successors[2] == rec[2]
-                and successors[3] == rec[3] and successors[4] == rec[4] + 1):
-            desired = int(successors[0])
-        if rec[5] != desired:
-            pending_sets.append((desired, int(rec[0])))
-    sql_conn.executemany(f"UPDATE conversation_chunks SET {CHUNK_CHAIN_FIELD}=? WHERE id=?", pending_sets)
-    return len(pending_sets)
 
 def _update_stamp_trigger_sql(tbl: str, cols: Sequence[str] = ()) -> str:
     """{table}_track_au: bump updated_at when the statement did not set it itself. columns: the columns
@@ -815,7 +725,8 @@ def _neighbor_rank(duo: tuple[int, float]) -> float:
 class MemoryStore:
     def __init__(self, fpath: pathlib.Path, *, dimensions: int, semantic_threshold: float = DEFAULT_SEMANTIC_CUTOFF,
                  verify_embedding: bool = True) -> None:
-        # A similarity floor for admission, separate from the lexical/metadata ranking bonuses: neither a
+        # The cosine floor a candidate needs to enter search results (saving never uses it), separate from the
+        # lexical/metadata ranking bonuses: neither a
         # probability nor proof that a document answers. Default: DEFAULT_SEMANTIC_CUTOFF (user decision).
         threshold_ok = (
             not isinstance(semantic_threshold, bool)
@@ -845,6 +756,9 @@ class MemoryStore:
             # v22 -> v23: preferences/constraints leave items for their own table (one verified transaction).
             if schema_v23.needs_v23(self._conn):
                 schema_v23.migrate_v23(self._conn)
+            # v23 -> v24: the copied conversation tables are dropped (one verified transaction).
+            if schema_v24.needs_v24(self._conn):
+                schema_v24.migrate_v24(self._conn)
         except _ANY_ABORT:
             self._conn.close()
             raise
@@ -899,7 +813,6 @@ class MemoryStore:
                 + ITEMS_DDL
                 + ITEM_LINKS_DDL
                 + ITEM_REVISIONS_DDL
-                + _CONVERSATION_DDL
                 + FOLDERS_SCHEMA
                 + _DISCOVERY_DDL
                 + _CHECKS_DDL
@@ -908,16 +821,6 @@ class MemoryStore:
             )
             preferences.drop_origin_column(self._conn)
             self._conn.execute(NEXT_CHAIN_TRIGGER_DDL)
-            # v10: forward chain over the parts of one split message (filled for existing rows).
-            chunk_columns = {rec[1] for rec in self._conn.execute("PRAGMA table_info(conversation_chunks)")}
-            if CHUNK_CHAIN_FIELD not in chunk_columns:
-                self._conn.execute(f"ALTER TABLE conversation_chunks ADD COLUMN {CHUNK_CHAIN_FIELD} INTEGER")
-                chain_message_chunks(self._conn)
-            # NULL on existing rows, so the next conv-import matches every conversation once.
-            if SYNCED_UPTO_FIELD not in {rec[1] for rec in self._conn.execute("PRAGMA table_info(conversations)")}:
-                self._conn.execute(f"ALTER TABLE conversations ADD COLUMN {SYNCED_UPTO_FIELD} REAL")
-            if SOURCE_LAST_ID_FIELD not in {rec[1] for rec in self._conn.execute("PRAGMA table_info(conversations)")}:
-                self._conn.execute(f"ALTER TABLE conversations ADD COLUMN {SOURCE_LAST_ID_FIELD} INTEGER")
             # v5: updated_at (existing rows take created_at) before the tracking triggers exist.
             for tbl in TABLES_WITH_UPDATE_STAMP:
                 if "updated_at" not in {rec[1] for rec in self._conn.execute(f"PRAGMA table_info({tbl})")}:
@@ -1180,8 +1083,8 @@ class MemoryStore:
             invalid = rec["invalid_at"] is not None
             if invalid and history == HISTORY_OMIT:
                 continue
-            # Admission happens before bonuses, top-k, access bookkeeping and RRF. Sharing a word is not
-            # required (bilingual paraphrases pass on semantic evidence alone): the cosine floor decides.
+            # The search-result gate, before bonuses, top-k, access bookkeeping and RRF. Sharing a word is
+            # not required (bilingual paraphrases pass on semantic evidence alone): the cosine floor decides.
             if not math.isfinite(sem) or sem < self.semantic_threshold:
                 continue
             boost = DURABLE_BOOST if rec["kind"] == "durable" else 0.0

@@ -49,7 +49,10 @@ EMBEDDING_MAX_TOKENS = 2048  # input window (2000-token chunks); a longer docume
 OLD_CONFIG_KEYS = {"debug_enabled": "turn_trace_enabled"}
 # Retention-days keys (*_ttl_days, *_retention_days) are not used; they are dropped on save.
 RETENTION_CONFIG_KEYS = ("episodic_ttl_days", "summary_ttl_days", "episodic_retention_days", "summary_retention_days")
-REMOVED_CONFIG_KEYS = ("llm_weekly_token_budget", "save_criteria", "visual_enabled", *RETENTION_CONFIG_KEYS)
+# The conversation copy in memory.db is gone (conversations are read from Hermes' state.db); its switches are ignored.
+CONVERSATION_COPY_CONFIG_KEYS = ("conversation_capture", "conversation_prefetch")
+REMOVED_CONFIG_KEYS = ("llm_weekly_token_budget", "save_criteria", "visual_enabled", *RETENTION_CONFIG_KEYS,
+                       *CONVERSATION_COPY_CONFIG_KEYS)
 OLD_SAVE_CRITERIA_KEY = "save_criteria"
 # v21 tool names in rule text -> v22 names (schema-migrate rewrites MEMORY_RULE.md with this map).
 OLD_TOOL_NAMES = {"neospike_remember": "neospike_memory_save", "neospike_update": "neospike_memory_update",
@@ -100,14 +103,11 @@ def read_enabled(hermes_home: str | Path | None) -> bool:
 
 @dataclass(frozen=True)
 class NeospikeConfig:
-    # Off: no automatic recall, no conversation capture, no save follow-up; tools return PAUSED_MESSAGE.
+    # Off: no automatic recall, no save follow-up; tools return PAUSED_MESSAGE.
     enabled: bool = field(default=True)
     turn_trace_enabled: bool = field(default=False)
     recall_log_enabled: bool = field(default=True)
     recall_log_months: int = field(default=12)
-    # User/assistant turns are copied into the conversation family and kept out of prefetch.
-    conversation_capture: bool = field(default=True)
-    conversation_prefetch: bool = field(default=False)
     map_recent_days: float = field(default=MAP_RECENT_DAYS_DEFAULT)
     map_stale_days: float = field(default=MAP_STALE_DAYS_DEFAULT)
     extraction_language: str = field(default=EXTRACTION_LANGUAGE_DEFAULT)
@@ -123,14 +123,13 @@ class NeospikeConfig:
 
     @classmethod
     def from_values(cls, values: dict[str, Any]) -> "NeospikeConfig":
+        # Only the known keys are read; any other key (a retired setting too) is ignored.
         pick = values.get
         return cls(
             enabled=_parse_flag(pick(ENABLED_KEY, True), ENABLED_KEY),
             turn_trace_enabled=_parse_flag(_pick_current(values, "turn_trace_enabled", False), "turn_trace_enabled"),
             recall_log_enabled=_parse_flag(pick("recall_log_enabled", True), "recall_log_enabled"),
             recall_log_months=_parse_log_months(pick("recall_log_months", 12)),
-            conversation_capture=_parse_flag(pick("conversation_capture", True), "conversation_capture"),
-            conversation_prefetch=_parse_flag(pick("conversation_prefetch", False), "conversation_prefetch"),
             map_recent_days=_parse_positive_days(pick("map_recent_days", MAP_RECENT_DAYS_DEFAULT), "map_recent_days"),
             map_stale_days=_parse_positive_days(pick("map_stale_days", MAP_STALE_DAYS_DEFAULT), "map_stale_days"),
             extraction_language=parse_extraction_language(pick("extraction_language", EXTRACTION_LANGUAGE_DEFAULT)),

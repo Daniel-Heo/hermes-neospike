@@ -198,7 +198,7 @@ def test_open_migrates_v21_in_one_checked_step(tmp_path: Path) -> None:
                                                "ORDER BY memory_id,stage")] == [
             (1, "absorb", "h1", formula_ids[1]), (1, "topic", "h1", None), (2, "topic", "h2", None)]
         meta = dict(conn.execute("SELECT key,value FROM meta_entries").fetchall())
-        assert meta["live_owner"] == OWNER and meta["schema_version"] == "23"  # v21 -> v22 -> v23 in one open
+        assert meta["live_owner"] == OWNER and meta["schema_version"] == "24"  # v21 -> v22 -> v23 -> v24 in one open
         assert meta["formula_chunk_hwm"] == str(formula_ids[1])
         assert not {"review_pending", "backup_hash:llm_usage", "live_namespace"} & set(meta)
         assert conn.execute("SELECT COUNT(*) FROM tombstones").fetchone()[0] == 0  # old-table tombstones dropped
@@ -299,8 +299,11 @@ def test_schema_migrate_dry_run_apply_and_restore(tmp_path: Path, capsys) -> Non
     assert applied["config"]["removed"] == ["llm_weekly_token_budget"] and applied["config"]["rule_replacements"] == 1
     assert json.loads((folder / "config.json").read_text(encoding="utf-8")) == {"turn_trace_enabled": True}
     assert (folder / "MEMORY_RULE.md").read_text(encoding="utf-8").strip() == "Use neospike_memory_save."
-    assert "items" in _names(db) and _run(home, "schema-migrate", "--apply", capsys=capsys)[1] == {
-        "applied": False, "reason": "already v22"}
+    assert "items" in _names(db)
+    code, onward = _run(home, "schema-migrate", "--apply", capsys=capsys)  # the v22 file takes v23 and v24 next
+    assert code == 0 and onward["applied"] and onward["backup"] == "memory.pre-v23.db"
+    assert onward["v23"]["migrated"] and onward["v24"]["migrated"]
+    assert _run(home, "schema-migrate", "--apply", capsys=capsys)[1] == {"applied": False, "reason": "already v24"}
     code, restored = _run(home, "schema-migrate", "--restore", capsys=capsys)
     assert code == 0 and restored["restored"] and sorted(restored["config_restored"]) == ["MEMORY_RULE.md", "config.json"]
     assert "memories" in _names(db) and "items" not in _names(db)

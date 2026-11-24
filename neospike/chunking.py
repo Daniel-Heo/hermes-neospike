@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable
 
 CountFn = Callable[[str], int]
 CutFn = Callable[[str, int], list[str]]
@@ -308,105 +307,3 @@ def split_document_parts(text: str, count_tokens: CountFn, *, max_tokens: int,
     return parts
 
 
-# --- conversation transcripts -------------------------------------------------------
-
-CONTEXT_TOKEN_BUDGET = 200  # leading tokens of the previous user message before each chunk
-MESSAGE_JOINER = "\n\n"
-PREVIOUS_USER_LABEL = "user (context): "
-
-
-@dataclass(frozen=True)
-class ConversationChunk:
-    """One conversation chunk: messages seq_start..seq_end (part > 0 only inside one long message).
-    text starts with prefix_chars characters of previous-user-message context."""
-    seq_start: int
-    seq_end: int
-    part: int
-    text: str
-    prefix_chars: int
-
-
-class _HeadedCount:
-    """count_tokens of head + text: the budget of a body that is embedded behind a fixed head."""
-
-    def __init__(self, count: CountFn, head: str) -> None:
-        self._count = count
-        self._head = head
-
-    def __call__(self, text: str) -> int:
-        return self._count(self._head + text)
-
-
-def _longest_prefix_within(text: str, count: CountFn, limit: int, cutter: CutFn | None) -> str:
-    """Longest leading part of text counting <= limit ('' when nothing fits)."""
-    if count(text) <= limit:
-        return text
-    if cutter is not None:
-        pieces = cutter(text, limit)
-        if pieces and pieces[0] and count(pieces[0]) <= limit:
-            return pieces[0]
-    low, high = 0, len(text)
-    while low < high:
-        mid = (low + high + 1) // 2
-        if count(text[:mid]) <= limit:
-            low = mid
-        else:
-            high = mid - 1
-    return text[:low]
-
-
-def format_message(role: str, content: str) -> str:
-    return f"{role}: {content}"
-
-
-def _context_head(user_text: str | None, count: CountFn, limit: int, cutter: CutFn | None) -> str:
-    if not user_text:
-        return ""
-    head = _longest_prefix_within(PREVIOUS_USER_LABEL + user_text, count, limit, cutter)
-    return head + MESSAGE_JOINER if len(head) > len(PREVIOUS_USER_LABEL) else ""
-
-
-def pack_conversation_chunks(
-    messages: Sequence[tuple[int, str, str]], count_tokens: CountFn, *, max_tokens: int,
-    context_tokens: int = CONTEXT_TOKEN_BUDGET, overlap_tokens: int = 64,
-    cut_tokens: CutFn | None = None, context: str | None = None,
-) -> list[ConversationChunk]:
-    """Chunks of (seq, role, content) messages cut at message boundaries, each within max_tokens.
-
-    Every chunk starts with the leading context_tokens of the last user message before its first
-    message (``context`` is that message for messages[0]). Only one message over the budget is
-    split, inside itself, by pack_markdown_chunks' paragraph/line/sentence packing with overlap_tokens.
-    Greedy and prefix-stable: appending messages changes only the last chunk and adds new ones,
-    so re-chunking may restart at the last chunk's first message.
-    """
-    if max_tokens < 1 or overlap_tokens < 0 or overlap_tokens >= max_tokens or not 0 <= context_tokens < max_tokens:
-        raise ValueError("Expected max_tokens > overlap_tokens >= 0 and max_tokens > context_tokens >= 0")
-    budget = _Budget(count_tokens, max_tokens, cut_tokens)
-    chunks: list[ConversationChunk] = []
-    last_user = context
-    head, blocks, first_seq, last_seq = "", [], 0, 0
-    for seq, role, content in messages:
-        block = format_message(role, content)
-        if blocks:
-            if budget.fits(head + MESSAGE_JOINER.join([*blocks, block])):
-                blocks.append(block)
-                last_seq = seq
-                if role == "user":
-                    last_user = content
-                continue
-            chunks.append(ConversationChunk(first_seq, last_seq, 0, head + MESSAGE_JOINER.join(blocks), len(head)))
-            blocks = []
-        head = _context_head(last_user, count_tokens, context_tokens, cut_tokens)
-        if budget.fits(head + block):
-            blocks, first_seq, last_seq = [block], seq, seq
-        else:
-            inner = _Budget(_HeadedCount(count_tokens, head), max_tokens, None)
-            # The inner budget counts the context head too; the overlap is measured on the body only.
-            body_overlap = overlap_tokens + count_tokens(head) - count_tokens("")
-            for part, text in enumerate(_pack_atoms(block, inner, body_overlap)):
-                chunks.append(ConversationChunk(seq, seq, part, head + text, len(head)))
-        if role == "user":
-            last_user = content
-    if blocks:
-        chunks.append(ConversationChunk(first_seq, last_seq, 0, head + MESSAGE_JOINER.join(blocks), len(head)))
-    return chunks

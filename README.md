@@ -6,7 +6,7 @@
 
 **An AI agent whose knowledge gathers, assembles, and grows on its own. Second brain + RAG, for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-Neospike is a memory provider plugin for Hermes Agent. The agent saves short facts and decisions as it works, keeps long documents as notes, and indexes past conversations. Code then tidies that knowledge in the background without calling an LLM: related memories are linked, linked groups become topics, and a topic that grows large becomes a note. One daily stage is the exception: it asks your Hermes model whether similar preferences should be kept, merged or removed, and settles similar memory pairs the agent left open (it can be turned off). Embeddings are computed on your machine and everything is stored in one SQLite file.
+Neospike is a memory provider plugin for Hermes Agent. The agent saves short facts and decisions as it works, keeps long documents as notes, and searches past Hermes conversations where Hermes stores them. Code then tidies that knowledge in the background without calling an LLM: related memories are linked, linked groups become topics, and a topic that grows large becomes a note. One daily stage is the exception: it asks your Hermes model whether similar preferences should be kept, merged or removed, and settles similar memory pairs the agent left open (it can be turned off). Embeddings are computed on your machine and everything is stored in one SQLite file.
 
 > Status: used daily on Windows 10. Linux and macOS have not been verified on real machines.
 
@@ -18,7 +18,7 @@ Neospike is a memory provider plugin for Hermes Agent. The agent saves short fac
 | **Notes** | Long documents the agent writes: designs, reports and `TASK_NNN` work orders. |
 | **Docs** | Notes you wrote yourself. The agent and background jobs can read them but not change them. |
 | **Preferences** | Your standing preferences and constraints, kept apart from memories. |
-| **Conversations** | Past Hermes chats, copied in and indexed for search. |
+| **Conversations** | Past Hermes chats, read in place from Hermes's own chat database (`state.db`, read-only); Neospike keeps no copy. |
 | **Topics** | Groups of related memories, made and named by code. |
 
 On top of that storage:
@@ -137,9 +137,7 @@ Settings are in `$HERMES_HOME/neospike/config.json`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | On/off switch (Setup tab). `false` pauses Neospike in this home without uninstalling it: no automatic recall, no conversation capture, no save follow-up, tool calls and MCP searches return an error, the daily job skips the home, and the embedding service is asked to stop unless another home uses it. Turning it back on works from the next turn, without a restart. |
-| `conversation_capture` | `true` | Copy user and assistant turns into the conversation store, with secrets masked. |
-| `conversation_prefetch` | `false` | Also add conversation excerpts to automatic recall. |
+| `enabled` | `true` | On/off switch (Setup tab). `false` pauses Neospike in this home without uninstalling it: no automatic recall, no save follow-up, tool calls and MCP searches return an error, the daily job skips the home, and the embedding service is asked to stop unless another home uses it. Turning it back on works from the next turn, without a restart. |
 | `recall_log_enabled` | `true` | Write one log line per recall under `neospike/logs` (ids and scores only, never the query text). |
 | `recall_log_months` | `12` | Months of recall logs to keep. |
 | `turn_trace_enabled` | `false` | Add short Neospike diagnostics to chat replies. |
@@ -167,11 +165,9 @@ Environment variables:
 
 1. `backup`: back up the database.
 2. `link-prune`: remove links whose memory or note is gone.
-3. `conv-import`: bring in conversations added or changed since the last run.
-4. `conv-index`: index the new conversation text.
-5. `embed-pending`: embed memories that were saved while the embedder was unavailable, then link them.
-6. `topic-discover`: turn linked groups into topics.
-7. `topic-to-note`: turn large topics into notes.
+3. `embed-pending`: embed memories that were saved while the embedder was unavailable, then link them.
+4. `topic-discover`: turn linked groups into topics.
+5. `topic-to-note`: turn large topics into notes.
 
 A failure is reported to Bot Chat. A successful run reports nothing.
 
@@ -198,7 +194,6 @@ In the same run it then judges the memory pairs that a save returned and the age
 - memories: `memory-search`, `memory-count`, `memory-update`, `memory-delete`, `memory-revisions`, `memory-restore`
 - notes: `note-save`, `note-read`, `note-search`, `note-delete`, `note-restore`
 - preferences: `pref-add`, `pref-update`, `pref-delete`, `pref-list`
-- conversations: `conv-import`, `conv-index`, `conv-search`, `conv-read`
 - backup and maintenance: `backup`, `backup-restore`, `reembed`
 
 A command prints its result as JSON. A failed command prints `{"error": ..., "message": ...}` and exits 1, also when the embedding model or the embedding service is not available (the message names the missing model file); a wrong argument prints the usage and exits 2.
@@ -217,9 +212,9 @@ A database embedded with a different model or dimension is refused until `reembe
 What Neospike does outside its own data folder (`$HERMES_HOME/neospike`):
 
 - **Network.** Two things contact a remote host. (1) The model download: `install.py` and the dashboard Setup tab run the Hugging Face CLI (`hf download Xenova/bge-m3` at a pinned revision). (2) The daily batch: preference data is extracted and reworked by the selected LLM model. The packages are installed by the Hermes package manager (`hermes plugins enable`), which downloads them from the package index. The embedding service listens only on a local socket (a Unix socket, or `127.0.0.1` with a per-request token on Windows). There is no telemetry, analytics or update check.
-- **Reads outside the data folder.** `conv-import`, the provider, the dashboard and the MCP server open Hermes's `$HERMES_HOME/state.db` read-only to read past conversations. `install.py` reads `$HERMES_HOME/config.yaml` and `$HERMES_HOME/cron/jobs.json`. The daily cron script reads `config.yaml` of the root home and of each profile (`memory.provider`) to find the homes that use Neospike.
+- **Reads outside the data folder.** The provider, the dashboard and the MCP server open Hermes's `$HERMES_HOME/state.db` read-only to read past conversations; nothing from it is copied into `memory.db`. `install.py` reads `$HERMES_HOME/config.yaml` and `$HERMES_HOME/cron/jobs.json`. The daily cron script reads `config.yaml` of the root home and of each profile (`memory.provider`) to find the homes that use Neospike.
 - **Shell commands and child processes.** All of them run without a shell. `install.py` runs `hermes --print-runtime-command` (to find the Hermes runtime Python), `uv pip uninstall neospike` (only when an earlier install left that package in the Hermes CLI environment), `hf download`, the environment, import and provider checks of `neospike.runtime_check`, `hermes plugins enable`, `hermes config set memory.provider neospike`, `hermes cron create` / `edit` / `remove`, and `claude mcp remove` / `add-json`; with `--check` it also runs `hermes memory status`; with `--uninstall` it runs `hermes cron remove`, `claude mcp get` / `remove`, `hermes plugins remove neospike` (or `hermes memory off` when the plugin folder is already gone). The dashboard runs `hermes config get` / `set memory.provider`, `hf download`, the Neospike CLI, and the dependency and provider checks of `neospike.runtime_check`. The provider checks the embedding service's dependencies with `neospike.runtime_check` before it reports itself available. The MCP server only reads; it runs no Neospike CLI child. Every Python child (`hf download`, the CLI, the checks, the MCP server, the cron script's CLI call and the embedding service) runs on the Hermes runtime Python through `hermes_launch.py`, which imports Hermes's `hermes_bootstrap` to select the package manager's environment.
-- **Long-running background process.** The embedding service (`neospike.inference`, started through `hermes_launch.py`) is started on first use as a detached process and keeps running after the agent exits; one service serves every profile of a Hermes home. It stops on Ctrl-C or SIGTERM, or when asked over its socket (with its token) by `install.py --uninstall` or by turning the Setup tab switch off, unless another home still uses it. Its socket and log (`inference.log`) are in `$HERMES_HOME/neospike/.cache`. Inside the provider, the conversation indexer and the save follow-up run as daemon threads.
+- **Long-running background process.** The embedding service (`neospike.inference`, started through `hermes_launch.py`) is started on first use as a detached process and keeps running after the agent exits; one service serves every profile of a Hermes home. It stops on Ctrl-C or SIGTERM, or when asked over its socket (with its token) by `install.py --uninstall` or by turning the Setup tab switch off, unless another home still uses it. Its socket and log (`inference.log`) are in `$HERMES_HOME/neospike/.cache`. Inside the provider, the save follow-up runs as a daemon thread.
 - **Files written outside the data folder.** `install.py` copies the plugin to `$HERMES_HOME/plugins/neospike` (staged in, and the previous copy kept in, `$HERMES_HOME/neospike/.install`; a `neospike.previous` or `neospike.installing` folder an earlier install left in `$HERMES_HOME/plugins` is removed, because Hermes would load it as a second copy of the plugin), the cron scripts to `$HERMES_HOME/scripts`, the model to `$HERMES_HOME/models/bge-m3-onnx`, adds `neospike` to `plugins.enabled` in `$HERMES_HOME/config.yaml` (and, through `hermes config set`, `auxiliary.neospike_pref_reconcile.provider: auto` in each home that has no such slot), and registers the `neospike-mcp` MCP server in Claude Code at user scope through `claude mcp add-json`. `MEMORY_RULE.md` is created inside the data folder.
 - **Credentials.** Neospike stores no tokens, API keys or passwords. The model is not gated, so no Hugging Face token is needed. The LLM call goes through Hermes, which holds the provider credentials; Neospike never reads them. The dashboard passes its child processes only a fixed list of environment variables and discards their output.
 
