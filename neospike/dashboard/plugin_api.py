@@ -27,13 +27,14 @@ _PKG_PARENT_DIR = str(Path(__file__).resolve().parents[2])
 if _PKG_PARENT_DIR not in sys.path:
     sys.path.insert(0, _PKG_PARENT_DIR)
 
-from neospike._wincompat import chmod as _win_chmod, default_hermes_home
-from neospike.config import (DEFAULT_SAVE_CRITERIA, ENABLED_KEY, EXTRACTION_LANGUAGE_DEFAULT, OLD_CONFIG_KEYS,
-                             REMOVED_CONFIG_KEYS, SaveCriteriaLimits, parse_extraction_language, read_enabled, read_memory_rule,
-                             write_memory_rule)
+from neospike._wincompat import chmod as _win_chmod, default_hermes_home, shared_inference_home
+from neospike.config import (DEFAULT_SAVE_CRITERIA, ENABLED_KEY, EXTRACTION_LANGUAGE_DEFAULT, MCP_PORT_DEFAULT,
+                             OLD_CONFIG_KEYS, REMOVED_CONFIG_KEYS, SaveCriteriaLimits, parse_extraction_language,
+                             parse_mcp_port, read_enabled, read_memory_rule, write_memory_rule)
 from neospike.database import canonical_database_path
 from neospike import hermes_runtime
 from neospike import inference  # stdlib only at import; release_daemon for the on/off switch
+from neospike import mcp_http  # stdlib only at import; stop_running for the on/off switch
 from neospike import runtime_check  # stdlib only; its checks run in the Hermes runtime
 from neospike.notes import (
     NoteError, head_row, list_notes, note_history, note_record, note_related, note_titles,
@@ -212,6 +213,8 @@ def _collect_status() -> dict[str, Any]:
             ENABLED_KEY: read_enabled(home),
             "turn_trace_enabled": _saved_setting(saved, "turn_trace_enabled", False),
             "extraction_language": _saved_setting(saved, "extraction_language", EXTRACTION_LANGUAGE_DEFAULT),
+            "mcp_port": _saved_setting(saved, "mcp_port", MCP_PORT_DEFAULT),
+            "mcp_port_applies": shared_inference_home(home) == home,
         },
         "database": _database_summary(canonical_database_path(home / "neospike", "memory")),
         "disk": {"free_bytes": shutil.disk_usage(home).free},
@@ -228,6 +231,8 @@ class ConfigBody(BaseModel):
     extraction_language: str | None = None
     # The on/off switch (Config tab); false pauses Neospike in this home and asks the shared daemon to stop.
     enabled: bool | None = None
+    # Port of the shared MCP server (root home); it takes effect after a gateway restart and install.py again.
+    mcp_port: int | None = None
 
 
 def _saved_setting(saved: dict[str, Any], key: str, default: Any = None) -> Any:
@@ -299,11 +304,28 @@ def config_route(request: ConfigBody):
             payload["extraction_language"] = parse_extraction_language(payload["extraction_language"])
         except ValueError as exc:
             raise HTTPException(422, {"error": "invalid", "message": str(exc)}) from exc
+    if "mcp_port" in payload:
+        try:
+            payload["mcp_port"] = parse_mcp_port(payload["mcp_port"])
+        except ValueError as exc:
+            raise HTTPException(422, {"error": "invalid", "message": str(exc)}) from exc
     _save_config_overlay(_home_dir_path() / "neospike" / "config.json", payload)
     reply = {"saved": True, "config": payload, "reindex_performed": False}
     if payload.get(ENABLED_KEY) is False:
         reply["daemon"] = _release_daemon(_home_dir_path())
+        reply["mcp_server"] = _stop_mcp_server(_home_dir_path())
     return reply
+
+
+def _stop_mcp_server(home: Path) -> str:
+    """The shared MCP server serves the root home: its switch turned off stops it (mcp_http.stop_running);
+    a profile's switch leaves it running ("not_root")."""
+    if shared_inference_home(home) != home:
+        return "not_root"
+    try:
+        return mcp_http.stop_running(home)
+    except OSError as exc:
+        return f"error: {exc}"
 
 
 def _release_daemon(home: Path) -> dict[str, Any]:

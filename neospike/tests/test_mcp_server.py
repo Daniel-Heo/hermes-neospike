@@ -1,7 +1,8 @@
-﻿"""Contract tests: MCP stdio server for Claude Code, TASK CLI helpers, dashboard env.
+﻿"""Contract tests: the MCP HTTP server for Claude Code and Hermes, TASK CLI helpers, dashboard env.
 
-MCP tests start the real server process through the SDK stdio client. The server
-uses the deterministic bag-of-words embedder instead of the embedding daemon.
+MCP tests start the real server process on a free test port and talk to it through the SDK streamable-http
+client with the token header. The server uses the deterministic bag-of-words embedder instead of the
+embedding daemon.
 Without the optional `mcp` extra those tests are skipped.
 """
 from __future__ import annotations
@@ -15,10 +16,12 @@ from pathlib import Path
 
 import pytest
 
-from neospike.config import NeospikeConfig
 from neospike.database import canonical_database_path
 from neospike.notes import NoteService, owned_paths
 from neospike.store import MemoryStore
+from neospike.mcp_headers import authorization_headers
+from neospike.mcp_http import server_url
+from neospike.tests.test_mcp_http import TOKEN, RunningServer, prepare_home, stop_all
 from neospike.tests.test_notes import DIMENSIONS, BowEmbedder
 
 HAS_MCP = importlib.util.find_spec("mcp") is not None
@@ -26,17 +29,6 @@ needs_mcp = pytest.mark.skipif(not HAS_MCP, reason="optional extra [mcp] is not 
 REPO = Path(__file__).resolve().parents[2]
 EXPECTED_TOOLS = {"note_read", "mem_search", "mem_period", "chat_search", "chat_read", "chat_period"}
 RETIRED_TOOLS = {"memory_search", "note_search", "doc_search", "note_related"}  # one mem_search; note_related left
-# Server process: stub Hermes core, swap the daemon for BowEmbedder, then run the real server entrypoint.
-_SERVER_BOOT = (
-    "import sys,types;"
-    "a=types.ModuleType('agent');m=types.ModuleType('agent.memory_provider');"
-    "m.MemoryProvider=type('MemoryProvider',(),{});a.memory_provider=m;"
-    "sys.modules.setdefault('agent',a);sys.modules.setdefault('agent.memory_provider',m);"
-    "from neospike import mcp_server as s;from neospike.tests.test_notes import BowEmbedder;"
-    "s.EmbeddingClient=BowEmbedder;"
-    "sys.exit(s.main(sys.argv[1:]))"
-)
-
 TASK_BODY = (
     "# TASK_101 — MCP 연동\n"
     "\n"
@@ -70,12 +62,14 @@ def _save(home: Path, title: str, body: str, tags: list[str]) -> dict:
 
 
 @pytest.fixture()
-def home(tmp_path: Path) -> Path:
+def home(tmp_path: Path):
     home = tmp_path / "hermes"
-    NeospikeConfig().save(home)
+    home.mkdir()
+    prepare_home(home)
     _save(home, "TASK_101", TASK_BODY, ["task", "status:active"])
     _save(home, "회의 메모", PLAIN_BODY, ["meeting"])
-    return home
+    yield home
+    stop_all(home)
 
 
 def _child_env() -> dict[str, str]:
@@ -86,28 +80,34 @@ def _child_env() -> dict[str, str]:
 
 
 class _Scenario:
-    """Runs steps(session) against a freshly started server process."""
+    """Runs steps(session) against a freshly started server process (HTTP, with the token header)."""
 
     def __init__(self, home: Path, steps) -> None:
         self.home = home
         self.steps = steps
+        self.port = 0
         self.initialized = None  # the server's initialize result
 
     async def __call__(self):
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
+        import httpx2
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
 
-        parameters = StdioServerParameters(command=sys.executable, args=["-c", _SERVER_BOOT, "--home", str(self.home)],
-                                           env=_child_env(), cwd=str(REPO))
-        async with stdio_client(parameters) as (read, write):
-            async with ClientSession(read, write) as session:
-                self.initialized = await session.initialize()
-                return await self.steps(session)
+        async with httpx2.AsyncClient(headers=authorization_headers(TOKEN)) as client:
+            async with streamable_http_client(server_url(self.port), http_client=client) as (read, write):
+                async with ClientSession(read, write) as session:
+                    self.initialized = await session.initialize()
+                    return await self.steps(session)
+
+    def run(self):
+        import anyio
+        with RunningServer(self.home) as record:
+            self.port = record.port
+            return anyio.run(self)
 
 
 def _run(home: Path, steps):
-    import anyio
-    return anyio.run(_Scenario(home, steps))
+    return _Scenario(home, steps).run()
 
 
 async def _call(session, name: str, arguments: dict) -> tuple[bool, dict]:
@@ -145,7 +145,9 @@ Pick the tool by what you know:
 3. Only the time ("yesterday", "the last 2 days") -> chat_period for conversations (with a per-conversation summary) or mem_period for memories and notes created or changed then.
 4. Then read in full: note_read for a note or doc body, chat_read for one message with its tool results and neighbours.
 
-Order: mem_search first; go to chat_search or chat_period only for original wording or evidence; then chat_read. Start with a small limit and narrow with since/until, role or session instead of raising it. A newer decision overrides an older one; superseded memories appear only with include_history."""
+Order: mem_search first; go to chat_search or chat_period only for original wording or evidence; then chat_read. Start with a small limit and narrow with since/until, role or session instead of raising it. A newer decision overrides an older one; superseded memories appear only with include_history.
+
+mem_search and mem_period search every project and show each memory's project; weigh a memory from another project accordingly."""
 # Each tool description opens with when to use it, in these words.
 EXPECTED_FIRST_SENTENCES = {
     "mem_search": "Find past decisions, memories, notes and docs by meaning; use first before deciding or asking "
@@ -170,9 +172,8 @@ async def _list_tools(session) -> list:
 
 @needs_mcp
 def test_initialize_sends_the_agreed_instructions_within_the_client_limit(home: Path) -> None:
-    import anyio
     scenario = _Scenario(home, _list_tool_names)
-    anyio.run(scenario)
+    scenario.run()
     instructions = scenario.initialized.instructions
     assert instructions == EXPECTED_INSTRUCTIONS
     assert len(instructions) <= CLIENT_TEXT_LIMIT
@@ -205,9 +206,8 @@ def test_tool_list_is_exactly_the_six_read_only_tools(home: Path) -> None:
 
 @needs_mcp
 def test_initialize_reports_the_plugin_version(home: Path) -> None:
-    import anyio
     scenario = _Scenario(home, _list_tool_names)
-    anyio.run(scenario)
+    scenario.run()
     manifest = (REPO / "neospike" / "plugin.yaml").read_text(encoding="utf-8")
     version = next(line.split(":", 1)[1].strip() for line in manifest.splitlines() if line.startswith("version:"))
     assert version and scenario.initialized.server_info.name == "neospike-mcp"

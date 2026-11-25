@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,13 +15,14 @@ from pathlib import Path
 
 from neospike import hermes_runtime
 from neospike import inference
+from neospike import mcp_http
 from neospike import runtime_check
 from neospike._wincompat import shared_inference_home
-from neospike.config import read_memory_rule, memory_rule_file_path, write_memory_rule
+from neospike.config import MCP_PORT_DEFAULT, NeospikeConfig, read_memory_rule, memory_rule_file_path, write_memory_rule
+from neospike.mcp_headers import TOKEN_VARIABLE, env_file_path, read_env_token
 from neospike.cron.neospike_cron_common import configured_memory_provider, target_homes
 from neospike.cron.neospike_cron_common import yaml_scalar as _scalar_of
 from neospike.cron.neospike_cron_common import _yaml_data
-from neospike.store import memory_db_path, pick_namespace
 
 
 # BAAI/bge-m3 int8 ONNX at a pinned revision; not gated (MIT).
@@ -66,7 +68,12 @@ DELIVER_FAIL = "bot-chat"
 MCP_SERVER_NAME, MCP_REG_SCOPE = "neospike-mcp", "user"
 # The name earlier installs registered; removed when its entry points at the home being installed or uninstalled.
 OLD_MCP_SERVER_NAME = "neospike"
-MCP_MODULE = "neospike.mcp_server"
+# Claude Code reads the token through this helper of the installed plugin (headersHelper), never from its settings.
+MCP_HEADERS_SCRIPT = "mcp_headers.py"
+# Hermes registration: <root home>/config.yaml mcp_servers.<MCP_SERVER_NAME>; Hermes expands ${VAR} from .env.
+# `hermes mcp add` has no option for a header value, so the entry is written as text (like plugins.enabled).
+HERMES_MCP_SECTION = "mcp_servers"
+HERMES_MCP_AUTHORIZATION = "Bearer ${" + TOKEN_VARIABLE + "}"
 HF_CLI_MODULE = "huggingface_hub.cli.hf"  # the `hf` console script's module
 # An earlier install.py ran `uv pip install` of this package into the Hermes CLI venv (hermes-agent/venv);
 # that copy is removed (this distribution only), since every Neospike process now runs the plugin folder.
@@ -419,23 +426,156 @@ def flatten_model_file(text_target: Path) -> None:
         os.replace(downloaded, text_target / MODEL_ONNX_NAME)
 
 
+def mcp_port_of(home: Path) -> int:
+    """mcp_port of <home>/neospike/config.json; the default when the file is missing or unreadable."""
+    try:
+        return NeospikeConfig.load(home).mcp_port
+    except (OSError, ValueError, TypeError):
+        return MCP_PORT_DEFAULT
+
+
+def headers_helper_command(python: str, home: Path) -> str:
+    """Command line Claude Code runs at each connection: the installed mcp_headers.py on the Hermes runtime
+    *python* (-I, stdlib only) prints the Authorization header read from <home>/.env."""
+    argv = [python, "-I", str(home / "plugins" / PLUGIN_FOLDER / MCP_HEADERS_SCRIPT), str(home)]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
 def mcp_server_entry(python: str, home: Path) -> dict:
-    """The neospike MCP server entry, same shape as the hand-made registration. The Hermes runtime *python*
-    starts the installed plugin's hermes_launch.py (-I: no launch folder, PYTHONPATH or user site on
-    sys.path), which selects the current dependency environment at every start; no environment folder is
-    written here."""
-    namespace = pick_namespace(None, memory_db_path(home))
-    command = runtime_target_command(python, home, [MCP_MODULE, "--home", str(home), "--owner", namespace])
-    return {
-        "type": "stdio",
-        "command": command[0],
-        "args": command[1:],
-        "env": {
-            "HERMES_HOME": str(home),
-            "HERMES_BGE_M3_DIR": str(shared_inference_home(home) / "models" / MODEL_FOLDER),
-            "PYTHONIOENCODING": "utf-8",
-        },
-    }
+    """The Claude Code entry of the shared HTTP server: its URL and the header helper (no token in it)."""
+    return {"type": "http", "url": mcp_http.server_url(mcp_port_of(home)),
+            "headersHelper": headers_helper_command(python, home)}
+
+
+def ensure_mcp_token(home: Path) -> bool:
+    """NEOSPIKE_MCP_TOKEN in <home>/.env, made once when missing (True = made now); under the server start lock
+    so a starting plugin cannot make a second one."""
+    if read_env_token(env_file_path(home)):
+        return False
+    with mcp_http.start_lock(home):
+        made = not read_env_token(env_file_path(home))
+        mcp_http.ensure_token(home)
+    if made:
+        print(f"Added {TOKEN_VARIABLE} to {env_file_path(home)}")
+    return made
+
+
+def hermes_mcp_entry_lines(home: Path, indent: str, newline: str) -> list[str]:
+    """The text lines of mcp_servers.<MCP_SERVER_NAME> at *indent*."""
+    inner = indent + "  "
+    return [f"{indent}{MCP_SERVER_NAME}:{newline}",
+            f"{inner}url: {mcp_http.server_url(mcp_port_of(home))}{newline}",
+            f"{inner}headers:{newline}",
+            f"{inner}  Authorization: \"{HERMES_MCP_AUTHORIZATION}\"{newline}"]
+
+
+def _significant(line: str) -> bool:
+    return bool(line.strip()) and not line.lstrip().startswith("#")
+
+
+def _indent_of(line: str) -> str:
+    return line[:len(line) - len(line.lstrip())]
+
+
+def _hermes_mcp_spans(lines: list[str]) -> tuple[int | None, int, tuple[int, int] | None, str]:
+    """(index of the top-level `mcp_servers:` line or None, end of its block, (start, end) of the
+    MCP_SERVER_NAME child or None, the child indent)."""
+    header = next((index for index, line in enumerate(lines)
+                   if re.match(re.escape(HERMES_MCP_SECTION) + r"\s*:", line)), None)
+    if header is None:
+        return None, len(lines), None, "  "
+    end = next((index for index in range(header + 1, len(lines))
+                if _significant(lines[index]) and not lines[index][0].isspace()), len(lines))
+    children = [index for index in range(header + 1, end) if _significant(lines[index])]
+    indent = _indent_of(lines[children[0]]) if children else "  "
+    own = re.compile(re.escape(indent) + r"['\"]?" + re.escape(MCP_SERVER_NAME) + r"['\"]?\s*:")
+    start = next((index for index in children if own.match(lines[index])), None)
+    if start is None:
+        return header, end, None, indent
+    child_end = next((index for index in children if index > start and len(_indent_of(lines[index])) <= len(indent)),
+                     None)
+    if child_end is None:  # the last child: up to its last significant line
+        child_end = max(index for index in children if index >= start) + 1
+    return header, end, (start, child_end), indent
+
+
+def _read_config_lines(home: Path) -> tuple[bytes, list[str], str]:
+    try:
+        raw = (home / "config.yaml").read_bytes()
+    except FileNotFoundError:
+        raw = b""
+    lines = raw.decode("utf-8-sig").splitlines(keepends=True)
+    return raw, lines, "\r\n" if lines and lines[0].endswith("\r\n") else "\n"
+
+
+def _write_config_lines(home: Path, raw: bytes, lines: list[str]) -> None:
+    (home / "config.yaml").write_bytes((BOM_BYTES if raw.startswith(BOM_BYTES) else b"") + "".join(lines).encode("utf-8"))
+
+
+def hermes_mcp_registered(home: Path) -> bool:
+    """<home>/config.yaml has mcp_servers.<MCP_SERVER_NAME> with this install's URL and header (PyYAML read)."""
+    try:
+        data = _yaml_data((home / "config.yaml").read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return False
+    servers = data.get(HERMES_MCP_SECTION) if isinstance(data, dict) else None
+    entry = servers.get(MCP_SERVER_NAME) if isinstance(servers, dict) else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("headers"), dict):
+        return False
+    return (entry.get("url") == mcp_http.server_url(mcp_port_of(home))
+            and entry["headers"].get("Authorization") == HERMES_MCP_AUTHORIZATION)
+
+
+def apply_hermes_mcp_registration(home: Path, dry_run: bool = False) -> bool:
+    """Write mcp_servers.<MCP_SERVER_NAME> into <home>/config.yaml as text (True = changed); the BOM, comments and
+    every other line and server stay (another server entry is never touched)."""
+    raw, lines, newline = _read_config_lines(home)
+    header, end, child, indent = _hermes_mcp_spans(lines)
+    entry = hermes_mcp_entry_lines(home, indent, newline)
+    if header is not None:
+        rest = _scalar_of(lines[header].split(":", 1)[1])
+        if rest and not re.fullmatch(r"\{\s*\}|null|~", rest):
+            raise SystemExit(f"{HERMES_MCP_SECTION} in {home / 'config.yaml'} is not a block mapping; add "
+                             f"{MCP_SERVER_NAME} (url {mcp_http.server_url(mcp_port_of(home))}) by hand.")
+    if child is not None and lines[child[0]:child[1]] == entry:
+        return False
+    if dry_run:
+        print("+ write", f"{HERMES_MCP_SECTION}.{MCP_SERVER_NAME}", "in", home / "config.yaml",
+              f"(url {mcp_http.server_url(mcp_port_of(home))})")
+        return True
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += newline
+    if header is None:
+        lines += [f"{HERMES_MCP_SECTION}:{newline}", *entry]
+    elif child is not None:
+        lines[child[0]:child[1]] = entry
+    else:
+        if _scalar_of(lines[header].split(":", 1)[1]):
+            lines[header] = f"{HERMES_MCP_SECTION}:{newline}"
+        last = max((index for index in range(header, end) if _significant(lines[index])), default=header)
+        lines[last + 1:last + 1] = entry
+    _write_config_lines(home, raw, lines)
+    print(f"Registered MCP server {MCP_SERVER_NAME} in {home / 'config.yaml'}")
+    return True
+
+
+def remove_hermes_mcp_registration(home: Path, dry_run: bool = False) -> bool:
+    """Delete mcp_servers.<MCP_SERVER_NAME> from <home>/config.yaml (True = it was there); an emptied section
+    becomes `mcp_servers: {}`."""
+    raw, lines, newline = _read_config_lines(home)
+    header, end, child, _indent = _hermes_mcp_spans(lines)
+    if child is None:
+        return False
+    if dry_run:
+        print("+ remove", f"{HERMES_MCP_SECTION}.{MCP_SERVER_NAME}", "from", home / "config.yaml")
+        return True
+    del lines[child[0]:child[1]]
+    end -= child[1] - child[0]
+    if not any(_significant(lines[index]) for index in range(header + 1, end)):
+        lines[header] = f"{HERMES_MCP_SECTION}: {{}}{newline}"
+    _write_config_lines(home, raw, lines)
+    print(f"Removed MCP server {MCP_SERVER_NAME} from {home / 'config.yaml'}")
+    return True
 
 
 def mcp_remove_argv(claude: str, name: str) -> list[str]:
@@ -476,11 +616,13 @@ def skip_cron_for_profile(home: Path) -> bool:
 
 
 def apply_mcp_registration(python: str, home: Path, runner=None) -> None:
-    """Register or overwrite the neospike MCP server in Claude Code; skipped when `claude` is absent or *home* is
-    a profile home."""
+    """The token, the Hermes config.yaml entry, then register or overwrite the server in Claude Code (that part
+    skipped when `claude` is absent); all skipped for a profile home."""
     runner = _runner_or_default(runner)
     if skip_mcp_for_profile(home):
         return
+    ensure_mcp_token(home)
+    apply_hermes_mcp_registration(home)
     claude = shutil.which("claude")
     if not claude:
         print(f"Claude Code (claude) not found; MCP server {MCP_SERVER_NAME} not registered.")
@@ -743,30 +885,43 @@ def uninstall_cron(hermes: str, home: Path, dry_run: bool) -> None:
 
 
 def mcp_points_at(claude: str, home: Path, runner=None, name: str = MCP_SERVER_NAME) -> bool:
-    """True when Claude Code has the MCP server *name* and its entry names *home* (`claude mcp get`, read only)."""
+    """True when Claude Code has the MCP server *name* and its entry names *home* (the old stdio entry and the
+    header helper carry the home path) or, for the current name, this install's URL (`claude mcp get`, read
+    only)."""
     runner = _runner_or_default(runner)
     try:
         shown = runner([claude, "mcp", "get", name], capture_output=True, text=True, encoding="utf-8",
                        errors="replace", timeout=PROBE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return False
-    return shown.returncode == 0 and os.path.normcase(str(home)) in os.path.normcase(shown.stdout or "")
+    text = os.path.normcase(shown.stdout or "")
+    url = os.path.normcase(mcp_http.server_url(mcp_port_of(home)))
+    return shown.returncode == 0 and (os.path.normcase(str(home)) in text or (name == MCP_SERVER_NAME and url in text))
 
 
 def uninstall_mcp(home: Path, dry_run: bool, runner=None) -> None:
-    """Step 2: `claude mcp remove` of the current and the old server name, each only when its user-scope entry
-    points at *home* (never for a profile home)."""
+    """Step 2 (never for a profile home): stop the shared server, `claude mcp remove` of the current and the old
+    server name (each only when its user-scope entry points at *home*), then the Hermes config.yaml entry and
+    the NEOSPIKE_MCP_TOKEN line of <home>/.env."""
     if skip_mcp_for_profile(home):
         return
+    if dry_run:
+        print("+ stop the MCP server", mcp_http.server_url(mcp_port_of(home)), "(when running)")
+    else:
+        print(f"MCP server: {mcp_http.stop_running(home)}")
     claude = shutil.which("claude")
     if not claude:
         print(f"Claude Code (claude) not found; MCP server {MCP_SERVER_NAME} left as it is.")
-        return
-    for name in (MCP_SERVER_NAME, OLD_MCP_SERVER_NAME):
-        if mcp_points_at(claude, home, runner, name):
-            _plan_or_run(mcp_remove_argv(claude, name), dry_run)
-        else:
-            print(f"Claude Code MCP server {name}: not registered for {home} (skipped)")
+    else:
+        for name in (MCP_SERVER_NAME, OLD_MCP_SERVER_NAME):
+            if mcp_points_at(claude, home, runner, name):
+                _plan_or_run(mcp_remove_argv(claude, name), dry_run)
+            else:
+                print(f"Claude Code MCP server {name}: not registered for {home} (skipped)")
+    if not remove_hermes_mcp_registration(home, dry_run):
+        print(f"Hermes MCP server {MCP_SERVER_NAME}: not in {home / 'config.yaml'} (skipped)")
+    if mcp_http.remove_token(home, dry_run):
+        print(f"{'+ remove' if dry_run else 'Removed'} {TOKEN_VARIABLE} from {env_file_path(home)}")
 
 
 def uninstall_daemon(home: Path, dry_run: bool) -> None:
@@ -902,14 +1057,35 @@ def _print_dry_run(hermes: str, home: Path) -> None:
         claude = shutil.which("claude") or "claude"
         print("+", f"(when `claude mcp get {OLD_MCP_SERVER_NAME}` names {home})",
               subprocess.list2cmdline(mcp_remove_argv(claude, OLD_MCP_SERVER_NAME)))
+        if not read_env_token(env_file_path(home)):
+            print("+ add", TOKEN_VARIABLE, "to", env_file_path(home))
+        if not hermes_mcp_registered(home):
+            apply_hermes_mcp_registration(home, dry_run=True)
         for argv in mcp_argv_list(claude, _dry_run_python(home), home):
             print("+", subprocess.list2cmdline(argv))
 
 
-def _run_check(home: Path, hermes: str, required: list[Path], plugin_yaml: Path) -> int:
+def mcp_problems(home: Path, runner=None) -> list[str]:
+    """--check of the MCP registrations of a root home: the token, the Hermes config.yaml entry and (when
+    `claude` is there) the Claude Code entry."""
+    problems = []
+    if not read_env_token(env_file_path(home)):
+        problems.append(f"{TOKEN_VARIABLE} is missing in {env_file_path(home)} (run install.py again)")
+    if not hermes_mcp_registered(home):
+        problems.append(f"{HERMES_MCP_SECTION}.{MCP_SERVER_NAME} in {home / 'config.yaml'} is missing or does not "
+                        f"point at {mcp_http.server_url(mcp_port_of(home))} (run install.py again)")
+    claude = shutil.which("claude")
+    if claude and not mcp_points_at(claude, home, runner):
+        problems.append(f"Claude Code MCP server {MCP_SERVER_NAME} is not registered for {home} (run install.py again)")
+    return problems
+
+
+def _run_check(home: Path, hermes: str, required: list[Path], plugin_yaml: Path, runner=None) -> int:
     """--check: collect every failure, then stop once."""
     problems = audit_installation(home, hermes, required)
     problems += dependency_decl_errors(plugin_yaml)
+    if not is_profile(home):
+        problems += mcp_problems(home, runner)
     if not skip_cron_for_profile(home):
         problems += cron_problems(home)
     problems += old_install_traces(home)

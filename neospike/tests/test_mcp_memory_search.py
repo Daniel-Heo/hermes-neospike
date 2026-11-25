@@ -79,6 +79,7 @@ def tools(tmp_path: Path) -> NeospikeTools:
         old = remember("memory superseded", 0.95)
         new = remember("memory replacement", MEMORY_SEARCH_COSINE_THRESHOLD + ON_FLOOR_FLOAT32)  # on the floor: kept
         remember("memory of another project", 0.97, scope="project", project=OTHER_PROJECT)
+        remember("memory of one session", 0.96, scope="session", session_id="s-1")
         with store._conn:
             store._conn.execute("UPDATE items SET invalid_at=?, superseded_by=? WHERE id=?", (time.time(), new, old))
             # Floor 0.50, so the chunks sit at 0.75 / 0.72 above it and 0.40 below it.
@@ -112,19 +113,20 @@ def test_search_floor_is_its_own_and_below_the_recall_cutoff() -> None:
 
 def test_memories_notes_and_docs_by_cosine_cut_to_limit(tools: NeospikeTools) -> None:
     every = _search(tools, limit=20)
-    assert [item["text"] for item in every] == ["human chunk 0.99", "auto chunk 0.90", "agent chunk 0.85", "memory high",
-                                                "auto chunk 0.75", "auto chunk 0.72", "memory replacement"]
-    # just below, 0.40, trashed, other project: out
-    assert [round(item["score"], 3) for item in every] == [0.99, 0.9, 0.85, 0.8, 0.75, 0.72,
+    assert [item["text"] for item in every] == ["human chunk 0.99", "memory of another project", "auto chunk 0.90",
+                                                "agent chunk 0.85", "memory high", "auto chunk 0.75", "auto chunk 0.72",
+                                                "memory replacement"]
+    # just below, 0.40, trashed, the session memory (no session here): out
+    assert [round(item["score"], 3) for item in every] == [0.99, 0.97, 0.9, 0.85, 0.8, 0.75, 0.72,
                                                            round(MEMORY_SEARCH_COSINE_THRESHOLD, 3)]
-    assert [item["kind"] for item in every] == [KIND_DOC, KIND_NOTE, KIND_NOTE, KIND_MEMORY, KIND_NOTE, KIND_NOTE,
-                                                KIND_MEMORY]
-    assert [item["text"] for item in _search(tools, limit=3)] == ["human chunk 0.99", "auto chunk 0.90",
-                                                                  "agent chunk 0.85"]
+    assert [item["kind"] for item in every] == [KIND_DOC, KIND_MEMORY, KIND_NOTE, KIND_NOTE, KIND_MEMORY, KIND_NOTE,
+                                                KIND_NOTE, KIND_MEMORY]
+    assert [item["text"] for item in _search(tools, limit=3)] == ["human chunk 0.99", "memory of another project",
+                                                                  "auto chunk 0.90"]
     assert len(_search(tools)) == 5  # default limit
-    doc, memory = every[0], every[3]
+    doc, memory = every[0], every[4]
     assert set(doc) == {"kind", "note_id", "title", "chunk_id", "heading_path", "text", "score"}
-    assert doc["title"] == "human plan" and every[2]["title"] == "TASK_900"
+    assert doc["title"] == "human plan" and every[3]["title"] == "TASK_900"
     assert memory["item_kind"] == "durable" and {"id", "text", "origin", "score", "confidence"} <= set(memory)
 
 
@@ -151,3 +153,19 @@ def test_superseded_memory_only_with_history(tools: NeospikeTools) -> None:
     [old] = [item for item in full if item["text"] == "memory superseded"]
     assert old["score"] == pytest.approx(0.95 * 0.5, abs=1e-6) and "superseded_by" in old
     assert full[-1] is old  # half score ranks it last here
+
+
+def test_search_covers_every_project_and_names_each_memory_project(tools: NeospikeTools) -> None:
+    """One shared server has no working folder: every project of the owner, each memory with project and scope."""
+    by_text = {item["text"]: item for item in _search(tools, limit=20) if item["kind"] == KIND_MEMORY}
+    assert (by_text["memory of another project"]["project"], by_text["memory of another project"]["scope"]) == (
+        OTHER_PROJECT, "project")
+    assert (by_text["memory high"]["project"], by_text["memory high"]["scope"]) == ("", "global")
+    assert "memory of one session" not in by_text  # a session memory stays hidden without its session
+
+
+def test_search_does_not_depend_on_the_server_folder(tools: NeospikeTools, tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    here = [item["text"] for item in _search(tools, limit=20)]
+    monkeypatch.chdir(tmp_path.parent)
+    assert [item["text"] for item in _search(tools, limit=20)] == here

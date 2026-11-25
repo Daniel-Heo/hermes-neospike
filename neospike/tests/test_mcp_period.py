@@ -297,24 +297,28 @@ def _labels(payload: dict) -> list[str]:
 
 def test_mem_period_lists_memories_notes_and_docs_newest_first(mem_tools: NeospikeTools) -> None:
     payload = _mem(mem_tools)
-    assert _labels(payload) == ["human plan", "agent plan", "memory tagged", "memory not embedded yet",
-                                "memory updated later", "memory created only"]  # no topic page, trash, other project
+    assert _labels(payload) == ["human plan", "agent plan", "memory tagged", "memory of another project",
+                                "memory not embedded yet", "memory updated later",
+                                "memory created only"]  # no topic page, trash; every project
     assert payload["truncated"] is False and list(payload)[-1] == "truncated"
     doc, note, memory = payload["results"][0], payload["results"][1], payload["results"][-1]
     assert doc["kind"] == "doc" and note["kind"] == "note" and note["tags"] == ["task"] and note["rev"] == 1
     assert "body" not in note and "text" not in note
     assert memory == {"kind": "memory", "id": mem_tools.ids.created_only, "text": "memory created only",
                       "origin": memory["origin"], "item_kind": "durable", "confidence": 1.0,
+                      "project": "", "scope": "global",
                       "time": datetime.fromtimestamp(T + HOUR).isoformat(timespec="seconds"),
                       "timestamp": T + HOUR, "created_at": T + HOUR, "updated_at": None}
     updated = payload["results"][-2]
     assert updated["created_at"] == T - 10 * DAY and updated["timestamp"] == T + 2 * HOUR
+    other = payload["results"][3]
+    assert (other["project"], other["scope"]) == (OTHER_PROJECT, "project")
 
 
 def test_mem_period_kind_tag_history_order_and_limit(mem_tools: NeospikeTools) -> None:
     assert _labels(_mem(mem_tools, kind="doc")) == ["human plan"]
     assert _labels(_mem(mem_tools, kind="note")) == ["agent plan"]
-    assert [item["kind"] for item in _mem(mem_tools, kind="memory")["results"]] == ["memory"] * 4
+    assert [item["kind"] for item in _mem(mem_tools, kind="memory")["results"]] == ["memory"] * 5
     assert _labels(_mem(mem_tools, tag="task")) == ["agent plan", "memory tagged"]
     history = _mem(mem_tools, kind="memory", include_history=True)["results"]
     [old] = [item for item in history if item["text"] == "memory superseded"]
@@ -324,8 +328,8 @@ def test_mem_period_kind_tag_history_order_and_limit(mem_tools: NeospikeTools) -
     newest = _mem(mem_tools, limit=2)
     assert _labels(newest) == ["human plan", "agent plan"] and newest["truncated"] is True
     rest = _mem(mem_tools, until=newest["results"][-1]["timestamp"], limit=20)
-    assert _labels(rest) == ["memory tagged", "memory not embedded yet", "memory updated later",
-                             "memory created only"]
+    assert _labels(rest) == ["memory tagged", "memory of another project", "memory not embedded yet",
+                             "memory updated later", "memory created only"]
     assert _labels(_mem(mem_tools, since=T - 4 * DAY, until=T)) == ["memory outside"]
     for bad in ({"limit": 0}, {"limit": 21}, {"kind": "chunk"}, {"order": "rank"}, {"include_history": 1},
                 {"since": "x"}, {"since": UNTIL}):

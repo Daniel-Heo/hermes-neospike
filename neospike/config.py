@@ -42,6 +42,8 @@ PREVIOUS_SAVE_CRITERIA = (
 # database meta next to the dimension; a mismatch stops the store until `neospike.cli reembed` runs.
 EMBEDDING_DIMENSIONS = 1024
 EMBEDDING_MODEL = "bge-m3-int8-onnx"
+MCP_PORT_DEFAULT = 47831  # the shared neospike-mcp HTTP server on 127.0.0.1 (root home config.json)
+MCP_PORT_MIN, MCP_PORT_MAX = 1024, 65535
 EMBEDDING_MAX_TOKENS = 2048  # input window (2000-token chunks); a longer document is an error, a longer query is cut to the window
 
 # Old (v21) config keys -> current keys. load() still reads an old key when the new one is
@@ -113,6 +115,8 @@ class NeospikeConfig:
     extraction_language: str = field(default=EXTRACTION_LANGUAGE_DEFAULT)
     # Daily preference tidy-up: the one batch stage that calls an LLM (false: the stage does nothing).
     pref_reconcile_enabled: bool = field(default=True)
+    # Port of the shared MCP server; a change needs a gateway restart and install.py again (the registered URL).
+    mcp_port: int = field(default=MCP_PORT_DEFAULT)
 
     @classmethod
     def load(cls, hermes_home: str | Path) -> "NeospikeConfig":
@@ -134,6 +138,7 @@ class NeospikeConfig:
             map_stale_days=_parse_positive_days(pick("map_stale_days", MAP_STALE_DAYS_DEFAULT), "map_stale_days"),
             extraction_language=parse_extraction_language(pick("extraction_language", EXTRACTION_LANGUAGE_DEFAULT)),
             pref_reconcile_enabled=_parse_flag(pick("pref_reconcile_enabled", True), "pref_reconcile_enabled"),
+            mcp_port=parse_mcp_port(pick("mcp_port", MCP_PORT_DEFAULT)),
         )
 
     def save(self, hermes_home: str | Path) -> Path:
@@ -186,6 +191,13 @@ def _parse_log_months(value: Any) -> int:
     value = _digits_to_int(value)
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= RECALL_LOG_MONTHS_CAP:
         raise ValueError(f"recall_log_months must be an integer from 1 to {RECALL_LOG_MONTHS_CAP}")
+    return value
+
+
+def parse_mcp_port(value: Any) -> int:
+    value = _digits_to_int(value)
+    if isinstance(value, bool) or not isinstance(value, int) or not MCP_PORT_MIN <= value <= MCP_PORT_MAX:
+        raise ValueError(f"mcp_port must be an integer from {MCP_PORT_MIN} to {MCP_PORT_MAX}")
     return value
 
 

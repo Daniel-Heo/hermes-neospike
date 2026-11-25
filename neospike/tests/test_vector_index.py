@@ -1,4 +1,5 @@
-﻿"""Faiss HNSW candidates for the items vectors (memories and document parts; synthetic vectors only)."""
+﻿"""Faiss HNSW candidates for the items vectors in the embedding service (memories and document parts; synthetic
+vectors only)."""
 from __future__ import annotations
 
 import hashlib
@@ -11,7 +12,9 @@ import faiss
 import numpy as np
 import pytest
 
-from neospike import mcp_server, notes, vector_index
+from neospike import mcp_server, notes, vector_index, vector_search
+from neospike.inference import EmbeddingUnavailable
+from neospike.tests.support_vector import use_full_comparison
 from neospike.store import FORMULA_AUTHOR, MemoryStore, dot_similarities
 
 DIMENSIONS = 32
@@ -64,13 +67,6 @@ def _bulk_memories(store: MemoryStore, vectors: np.ndarray, *, importance: float
                                                         (owner,))]
 
 
-@pytest.fixture(autouse=True)
-def _fresh_registry():
-    vector_index.drop_all()
-    yield
-    vector_index.drop_all()
-
-
 @pytest.fixture
 def store(tmp_path: Path):
     opened = MemoryStore(tmp_path / "memory.db", dimensions=DIMENSIONS, semantic_threshold=THRESHOLD)
@@ -90,8 +86,12 @@ def _exact(store: MemoryStore, ids: list[int], query: np.ndarray) -> list[float]
     return dot_similarities(query, [blobs[rowid] for rowid in ids])
 
 
-def _state(store: MemoryStore, table: str = "items"):
-    return vector_index._registry[(vector_index._database_file(store._conn), table)]
+def _state(service, store: MemoryStore, table: str = "items"):
+    return service.state(vector_index._database_file(store._conn), table)
+
+
+def _full_comparison(patch: pytest.MonkeyPatch) -> None:
+    use_full_comparison(patch)
 
 
 def test_recall_top_and_threshold(store: MemoryStore) -> None:
@@ -134,7 +134,7 @@ def test_recall_1024_dimensions(store_1024: MemoryStore) -> None:
     assert range_total > QUERY_COUNT and range_hits / range_total >= MIN_RECALL
 
 
-def test_top_n_after_same_id_changes_by_other_connection(store: MemoryStore) -> None:
+def test_top_n_after_same_id_changes_by_other_connection(store: MemoryStore, search_service) -> None:
     """Old copies of rows changed in place (another connection) never push the true top N out."""
     pool = _clustered(SYNC_ROWS + 1)
     ids = _bulk_memories(store, pool[:SYNC_ROWS])
@@ -151,11 +151,11 @@ def test_top_n_after_same_id_changes_by_other_connection(store: MemoryStore) -> 
                           (_unit(pool[0] + 0.05 * pool[index]).tobytes(), ids[index]))
     other.close()
     hits = store.closest_memories(NAMESPACE, anchor, limit=TOP)
-    assert _state(store).index.ntotal > SYNC_ROWS  # old copies are in the index
+    assert _state(search_service, store).index.ntotal > SYNC_ROWS  # old copies are in the index
     assert len({hit[0] for hit in hits}) == TOP
     assert not set(near) & {hit[0] for hit in hits}
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(vector_index, "EXACT_LIMIT", 10 ** 9)
+        _full_comparison(patch)
         assert store.closest_memories(NAMESPACE, anchor, limit=TOP) == hits
 
 
@@ -166,7 +166,7 @@ def _near(anchor: np.ndarray, spread: float, count: int, seed: int) -> np.ndarra
     return (rows / np.linalg.norm(rows, axis=1, keepdims=True)).astype(np.float32)
 
 
-def test_top_n_when_old_copies_outnumber_allowed_minus_limit(store: MemoryStore) -> None:
+def test_top_n_when_old_copies_outnumber_allowed_minus_limit(store: MemoryStore, search_service) -> None:
     """One owner's 1,002 rows (1,001 neighbours) of a bigger table; its rows changed twice leave more old copies near the anchor than
     allowed ids - limit (k = allowed count gave 0 of them). k must not stop at the allowed count,
     or the true neighbours never reach the scoring."""
@@ -189,17 +189,17 @@ def test_top_n_when_old_copies_outnumber_allowed_minus_limit(store: MemoryStore)
         hits = store.closest_memories(NAMESPACE, ids[0], limit=TOP)
         assert len({hit[0] for hit in hits}) == TOP, step
     other.close()
-    index = _state(store).index
+    index = _state(search_service, store).index
     stale = index.ntotal - len(np.unique(faiss.vector_to_array(index.id_map)))
     assert stale == (NEAR_REWRITES + 1) * moved_count and stale > allowed - TOP
     assert not set(moved) & {hit[0] for hit in hits}
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(vector_index, "EXACT_LIMIT", 10 ** 9)
+        _full_comparison(patch)
         assert store.closest_memories(NAMESPACE, ids[0], limit=TOP) == hits
 
 
-def test_memory_database_is_the_full_comparison() -> None:
-    """No file path, no index: every allowed row gets its cosine."""
+def test_memory_database_is_refused() -> None:
+    """No file path, no search: the same error as an embedding that cannot be made."""
     vectors = _clustered(SYNC_ROWS)
     connection = sqlite3.connect(":memory:")
     connection.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, embedding BLOB)")
@@ -207,13 +207,15 @@ def test_memory_database_is_the_full_comparison() -> None:
                            [(index + 1, vector.tobytes()) for index, vector in enumerate(vectors)])
     ids = list(range(1, SYNC_ROWS + 1))
     query = _clustered(1, seed=SEED + 2)[0]
-    assert vector_index.similarities(connection, "items", ids, query, limit=TOP) ==         dot_similarities(query, [vector.tobytes() for vector in vectors])
-    assert not vector_index._registry
+    with pytest.raises(EmbeddingUnavailable, match="database file"):
+        vector_index.similarities(connection, "items", ids, query, limit=TOP)
+    assert vector_index.similarities(connection, "items", [], query, limit=TOP) == []
     connection.close()
 
 
 @pytest.mark.parametrize("allowed", SMALL_ALLOWED)
-def test_small_allowed_set_takes_hnsw_and_matches_full_comparison(store: MemoryStore, allowed: int) -> None:
+def test_small_allowed_set_takes_hnsw_and_matches_full_comparison(store: MemoryStore, allowed: int,
+                                                                   search_service) -> None:
     """A database file uses the index even for 1 or 5 allowed rows; top N and threshold hits equal the full
     comparison, scores included."""
     vectors = _clustered(SYNC_ROWS)
@@ -222,7 +224,7 @@ def test_small_allowed_set_takes_hnsw_and_matches_full_comparison(store: MemoryS
     query = _unit(vectors[ids.index(picked[0])] + SMALL_QUERY_NOISE * _clustered(1, seed=SEED + 3)[0])
     exact = np.asarray(_exact(store, picked, query))
     found = vector_index.similarities(store._conn, "items", picked, query, limit=TOP)
-    assert _state(store).index.ntotal == SYNC_ROWS
+    assert _state(search_service, store).index.ntotal == SYNC_ROWS
     got = {index for index, sim in enumerate(found) if np.isfinite(sim)}
     assert got == set(np.argsort(-exact)[:TOP].tolist())
     assert all(abs(found[index] - exact[index]) < RESCORE_TOLERANCE for index in got)
@@ -236,12 +238,12 @@ def _search_ids(store: MemoryStore, query: np.ndarray, limit: int = TOP) -> list
     return [hit.id for hit in store.search(NAMESPACE, "q", query.tolist(), limit=limit)]
 
 
-def test_other_connection_add_change_delete(store: MemoryStore) -> None:
+def test_other_connection_add_change_delete(store: MemoryStore, search_service) -> None:
     vectors = _clustered(SYNC_ROWS)
     ids = _bulk_memories(store, vectors)
     query = vectors[0]
     first = _search_ids(store, query)
-    assert first and _state(store).index.ntotal == SYNC_ROWS
+    assert first and _state(search_service, store).index.ntotal == SYNC_ROWS
     other = sqlite3.connect(store.path)
     with other:
         other.execute(
@@ -256,7 +258,7 @@ def test_other_connection_add_change_delete(store: MemoryStore) -> None:
     after = _search_ids(store, query)
     assert new_id in after and changed in after and first[1] not in after
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(vector_index, "EXACT_LIMIT", 10 ** 9)
+        _full_comparison(patch)
         assert _search_ids(store, query) == after
 
 
@@ -283,25 +285,25 @@ def test_note_chunk_id_reused_by_other_connection(store: MemoryStore) -> None:
     assert notes.nearest_formula_chunks(store._conn, target.tobytes(), limit=1)[0][0] == top_id
 
 
-def test_rebuild_on_stale_share_and_model_change(store: MemoryStore) -> None:
+def test_rebuild_on_stale_share_and_model_change(store: MemoryStore, search_service) -> None:
     vectors = _clustered(SYNC_ROWS * 2)
     ids = _bulk_memories(store, vectors)
     query = vectors[0]
     vector_index.similarities(store._conn, "items", ids, query, limit=TOP)
-    built = _state(store).index
-    gone = ids[: int(len(ids) * (vector_index.DEAD_RATIO + 0.05))]
+    built = _state(search_service, store).index
+    gone = ids[: int(len(ids) * (vector_search.DEAD_RATIO + 0.05))]
     with store._write_scope():
         store._conn.executemany("DELETE FROM items WHERE type='memory' AND id=?", [(rowid,) for rowid in gone])
     left = ids[len(gone):]
     vector_index.similarities(store._conn, "items", left, query, limit=TOP)
-    assert _state(store).index is not built and _state(store).index.ntotal == len(left)
-    rebuilt = _state(store).index
+    assert _state(search_service, store).index is not built and _state(search_service, store).index.ntotal == len(left)
+    rebuilt = _state(search_service, store).index
     vector_index.similarities(store._conn, "items", left, query, limit=TOP)
-    assert _state(store).index is rebuilt
+    assert _state(search_service, store).index is rebuilt
     with store._write_scope():
         store._conn.execute("UPDATE meta_entries SET value='other-model' WHERE key='embedding_model'")
     vector_index.similarities(store._conn, "items", left, query, limit=TOP)
-    assert _state(store).index is not rebuilt and _state(store).meta[0] == "other-model"
+    assert _state(search_service, store).index is not rebuilt and _state(search_service, store).meta[0] == "other-model"
 
 
 def test_threshold_callers_match_full_comparison(store: MemoryStore) -> None:
@@ -320,7 +322,7 @@ def test_threshold_callers_match_full_comparison(store: MemoryStore) -> None:
     memory = mcp_server.search_memory_and_formula_readonly(store._conn, NAMESPACE, query, dimensions=DIMENSIONS,
                                                            limit=5, project="", session_id="", threshold=THRESHOLD)
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(vector_index, "EXACT_LIMIT", 10 ** 9)
+        _full_comparison(patch)
         exact = [(hit.id, hit.score) for hit in store.search(NAMESPACE, "q", query.tolist(), limit=5)]
         exact_memory = mcp_server.search_memory_and_formula_readonly(
             store._conn, NAMESPACE, query, dimensions=DIMENSIONS, limit=5, project="", session_id="",
@@ -347,7 +349,7 @@ def test_measure_search_and_build(store: MemoryStore) -> None:
         vector_index.similarities(store._conn, "items", ids, query, threshold=THRESHOLD)
     hnsw_ms = (time.perf_counter() - started) / rounds * 1000
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(vector_index, "EXACT_LIMIT", 10 ** 9)
+        _full_comparison(patch)
         started = time.perf_counter()
         for _ in range(rounds):
             vector_index.similarities(store._conn, "items", ids, query, threshold=THRESHOLD)

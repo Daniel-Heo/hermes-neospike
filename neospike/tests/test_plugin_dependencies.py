@@ -30,6 +30,7 @@ NOT_DECLARED = {
     "pydantic": "Hermes dashboard (host)",
     "yaml": "Hermes dependency; cron scripts fall back when absent",
     "mcp": "optional extra [mcp] for the Claude Code MCP server",
+    "uvicorn": "comes with the mcp SDK (MCP HTTP server)",
 }
 VERSION_MARKS = "<>=!~;[ "
 # A declared distribution that is another build of the same module (one per system) counts as that module's.

@@ -36,8 +36,13 @@ from .service import MODE_CORRECT_INPLACE, MODE_SUPERSEDE_NEW, VALID_UPDATE_MODE
 from . import memory_reconcile as pending_pairs
 from . import preferences as prefs
 from .store import (DEFAULT_SEMANTIC_CUTOFF, DOC_TYPES_SQL, EVIDENCE_CHAR_LIMIT, ITEM_DOC, HISTORY_OMIT, HISTORY_SHOW, HISTORY_COLLAPSE, ITEM_MEMORY,
-                    PART_SOURCE_KEY, MemoryStore, SearchResult, dot_similarities, memory_time_expr, normalize_rows,
+                    PART_SOURCE_KEY, MemoryStore, SearchResult, memory_time_expr, normalize_rows,
                     vector_present_sql)
+from . import vector_index
+from .inference import EmbeddingUnavailable
+
+# preferences vector column of the situation text (the text vector is the default column).
+_SITUATION_VECTOR_COLUMN = "situation_embedding"
 
 # source_json of an automatic-note part (notes.chunk_source_json), read from the part row's metadata_json.
 _PART_SOURCE_SQL = f"json_extract(metadata_json,'$.{PART_SOURCE_KEY}')"
@@ -721,9 +726,11 @@ class NeospikeProvider(HermesMemoryProvider):
             with store._lock:
                 rows = prefs.situation_rows(store._conn, self._ns_label) if prefs.table_present(store._conn) else []
             scored = sorted(((similarity, row) for similarity, row in zip(
-                dot_similarities(vector, [row[4] for row in rows]), rows)
+                vector_index.similarities(store._conn, prefs.PREFERENCES_TABLE, [int(row[0]) for row in rows], vector,
+                                          threshold=SituationTuning.CUTOFF, column=_SITUATION_VECTOR_COLUMN),
+                rows)
                 if math.isfinite(similarity) and similarity >= SituationTuning.CUTOFF), key=_situation_order)
-        except (sqlite3.Error, ValueError, TypeError) as exc:
+        except (sqlite3.Error, ValueError, TypeError, EmbeddingUnavailable) as exc:
             self._turn_log.failure(self._trace_key(live_sid), f"Situation block failure: {type(exc).__name__}",
                                    attempted_write=False)
             return "", None
@@ -835,7 +842,7 @@ class NeospikeProvider(HermesMemoryProvider):
             return "", None
         try:
             return self._render_profile(self._profile_items(live_sid, live))
-        except (sqlite3.Error, ValueError, TypeError, OSError) as exc:
+        except (sqlite3.Error, ValueError, TypeError, OSError, EmbeddingUnavailable) as exc:
             self._turn_log.failure(self._trace_key(live_sid), f"Profile block failure: {type(exc).__name__}",
                                    attempted_write=False)
             return "", None
@@ -857,9 +864,11 @@ class NeospikeProvider(HermesMemoryProvider):
         if live is not None:
             lined = [(row, line) for row, line in lined if not live.holds(line)]
         covered = [False] * len(lined)
-        blobs = [row[4] for row, _ in lined]
-        for mirror in mirrors:
-            for index, similarity in enumerate(dot_similarities(std_array.array("f", mirror), blobs)):
+        line_ids = [int(row[0]) for row, _ in lined]
+        mirror_vectors = [std_array.array("f", mirror) for mirror in mirrors] if line_ids else []
+        for scores in vector_index.similarities_many(store._conn, prefs.PREFERENCES_TABLE, line_ids, mirror_vectors,
+                                                     threshold=ProfileTuning.BUILTIN_DUPLICATE_COSINE):
+            for index, similarity in enumerate(scores):
                 covered[index] = covered[index] or similarity >= ProfileTuning.BUILTIN_DUPLICATE_COSINE
         placed = []
         for (row, line), already in zip(lined, covered):
@@ -1429,7 +1438,7 @@ class NeospikeProvider(HermesMemoryProvider):
             return json.dumps(reply)
         try:
             tidy = tidy_saved_preference(self._memory_db, self._ns_label, pref_id)
-        except (sqlite3.Error, ValueError, TypeError) as exc:  # the row is stored; tidying is best effort
+        except (sqlite3.Error, ValueError, TypeError, EmbeddingUnavailable) as exc:  # stored; tidying is best effort
             self._turn_log.record_unsure_outcome(key, f"Post-save dedupe stopped: {type(exc).__name__}")
             return json.dumps(reply)
         if tidy["deleted"]:
@@ -1982,9 +1991,22 @@ def register(ctx: Any) -> None:
     Hermes calls it twice: as the configured memory provider (a collector without ``llm``) and, because
     plugin.yaml declares kind: standalone and plugins.enabled lists the plugin, from general discovery (a real
     PluginContext). Hermes keeps one hook group for both loads; only the context with ``llm`` schedules the
-    daily preference tidy-up."""
+    daily preference tidy-up. Every process that loads the plugin also starts a new shared MCP server in the
+    background (once per process; the new server stops the previous one)."""
     from .debug_hooks import register_hooks
     from .pref_reconcile import register_idle_task
     ctx.register_memory_provider(NeospikeProvider())
     register_hooks(ctx)
     register_idle_task(ctx)
+    start_mcp_server()
+
+
+def start_mcp_server() -> bool:
+    """Start the shared neospike-mcp server of the Hermes home this plugin load runs for (its root home) on a
+    background thread, so register() returns at once. Outside Hermes (no hermes_constants) nothing starts."""
+    try:
+        from hermes_constants import get_hermes_home
+    except ImportError:
+        return False
+    from . import mcp_http
+    return mcp_http.start_in_background(FilePath(get_hermes_home()))

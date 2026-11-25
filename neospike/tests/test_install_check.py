@@ -309,8 +309,8 @@ class _FixedLauncher:
 
 
 def test_mcp_registration_names_no_dependency_environment(tmp_path, monkeypatch):
-    """The registered MCP command survives a PM environment change: runtime python + hermes_launch.py of the
-    installed plugin + checkout, and no installs/<id>/environments/<hash> path anywhere in it."""
+    """The registered MCP entry is the HTTP URL plus the installed header helper on the runtime python: no
+    installs/<id>/environments/<hash> path and no token in it; the token is in <home>/.env."""
     install = _install_module()
     home = tmp_path / "home"
     site, runtime_venv_python = _runtime_venv(home)
@@ -324,15 +324,16 @@ def test_mcp_registration_names_no_dependency_environment(tmp_path, monkeypatch)
     adds = [command for command in runner.commands if command[1:3] == ["mcp", "add-json"]]
     assert len(adds) == 1
     entry = json.loads(adds[0][6])
-    assert entry["command"] == RUNTIME_PYTHON
-    assert entry["args"][:4] == ["-I", str(home / "plugins" / "neospike" / "hermes_launch.py"),
-                                 str(home / "hermes-agent"), "neospike.mcp_server"]
-    assert (home / "plugins" / "neospike" / "hermes_launch.py").is_file()
-    for forbidden in ("environments", str(runtime_venv_python.parent.parent), "PYTHONPATH"):
+    assert entry["type"] == "http" and entry["url"] == "http://127.0.0.1:47831/mcp"
+    assert entry["headersHelper"].startswith(RUNTIME_PYTHON + " -I ")
+    assert str(home / "plugins" / "neospike" / "mcp_headers.py") in entry["headersHelper"]
+    assert (home / "plugins" / "neospike" / "mcp_headers.py").is_file()
+    token = re.search(r"NEOSPIKE_MCP_TOKEN=([0-9a-f]{64})", (home / ".env").read_text(encoding="utf-8")).group(1)
+    for forbidden in ("environments", str(runtime_venv_python.parent.parent), "PYTHONPATH", token):
         assert forbidden not in adds[0][6], forbidden
 
 
-def test_mcp_registration_overwrites_with_the_hand_made_shape(tmp_path, monkeypatch):
+def test_mcp_registration_overwrites_with_the_http_shape(tmp_path, monkeypatch):
     install = _install_module()
     calls = []
 
@@ -341,43 +342,39 @@ def test_mcp_registration_overwrites_with_the_hand_made_shape(tmp_path, monkeypa
         return subprocess.CompletedProcess(command, 1, "", "No MCP server named neospike")
 
     monkeypatch.setattr(install.shutil, "which", {"claude": "claude"}.get)
-    monkeypatch.delenv("NEOSPIKE_HERMES_CHECKOUT", raising=False)
     install.apply_mcp_registration("/runtime/python", tmp_path, runner)
     (get, _), (remove, remove_check), (add, add_check) = calls
     assert get == ["claude", "mcp", "get", "neospike"]  # the old name is not registered: nothing more to remove
     assert remove == ["claude", "mcp", "remove", "-s", "user", "neospike-mcp"] and remove_check is False
     assert add[:6] == ["claude", "mcp", "add-json", "-s", "user", "neospike-mcp"] and add_check is True
     assert json.loads(add[6]) == {
-        "type": "stdio", "command": "/runtime/python",
-        "args": ["-I", str(tmp_path / "plugins" / "neospike" / "hermes_launch.py"), str(tmp_path / "hermes-agent"),
-                 "neospike.mcp_server", "--home", str(tmp_path), "--owner", "default:local"],
-        "env": {"HERMES_HOME": str(tmp_path),
-                "HERMES_BGE_M3_DIR": str(tmp_path / "models" / "bge-m3-onnx"),
-                "PYTHONIOENCODING": "utf-8"}}
-    assert " " not in add[6]  # compact: survives claude.cmd / cmd.exe
+        "type": "http", "url": "http://127.0.0.1:47831/mcp",
+        "headersHelper": install.headers_helper_command("/runtime/python", tmp_path)}
+    assert ", " not in add[6] and ": " not in add[6]  # compact JSON
 
 
-def test_profile_home_models_are_the_root_models(tmp_path, monkeypatch):
-    """Models are shared with the root home (shared_inference_home), never per profile."""
+def test_mcp_entry_follows_the_configured_port(tmp_path):
     install = _install_module()
-    monkeypatch.delenv("NEOSPIKE_INFERENCE_HOME", raising=False)
-    root = tmp_path.resolve()
-    profile = root / "profiles" / "design"
-    entry = install.mcp_server_entry("/runtime/python", profile)
-    assert entry["env"]["HERMES_BGE_M3_DIR"] == str(root / "models" / "bge-m3-onnx")
-    assert entry["args"][1] == str(profile / "plugins" / "neospike" / "hermes_launch.py")  # plugins: the profile's
+    (tmp_path / "neospike").mkdir()
+    (tmp_path / "neospike" / "config.json").write_text('{"mcp_port": 50123}', encoding="utf-8")
+    assert install.mcp_server_entry("/runtime/python", tmp_path)["url"] == "http://127.0.0.1:50123/mcp"
 
 
-def test_mcp_server_entry_starts_isolated(tmp_path):
-    """-I: no launch folder, PYTHONPATH or user site on sys.path, as in the Hermes launcher."""
-    assert _install_module().mcp_server_entry("/runtime/python", tmp_path)["args"][0] == "-I"
+def test_headers_helper_runs_the_installed_script_isolated(tmp_path):
+    """-I: no launch folder, PYTHONPATH or user site on sys.path; the home is the helper's one argument."""
+    install = _install_module()
+    command = install.headers_helper_command("/runtime/python", tmp_path)
+    assert command.split(" ")[:2] == ["/runtime/python", "-I"]
+    assert command.endswith(str(tmp_path / "plugins" / "neospike" / "mcp_headers.py") + " " + str(tmp_path))
 
 
 def test_mcp_registration_is_skipped_without_claude(tmp_path, monkeypatch, capsys):
     install = _install_module()
     monkeypatch.setattr(install.shutil, "which", {}.get)
     install.apply_mcp_registration("/venv/python", tmp_path, None)
-    assert capsys.readouterr().out.strip() == "Claude Code (claude) not found; MCP server neospike-mcp not registered."
+    out = capsys.readouterr().out.strip().splitlines()
+    assert out[-1] == "Claude Code (claude) not found; MCP server neospike-mcp not registered."
+    assert install.hermes_mcp_registered(tmp_path)  # Hermes gets its entry all the same
 
 
 class _OldNameRunner:

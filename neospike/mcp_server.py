@@ -1,8 +1,9 @@
-﻿"""MCP stdio server for Claude Code: read notes, memories and past Hermes conversations.
+﻿"""MCP server for Claude Code and Hermes: read notes, memories and past Hermes conversations.
 
 Run: python -m neospike.mcp_server [--home <HERMES_HOME>] [--owner <owner>]  (v21 --namespace: accepted with a warning)
-Register (install.py does this, not this module):
-    claude mcp add --scope user neospike-mcp -- <runtime python> -I <plugins>/neospike/hermes_launch.py <hermes checkout> neospike.mcp_server
+It serves MCP streamable-http on 127.0.0.1:<mcp_port>/mcp as the one shared server of the home (mcp_http.py:
+token check, the stop of the previous server, the record and the log). The plugin starts it (register());
+install.py registers its URL in Claude Code and in the Hermes config.yaml.
 
 Reads open the database with mode=ro and never write (no access bookkeeping).
 Query embeddings come from the shared embedding daemon (EmbeddingClient). Every
@@ -66,6 +67,8 @@ KIND_NOTE_CHUNK = "note_chunk"  # search_memory_and_formula_readonly kind of an 
 # mem_search result kinds: a memory item, a chunk of a note (agent or automatic) and a chunk of a doc.
 KIND_MEMORY, KIND_NOTE, KIND_DOC = "memory", "note", "doc"
 DOC_AUTHOR = "human"  # a doc is a note the user wrote (notes.author); the table is the same
+# project argument of the memory queries: every project of the owner (one shared server has no working folder).
+ALL_PROJECTS = None
 
 TOOL_DESCRIPTIONS = {
     "note_read": (
@@ -78,8 +81,9 @@ TOOL_DESCRIPTIONS = {
         "that may already be decided. Covers memories (facts, decisions, constraints), notes (agent notes such as "
         "TASK_ orders, automatic notes) and docs (notes the user wrote) in one search, "
         f"cosine >= {MEMORY_SEARCH_COSINE_THRESHOLD}, best first, limit 1-20. "
+        "Searches every project; each memory result names its project ('' = none) and scope. "
         "Each result has kind memory, note or doc. note/doc: note_id, title, chunk_id, heading_path, text. memory: "
-        "id, text, origin, confidence; superseded memories only with include_history, at half score with "
+        "id, text, origin, confidence, project, scope; superseded memories only with include_history, at half score with "
         "superseded_by=N: mem:N is the current decision. Optional tag keeps only items with that tag (e.g. 'task', "
         "'status:active')."
     ),
@@ -88,7 +92,8 @@ TOOL_DESCRIPTIONS = {
         "Range: since <= changed < until; changed = updated_at, else created_at. Newest first, limit 1-20 "
         "(default 10), no embedding. since is "
         "required, until defaults to now; both accept ISO time (local without a zone), epoch seconds or 24h/7d/2w. "
-        "kind memory, note, doc or all; tag and include_history as in mem_search. Notes and docs come without "
+        "kind memory, note, doc or all; tag and include_history as in mem_search; every project, with project and "
+        "scope on each memory. Notes and docs come without "
         "the body (note_id, title, tags, rev): read one with note_read. truncated=true: call again with until = "
         "the last result's timestamp (order oldest: since)."
     ),
@@ -145,7 +150,10 @@ SERVER_INSTRUCTIONS = (
     "\n"
     "Order: mem_search first; go to chat_search or chat_period only for original wording or evidence; then "
     "chat_read. Start with a small limit and narrow with since/until, role or session instead of raising it. A newer "
-    "decision overrides an older one; superseded memories appear only with include_history."
+    "decision overrides an older one; superseded memories appear only with include_history.\n"
+    "\n"
+    "mem_search and mem_period search every project and show each memory's project; weigh a memory from "
+    "another project accordingly."
 )
 
 
@@ -163,11 +171,21 @@ def _limit(value: Any) -> int:
     return value
 
 
-def _visible_memory_where(namespace: str, project: str, session_id: str,
+# Every project (ALL_PROJECTS): the scopes MemoryStore._scope_clause knows, a project boundary dropped, and the
+# session rule kept (a session memory only for its own session, so never for an empty one).
+_ALL_PROJECTS_SQL = (" AND (scope IS NULL OR scope IN ('global','project') OR "
+                     "(scope='session' AND ?<>'' AND json_extract(metadata_json,'$.session_id')=?))")
+
+
+def _visible_memory_where(namespace: str, project: str | None, session_id: str,
                           tag: str | None = None) -> tuple[str, tuple]:
     """WHERE condition (no leading AND) and its parameters: memories of *namespace* visible from project/session
-    (MemoryStore._scope_clause); with tag, only those whose metadata tags hold it."""
-    visibility, visibility_args = MemoryStore._scope_clause(project, session_id)
+    (MemoryStore._scope_clause; project ALL_PROJECTS: every project); with tag, only those whose metadata tags
+    hold it."""
+    if project is ALL_PROJECTS:
+        visibility, visibility_args = _ALL_PROJECTS_SQL, (session_id, session_id)
+    else:
+        visibility, visibility_args = MemoryStore._scope_clause(project, session_id)
     tag_sql, tag_args = "", ()
     if tag:
         tag_sql = (" AND json_valid(metadata_json) AND EXISTS (SELECT 1 FROM json_each(metadata_json,'$.tags') "
@@ -177,12 +195,12 @@ def _visible_memory_where(namespace: str, project: str, session_id: str,
             (namespace, *visibility_args, *tag_args))
 
 
-def _visible_memory_rows(connection: sqlite3.Connection, namespace: str, project: str,
+def _visible_memory_rows(connection: sqlite3.Connection, namespace: str, project: str | None,
                          session_id: str, tag: str | None = None) -> list[sqlite3.Row]:
     """Visible memories (_visible_memory_where) that have a vector."""
     where, args = _visible_memory_where(namespace, project, session_id, tag)
     return connection.execute(
-        "SELECT id,text,origin,kind,confidence,importance,created_at,invalid_at,superseded_by "
+        "SELECT id,text,origin,kind,confidence,importance,created_at,invalid_at,superseded_by,project,scope "
         f"FROM items WHERE {where} AND {vector_present_sql()}",
         args,
     ).fetchall()
@@ -205,21 +223,28 @@ def _period_item_times(row: sqlite3.Row) -> dict:
             "updated_at": row["updated_at"]}
 
 
-def _memory_period_items(connection: sqlite3.Connection, namespace: str, start: float, end: float, *, project: str,
+def _memory_scope_fields(row: sqlite3.Row) -> dict:
+    """project ('' = none) and scope of a memory row, as the MCP results show them."""
+    return {"project": row["project"] or "", "scope": row["scope"] or ""}
+
+
+def _memory_period_items(connection: sqlite3.Connection, namespace: str, start: float, end: float, *,
+                         project: str | None,
                          session_id: str, include_history: bool, tag: str | None, order: str,
                          wanted: int) -> list[dict]:
     """Visible memories (embedded or not) changed in [start, end); superseded ones only with include_history."""
     where, args = _visible_memory_where(namespace, project, session_id, tag)
     history_sql = "" if include_history else " AND invalid_at IS NULL"
     rows = connection.execute(
-        f"SELECT id,text,origin,kind,confidence,created_at,updated_at,invalid_at,superseded_by,"
+        f"SELECT id,text,origin,kind,confidence,created_at,updated_at,invalid_at,superseded_by,project,scope,"
         f"{_CHANGED_SQL} AS changed FROM items WHERE {where}{history_sql} "
         f"AND {_CHANGED_SQL}>=? AND {_CHANGED_SQL}<?" + _period_order_sql(order),
         (*args, start, end, wanted)).fetchall()
     items = []
     for row in rows:
         item = {"kind": KIND_MEMORY, "id": int(row["id"]), "text": row["text"], "origin": row["origin"],
-                "item_kind": row["kind"], "confidence": float(row["confidence"]), **_period_item_times(row)}
+                "item_kind": row["kind"], "confidence": float(row["confidence"]), **_memory_scope_fields(row),
+                **_period_item_times(row)}
         if row["invalid_at"] is not None and row["superseded_by"] is not None:
             item["superseded_by"] = int(row["superseded_by"])
         items.append(item)
@@ -263,7 +288,7 @@ class _ChangedKey:
 
 
 def mem_period_readonly(connection: sqlite3.Connection, namespace: str, since: float, until: float, *, kind: str,
-                        limit: int, project: str, session_id: str, include_history: bool = False,
+                        limit: int, project: str | None, session_id: str, include_history: bool = False,
                         tag: str | None = None, order: str = chat_history.ORDER_NEWEST) -> dict:
     """MCP mem_period: memories, notes and docs whose last change (updated_at, else created_at) lies in
     [since, until), sorted by that time, cut to limit; truncated tells more matched."""
@@ -281,7 +306,7 @@ def mem_period_readonly(connection: sqlite3.Connection, namespace: str, since: f
             "results": results, "count": len(results), "truncated": len(items) > limit}
 
 
-def _memory_hits(connection: sqlite3.Connection, namespace: str, qvec: list[float], *, project: str,
+def _memory_hits(connection: sqlite3.Connection, namespace: str, qvec: list[float], *, project: str | None,
                  session_id: str, include_history: bool, threshold: float, tag: str | None = None) -> list[dict]:
     """Visible memories with cosine >= threshold; score = cosine (x OLD_VERSION_SCORE_FACTOR for a superseded
     memory, include_history only). kind is the memory row's kind column."""
@@ -296,7 +321,7 @@ def _memory_hits(connection: sqlite3.Connection, namespace: str, qvec: list[floa
             continue
         hit = {"id": int(row["id"]), "text": row["text"], "origin": row["origin"], "kind": row["kind"],
                "score": cosine * OLD_VERSION_SCORE_FACTOR if invalid else cosine,
-               "confidence": float(row["confidence"])}
+               "confidence": float(row["confidence"]), **_memory_scope_fields(row)}
         if invalid and row["superseded_by"] is not None:
             hit["superseded_by"] = int(row["superseded_by"])
         hits.append(hit)
@@ -335,7 +360,7 @@ def search_memory_and_formula_readonly(connection: sqlite3.Connection, namespace
 
 
 def mem_search_readonly(connection: sqlite3.Connection, namespace: str, query_embedding: Any, *, dimensions: int,
-                        limit: int, project: str, session_id: str, include_history: bool = False,
+                        limit: int, project: str | None, session_id: str, include_history: bool = False,
                         tag: str | None = None, threshold: float = MEMORY_SEARCH_COSINE_THRESHOLD) -> list[dict]:
     """MCP mem_search: memories (as search_memory_and_formula_readonly, kind memory, the row kind in item_kind)
     plus parts of every live document except TOPIC pages: kind = the document's items.type (doc: written by the
@@ -458,10 +483,10 @@ class NeospikeTools:
 
     def _mem_search(self, connection: sqlite3.Connection, query: str, limit: int, include_history: bool,
                     tag: str | None) -> dict:
-        # Same authority as the standalone CLI search: the working directory, no session.
+        # Every project of the owner, no session (one shared server serves every client folder).
         results = mem_search_readonly(connection, self.namespace, self._query_embedding(query),
                                       dimensions=EMBEDDING_DIMENSIONS, limit=limit,
-                                      project=str(Path.cwd().resolve()), session_id="",
+                                      project=ALL_PROJECTS, session_id="",
                                       include_history=include_history, tag=tag)
         return {"results": results}
 
@@ -486,9 +511,9 @@ class NeospikeTools:
 
     def _mem_period(self, connection: sqlite3.Connection, start: float, end: float, kind: str, tag: str | None,
                     include_history: bool, order: str, limit: int) -> dict:
-        # The visibility of mem_search: the working directory, no session.
+        # The visibility of mem_search: every project, no session.
         return mem_period_readonly(connection, self.namespace, start, end, kind=kind, limit=limit,
-                                   project=str(Path.cwd().resolve()), session_id="",
+                                   project=ALL_PROJECTS, session_id="",
                                    include_history=include_history, tag=tag, order=order)
 
     # Hermes chat history: no embedding daemon, so like note_read these work while the switch is off.
@@ -554,8 +579,8 @@ def main(argv: list[str] | None = None) -> int:
     if MCPServer is None:
         sys.stderr.write("neospike.mcp_server needs the MCP SDK: pip install 'neospike[mcp]'\n")
         return EXIT_MISSING_SDK
-    build_server(NeospikeTools(Path(args.home), args.namespace)).run("stdio")
-    return 0
+    from . import mcp_http
+    return mcp_http.serve(build_server(NeospikeTools(Path(args.home), args.namespace)), Path(args.home))
 
 
 if __name__ == "__main__":

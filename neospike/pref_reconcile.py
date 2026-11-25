@@ -20,11 +20,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from . import memory_reconcile as memory_pairs
+from . import vector_index
 from . import preferences as pref_ops
 from .config import EMBEDDING_DIMENSIONS, EXTRACTION_LANGUAGE_DEFAULT, LANGUAGE_NAMES, NeospikeConfig, read_enabled
 from .database import canonical_database_path
 from .notes import RememberTuning
-from .store import MemoryStore, dot_similarities, vector_present_sql
+from .store import MemoryStore, vector_present_sql
 
 ACTION_KEEP, ACTION_UPDATE, ACTION_DELETE = "keep", "update", "delete"
 ACTIONS = (ACTION_KEEP, ACTION_UPDATE, ACTION_DELETE)
@@ -170,13 +171,19 @@ def _is_save_duplicate(similarity: float, left_text: str, right_text: str) -> bo
     return similarity >= RememberTuning.DUPLICATE_COSINE and gap <= RememberTuning.DUPLICATE_WORD_GAP
 
 
-def _owner_pairs(records: list[tuple]) -> list[tuple[float, dict, dict]]:
+def _owner_pairs(store: MemoryStore, records: list[tuple]) -> list[tuple[float, dict, dict]]:
+    """Every pair a.id < b.id of one owner's rows at or above CONTRADICTION_COSINE that the save-time rule would
+    not have removed: each row is a query against the owner's rows, only the later ones are kept."""
     pairs = []
-    for index in range(len(records) - 1):
-        later = records[index + 1:]
-        scores = dot_similarities(array("f", records[index][8]), [rec[8] for rec in later])
-        for offset, similarity in enumerate(scores):
-            other = later[offset]
+    if len(records) < 2:
+        return pairs
+    ids = [int(rec[0]) for rec in records]
+    rows = vector_index.similarities_many(store._conn, pref_ops.PREFERENCES_TABLE, ids,
+                                          [array("f", rec[8]) for rec in records[:-1]],
+                                          threshold=RememberTuning.CONTRADICTION_COSINE)
+    for index, scores in enumerate(rows):
+        for offset in range(index + 1, len(records)):
+            similarity, other = scores[offset], records[offset]
             if (not math.isfinite(similarity) or similarity < RememberTuning.CONTRADICTION_COSINE
                     or _is_save_duplicate(similarity, records[index][3], other[3])):
                 continue
@@ -195,7 +202,7 @@ def candidate_pairs(store: MemoryStore) -> list[tuple[float, dict, dict]]:
         by_owner.setdefault(rec[1], []).append(rec)
     pairs = []
     for owner_records in by_owner.values():
-        pairs.extend(_owner_pairs(owner_records))
+        pairs.extend(_owner_pairs(store, owner_records))
     pairs.sort(key=_pair_order)
     return pairs
 

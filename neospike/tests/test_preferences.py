@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 from neospike import backup as db_backup
 from neospike import cli
 from neospike import preferences as prefs
+from neospike import vector_index
+from neospike.inference import EmbeddingUnavailable
 from neospike.provider import PROFILE_OPEN, SITUATION_CLOSE, SITUATION_HEADER, SITUATION_OPEN, SituationTuning
 from neospike.store import DEFAULT_SEMANTIC_CUTOFF, SCHEMA_VERSION, MemoryStore
 from neospike.config import NeospikeConfig
@@ -145,6 +147,28 @@ def test_near_duplicate_replaces_the_old_row(provider) -> None:
     [row] = pref_rows(provider._memory_db)
     assert (prefs.pref_ref(row[0]), row[2], row[3]) == (second["id"], "", "user_said")
 
+
+
+class _SearchUnavailable:
+    """Stands in for vector_index.similarities when the search service cannot answer."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        raise EmbeddingUnavailable("Inference service failed to start")
+
+
+def test_save_keeps_the_row_when_the_duplicate_search_is_unavailable(provider, monkeypatch) -> None:
+    """The row is stored before the duplicate check; a search service that cannot answer only skips the check."""
+    first = save(provider, "Use python type hints everywhere.", kind="preference", basis="user_said")
+    unavailable = _SearchUnavailable()
+    monkeypatch.setattr(vector_index, "similarities", unavailable)
+    second = save(provider, "Use python type hints everywhere please.", kind="preference", basis="user_said")
+    assert unavailable.calls == 1
+    assert second["stored"] is True and "deleted" not in second
+    assert [prefs.pref_ref(row[0]) for row in pref_rows(provider._memory_db)] == [first["id"], second["id"]]
 
 
 def test_near_duplicate_constraint_keeps_its_situation_and_the_delete(provider) -> None:

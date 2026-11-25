@@ -19,6 +19,14 @@ from neospike.provider import NeospikeProvider
 from neospike.store import MemoryStore, next_of
 from neospike.tests.support_items import chunk_rows, link_rows, note_rows, topic_labels
 from neospike.tests.support_provider import ThreeTopicEmbedder as FakeEmbedder
+from neospike.tests.support_vector import use_full_comparison
+
+
+@pytest.fixture(autouse=True)
+def _old_layout_compared_in_process(monkeypatch):
+    """The migration's top-5 check reads the old memories table and its own uncommitted rows, which the search
+    service (committed rows of the current tables) cannot see: these tests check the migration, not the search."""
+    use_full_comparison(monkeypatch)
 
 DIM = 4
 OWNER = "default:local"

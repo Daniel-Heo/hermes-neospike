@@ -54,6 +54,10 @@
         "setup.debug": "Append Neospike diagnostics to chat responses (developer mode)",
         "setup.debugCopy": "Off by default. Shows memory excerpts in this profile's chats; normal chat history may retain them. No extra model calls.",
         "config.extractLang": "Language of extracted memories", "config.extractLang.ko": "한국어", "config.extractLang.en": "English", "config.extractLangCopy": "The language Neospike uses when it extracts memories from conversations. Default: English.",
+        "config.mcpPort.title": "MCP server port", "config.mcpPort.copy": "Claude Code and Hermes reach the Neospike MCP server at http://127.0.0.1:{port}/mcp. Default: 47831.",
+        "config.mcpPort.restart": "After a change, restart the gateway (hermes gateway restart) and run python install.py again: the registered address changes.",
+        "config.mcpPort.profile": "This is a profile home. The MCP server uses the port set in the root home.",
+        "config.mcpPort.invalid": "Enter a whole number from 1024 to 65535.",
         "setup.step5": "Apply to memory handling and verify",
         "setup.step5Copy": "Activation updates memory.provider. Restart the gateway afterward (hermes gateway restart).",
         "setup.step5Example": "e.g. hermes gateway restart",
@@ -177,6 +181,10 @@
         "setup.debug": "채팅 답변에 Neospike 진단 정보 붙이기 (개발모드)",
         "setup.debugCopy": "기본은 꺼져 있습니다. 켜면 이 프로필의 채팅에 기억 발췌가 보이고, 채팅 기록에 남을 수 있습니다. 모델 호출은 늘지 않습니다.",
         "config.extractLang": "기억 추출 결과 언어", "config.extractLang.ko": "한국어", "config.extractLang.en": "English", "config.extractLangCopy": "Neospike가 대화에서 기억을 추출할 때 쓰는 언어입니다. 기본은 영어입니다.",
+        "config.mcpPort.title": "MCP 서버 포트", "config.mcpPort.copy": "Claude Code와 Hermes는 http://127.0.0.1:{port}/mcp 로 Neospike MCP 서버에 연결합니다. 기본은 47831입니다.",
+        "config.mcpPort.restart": "바꾼 뒤에는 게이트웨이를 다시 시작하고(hermes gateway restart) python install.py를 다시 실행하세요. 등록된 주소가 바뀝니다.",
+        "config.mcpPort.profile": "이 홈은 프로필입니다. MCP 서버는 루트 홈에 설정한 포트를 씁니다.",
+        "config.mcpPort.invalid": "1024에서 65535 사이의 정수를 넣으세요.",
         "setup.step5": "메모리 처리에 적용과 점검",
         "setup.step5Copy": "활성화하면 memory.provider가 바뀝니다. 그다음 게이트웨이를 다시 시작하세요(hermes gateway restart).",
         "setup.step5Example": "예) hermes gateway restart",
@@ -709,8 +717,9 @@
   // ---- Config: operating settings; Setup stays for installation. The save criteria list is titled
   // "memory creation rules" (a page heading like Setup's, not a small card actionKey).
   function SettingsView(props) {
-    // Numbered step cards wrapped like Setup's steps.
-    return h("div", { className: "neospike-steps" }, h(CommitCriteriaView, null), h(ExtractLangView, null), h(PrefModelView, null), h(DiagnosticsView, null));
+    // Numbered step cards wrapped like Setup's steps; the connection setting (MCP port) follows, unnumbered.
+    const steps = h("div", { className: "neospike-steps" }, h(CommitCriteriaView, null), h(ExtractLangView, null), h(PrefModelView, null), h(DiagnosticsView, null));
+    return h("div", { className: "neospike-stack" }, steps, h("div", { className: "neospike-steps" }, h(McpPortView, null)));
   }
 
   // The on/off switch (config.json "enabled", default on). Saved at once through /setup/config with only that key;
@@ -812,6 +821,53 @@
         h("select", { className: "neospike-select", value: lang, onChange: function (e) { setLang(e.target.value); }, "aria-label": t("config.extractLang") },
           EXTRACT_LANGS.map(renderLangOption)),
         h("p", { className: "text-xs text-muted-foreground" }, t("config.extractLangCopy")),
+        h("div", { className: "neospike-actions" },
+          h(Button, { type: "button", size: "sm", disabled: busy || !loaded, onClick: save }, t("common.save"))),
+        message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));
+  }
+
+  const MCP_PORT_DEFAULT = 47831;  // config.py MCP_PORT_DEFAULT
+  const MCP_PORT_MIN = 1024;  // config.py MCP_PORT_MIN
+  const MCP_PORT_MAX = 65535;  // config.py MCP_PORT_MAX
+
+  function parseMcpPort(text) {
+    const value = /^\s*\d+\s*$/.test(String(text)) ? parseInt(text, 10) : NaN;
+    return value >= MCP_PORT_MIN && value <= MCP_PORT_MAX ? value : null;
+  }
+
+  // Port of the shared MCP server (config.json mcp_port), saved through /setup/config with only that key.
+  function McpPortView() {
+    const [port, setPort] = useState(String(MCP_PORT_DEFAULT));
+    const [shown, setShown] = useState(MCP_PORT_DEFAULT);
+    const [applies, setApplies] = useState(true);
+    const [loaded, setLoaded] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [message, setMessage] = useState(null);
+
+    useEffect(function () {
+      SDK.fetchJSON(API + "/setup/status").then(function (data) {
+        const config = data.config || {};
+        const saved = parseMcpPort(config.mcp_port) || MCP_PORT_DEFAULT;
+        setPort(String(saved)); setShown(saved); setApplies(config.mcp_port_applies !== false); setLoaded(true);
+      }).catch(function (e) { setMessage({ ok: false, text: apiFault(e).text }); });
+    }, []);
+
+    function save() {
+      const value = parseMcpPort(port);
+      if (value === null) { setMessage({ ok: false, text: t("config.mcpPort.invalid") }); return; }
+      setBusy(true); setMessage(null);
+      SDK.fetchJSON(API + "/setup/config", jsonInit("POST", { mcp_port: value })).then(function () {
+        setBusy(false); setShown(value); setMessage({ ok: true, text: t("common.saved") + " " + t("config.mcpPort.restart") });
+      }).catch(function (e) { setBusy(false); setMessage({ ok: false, text: apiFault(e).text }); });
+    }
+
+    return h(Card, null, h(CardHeader, null, h("div", { className: "neospike-step-head" }, h(CardTitle, null, t("config.mcpPort.title")))),
+      h(CardContent, { className: "neospike-stack" },
+        h("input", { type: "number", className: "neospike-select", min: MCP_PORT_MIN, max: MCP_PORT_MAX, value: port, disabled: busy || !loaded,
+          onChange: function (e) { setPort(e.target.value); }, "aria-label": t("config.mcpPort.title") }),
+        h("p", { className: "text-xs text-muted-foreground" }, t("config.mcpPort.copy", { port: shown })),
+        h("p", { className: "text-xs text-muted-foreground" }, t("config.mcpPort.restart")),
+        applies ? null : h("p", { className: "text-xs text-muted-foreground" }, t("config.mcpPort.profile")),
         h("div", { className: "neospike-actions" },
           h(Button, { type: "button", size: "sm", disabled: busy || !loaded, onClick: save }, t("common.save"))),
         message ? h("div", { className: "neospike-message " + (message.ok ? "is-ok" : "is-error") }, message.text) : null));

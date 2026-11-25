@@ -171,11 +171,18 @@ def _metadata(raw: Any) -> dict:
 
 
 # --- vectors and fixed queries (memory rows of either layout) -----------------------------------------------------
-def _memory_source(conn: sqlite3.Connection) -> str | None:
+def _memory_table(conn: sqlite3.Connection) -> str | None:
     present = _tables(conn)
     if LEGACY_MEMORY_TABLE in present:
+        return LEGACY_MEMORY_TABLE
+    return "items" if "items" in present else None
+
+
+def _memory_source(conn: sqlite3.Connection) -> str | None:
+    table = _memory_table(conn)
+    if table == LEGACY_MEMORY_TABLE:
         return f"SELECT id, embedding FROM {LEGACY_MEMORY_TABLE} WHERE length(embedding)>0 ORDER BY id"
-    if "items" in present:
+    if table == "items":
         return "SELECT id, embedding FROM items WHERE type='memory' AND length(embedding)>0 ORDER BY id"
     return None
 
@@ -202,7 +209,8 @@ def top_ids(conn: sqlite3.Connection, query_ids: list[int], k: int = TOP_K,
     """'mem:<query id>' -> the k memory ids with the highest dot product to that stored vector (ids through
     id_map, so a before/after pair compares the same items)."""
     import array
-    from .store import dot_similarities
+    import math
+    from . import vector_index
     ids, blobs = _vector_rows(conn)
     if not ids or not query_ids:
         return {}
@@ -214,8 +222,9 @@ def top_ids(conn: sqlite3.Connection, query_ids: list[int], k: int = TOP_K,
         if blob is None:
             result[f"mem:{query_id}"] = []
             continue
-        scores = dot_similarities(array.array("f", blob), blobs)
-        ranked = sorted(range(len(ids)), key=scores.__getitem__, reverse=True)[:k]
+        scores = vector_index.similarities(conn, _memory_table(conn), ids, array.array("f", blob), limit=k)
+        ranked = sorted((index for index in range(len(ids)) if math.isfinite(scores[index])),
+                        key=scores.__getitem__, reverse=True)[:k]
         result[f"mem:{query_id}"] = [ids[index] for index in ranked]
     return result
 

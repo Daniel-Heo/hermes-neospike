@@ -1,15 +1,19 @@
 ﻿# neospike windows patch v1
 """Profile-private embedding service (runs in the foreground; it never starts or stops Hermes).
 
-One worker thread owns the model and loads it the first time a request needs it. Clients have no
-local fallback. A native call cannot be interrupted once it is running, so the bounded queues and
-the per-request deadlines are what stop a stuck call from accumulating more work behind it.
+One worker thread owns the model and loads it the first time a request needs it; a second worker
+thread answers vector searches (op 'search', vector_search.py), so a search never waits behind an
+embedding. Clients have no local fallback. A native call cannot be interrupted once it is running,
+so the bounded queues and the per-request deadlines are what stop a stuck call from accumulating
+more work behind it. A client that finds a service started from other code (its fingerprint) stops
+it and starts a new one.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import hmac
 import itertools
 import json
@@ -29,6 +33,7 @@ import time
 from . import _wincompat as _wc
 from ._wincompat import fcntl
 from .config import EMBEDDING_DIMENSIONS, PAUSED_MESSAGE, read_enabled
+from .vector_search import VectorSearcher
 
 # One input may fill the full token window. The bge-m3 tokenizer emits at most 16
 # characters (plus a space) per piece, so 17 chars/token is the ceiling. A frame holds that input
@@ -39,7 +44,16 @@ INPUT_CHAR_CAP = 8192 * 17
 _FRAME_OVERHEAD = 65_536
 FRAME_BYTE_CAP = INPUT_CHAR_CAP * 6 + _FRAME_OVERHEAD
 _OPS = frozenset(('query', 'document'))
+SEARCH_OP = 'search'
+# Requests that need a running service (ensure_daemon starts or replaces one first).
+_SERVICE_OPS = _OPS | {SEARCH_OP}
 SHUTDOWN_OP = 'shutdown'
+# Code fingerprint: plugin version plus the stamp of every package .py file outside these folders.
+_FINGERPRINT_SKIP_DIRS = frozenset(('tests', '__pycache__'))
+_PLUGIN_MANIFEST = 'plugin.yaml'
+_VERSION_KEY = 'version:'
+# A client re-reads the files at most this often outside the startup lock (inside it, always).
+_FINGERPRINT_REUSE_SECONDS = 2.0
 # release_daemon() results.
 DAEMON_STOPPED, DAEMON_NOT_RUNNING, DAEMON_IN_USE = 'stopped', 'not_running', 'in_use'
 _SHUTDOWN_REPLY_SECONDS = 5
@@ -91,7 +105,61 @@ _ERR = {
     'launching': 'Inference launch in progress; service is not ready',
     'spawn_failed': 'Inference service failed to start; see private inference.log',
     'model_missing': 'Embedding model file not found: {path} (put bge-m3-onnx there or set HERMES_BGE_M3_DIR)',
+    'replace_refused': 'Inference service runs other code and did not accept a shutdown: {reason}',
 }
+
+
+def _plugin_version(package):
+    try:
+        lines = (package / _PLUGIN_MANIFEST).read_text(encoding='utf-8-sig').splitlines()
+    except OSError:
+        return ''
+    for line in lines:
+        if line.startswith(_VERSION_KEY):
+            return line[len(_VERSION_KEY):].strip()
+    return ''
+
+
+def code_fingerprint():
+    """Fingerprint of the code a service started now would run: the plugin version and the modification time
+    and size of every package .py file (tests and caches left out)."""
+    package = pathlib.Path(__file__).resolve().parent
+    stamps = []
+    for folder, subfolders, files in os.walk(package):
+        subfolders[:] = sorted(name for name in subfolders if name not in _FINGERPRINT_SKIP_DIRS)
+        for name in files:
+            if name.endswith('.py'):
+                path = pathlib.Path(folder) / name
+                info = path.stat()
+                stamps.append(f'{path.relative_to(package).as_posix()}\0{info.st_mtime_ns}\0{info.st_size}')
+    digest = hashlib.sha256(_plugin_version(package).encode())
+    for stamp in sorted(stamps):
+        digest.update(stamp.encode() + b'\n')
+    return digest.hexdigest()
+
+
+class _FingerprintCache:
+    """code_fingerprint() reused for a short while (each embedding request checks the service)."""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._value = None
+        self._taken_at = 0.0
+
+    def fresh(self):
+        value = code_fingerprint()
+        with self._guard:
+            self._value, self._taken_at = value, time.monotonic()
+        return value
+
+    def recent(self):
+        with self._guard:
+            if self._value is not None and time.monotonic() - self._taken_at < _FINGERPRINT_REUSE_SECONDS:
+                return self._value
+        return self.fresh()
+
+
+_fingerprints = _FingerprintCache()
 
 
 class EmbeddingUnavailable(RuntimeError):
@@ -155,8 +223,16 @@ def _read_frame(conn):
             raise ValueError(_ERR['frame_big'])
 
 
+def _request_seconds(request):
+    """The request's own deadline in seconds (ValueError when it is not a usable one)."""
+    seconds = float(request.get('timeout', _DEFAULT_REQUEST_SECONDS))
+    if not (math.isfinite(seconds) and 0 < seconds <= _MAX_REQUEST_SECONDS):
+        raise ValueError(_ERR['bad_timeout'])
+    return seconds
+
+
 def _write_frame(conn, payload):
-    wire = json.dumps(payload, ensure_ascii=False, allow_nan=False).encode() + b'\n'
+    wire = json.dumps(payload, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode() + b'\n'
     if FRAME_BYTE_CAP < len(wire):
         raise ValueError(_ERR['frame_big'])
     conn.sendall(wire)
@@ -214,6 +290,10 @@ class EmbeddingDaemon:
             raise ValueError(_ERR['bad_bounds'])
         self.jobs = queue.PriorityQueue(maxsize=queue_size * 2)
         self.lane_slots = {lane: threading.BoundedSemaphore(queue_size) for lane in _PRIORITY_RANK}
+        # Vector searches: their own queue and thread, never behind a model call.
+        self.search_jobs = queue.Queue(maxsize=queue_size)
+        self.searcher = VectorSearcher()
+        self.fingerprint = None
         self.conn_slots = threading.BoundedSemaphore(connections)
         self.ticket_seq = itertools.count()
         self.stop_event = threading.Event()
@@ -241,11 +321,12 @@ class EmbeddingDaemon:
             self.lifetime_lock = None
             raise RuntimeError(_ERR['already_up']) from None
         try:
+            self.fingerprint = code_fingerprint()
             self._publish_token()
             self.socket_path.unlink(missing_ok=True)
             self.server_sock = _wc.listen_socket(self.socket_path, backlog=_LISTEN_BACKLOG)
             self.server_sock.settimeout(_ACCEPT_TICK)
-            for loop in (self._worker_loop, self._accept_loop):
+            for loop in (self._worker_loop, self._search_loop, self._accept_loop):
                 thread = threading.Thread(target=loop, daemon=True)
                 self.loop_threads.append(thread)
                 thread.start()
@@ -283,15 +364,17 @@ class EmbeddingDaemon:
         return request
 
     def _enqueue(self, request):
-        """Check a query/document request and put it on the queue; returns (future, timeout)."""
-        if request.get('op') not in _OPS:
+        """Check a query/document/search request and put it on its queue; returns (future, timeout)."""
+        op = request.get('op')
+        if op not in _SERVICE_OPS:
             raise ValueError(_ERR['bad_op'])
+        if op == SEARCH_OP:
+            seconds = _request_seconds(request)
+            return self._enqueue_search(request, seconds), seconds
         text = request.get('value')
         if not isinstance(text, str) or len(text) > INPUT_CHAR_CAP:
             raise ValueError(_ERR['bad_input'])
-        seconds = float(request.get('timeout', _DEFAULT_REQUEST_SECONDS))
-        if not (math.isfinite(seconds) and 0 < seconds <= _MAX_REQUEST_SECONDS):
-            raise ValueError(_ERR['bad_timeout'])
+        seconds = _request_seconds(request)
         lane = request.get('priority', 'interactive')
         if lane not in _PRIORITY_RANK:
             raise ValueError(_ERR['bad_priority'])
@@ -306,13 +389,21 @@ class EmbeddingDaemon:
             raise
         return future, seconds
 
+    def _enqueue_search(self, request, seconds):
+        """Put a search on the search queue (queue.Full when it is full); the search thread checks the fields."""
+        future = concurrent.futures.Future()
+        self.search_jobs.put_nowait((time.monotonic() + seconds, future, request))
+        return future
+
     def _serve_connection(self, conn):
         try:
             conn.settimeout(_CONN_IO_TIMEOUT)
             request = self._authenticated_request(conn)
             if request.get('op') == 'ping':
                 # device: where the model runs; None until the model is loaded (the start-up warm-up).
-                _write_frame(conn, {'result': {'pid': os.getpid(), 'device': getattr(self.backend, 'device', None)}})
+                # fingerprint: the code this service runs (a client with other code replaces it).
+                _write_frame(conn, {'result': {'pid': os.getpid(), 'device': getattr(self.backend, 'device', None),
+                                               'fingerprint': self.fingerprint}})
                 return
             if request.get('op') == SHUTDOWN_OP:
                 # Set before the answer, so a caller that got it knows the stop is under way; main() then
@@ -382,6 +473,29 @@ class EmbeddingDaemon:
             finally:
                 self.jobs.task_done()
 
+    def _run_search(self, deadline, future, request):
+        if deadline <= time.monotonic():
+            future.cancel()
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            result = self.searcher.search(request)
+        except Exception as error:
+            future.set_exception(error)
+        else:
+            future.set_result((result, []))
+
+    def _search_loop(self):
+        while not self.stop_event.is_set():
+            try:
+                deadline, future, request = self.search_jobs.get(timeout=_JOB_TICK)
+            except queue.Empty:
+                continue
+            try:
+                self._run_search(deadline, future, request)
+            finally:
+                self.search_jobs.task_done()
+
     def close(self):
         self.stop_event.set()
         if self.server_sock:
@@ -392,6 +506,10 @@ class EmbeddingDaemon:
         while not self.jobs.empty():
             self.jobs.get_nowait()[3].cancel()
             self.jobs.task_done()
+        while not self.search_jobs.empty():
+            self.search_jobs.get_nowait()[1].cancel()
+            self.search_jobs.task_done()
+        self.searcher.indexes.clear()
         with self.live_conns_guard:
             conn_threads = list(self.live_conns)
         for thread in conn_threads:
@@ -467,33 +585,45 @@ class EmbeddingClient:
         A daemon that took the connection but answers slowly is busy rather than dead, and reconnecting
         on every slice would only stack abandoned connections in its backlog."""
         try:
-            self._exchange('ping', socket_timeout=countdown.left(), reply_timeout=countdown.rest())
+            return self._exchange('ping', socket_timeout=countdown.left(), reply_timeout=countdown.rest())
         except TimeoutError:
             raise TimeoutError(_ERR['start_deadline']) from None
 
     def _daemon_responds(self, countdown):
+        """The ping reply of the live daemon (a dict), or None when none runs."""
         try:
-            self._ping(countdown)
+            return self._ping(countdown)
         except ConnectionRefusedError:
-            return False
+            return None
         except FileNotFoundError:
             pass
-        else:
-            return True
         # No token file: probe only the transport (files are never repaired here), so a live daemon
         # that lacks credentials cannot be mistaken for a dead one.
         try:
             _wc.connect_socket(self.directory / 'i.sock', countdown.left()).close()
         except (FileNotFoundError, ConnectionRefusedError):
-            return False
+            return None
         # The daemon may have appeared between the two probes, so authenticate one more time.
         try:
-            self._ping(countdown)
+            return self._ping(countdown)
         except FileNotFoundError:
             raise PermissionError(_ERR['no_credentials']) from None
         except ConnectionRefusedError:
-            return False
-        return True
+            return None
+
+    def _retire_daemon(self, countdown):
+        """Stop the live daemon (it runs other code) and wait until its lifetime lock is free."""
+        try:
+            self._exchange(SHUTDOWN_OP, socket_timeout=countdown.left(), reply_timeout=countdown.rest())
+        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
+            pass  # already gone
+        except EmbeddingUnavailable as error:
+            raise EmbeddingUnavailable(_ERR['replace_refused'].format(reason=error)) from None
+        while True:
+            with _open_owner_file(self.directory / 'owner.lock') as lifetime:
+                if _try_flock(lifetime):
+                    return
+            time.sleep(min(_SPIN_SLEEP, countdown.left()))
 
     def _spawn_daemon(self, guard):
         # Detached: no shell, no console window, no inherited pipes, and no tie to this app's lifetime.
@@ -519,20 +649,28 @@ class EmbeddingClient:
             raise EmbeddingUnavailable(_ERR['launching']) from None
 
     def ensure_daemon(self):
+        """A live daemon running the code of this package's files; one running other code is stopped and a new
+        one started (one service serves every profile, so it is replaced even while other homes use it)."""
         countdown = _Countdown(self.startup_timeout)
-        if self._daemon_responds(countdown):
+        live = self._daemon_responds(countdown)
+        if live is not None and live.get('fingerprint') == _fingerprints.recent():
             return
         # A directory that already exists with unsafe ownership is rejected here.
         _ensure_owner_dir(self.directory)
         with _open_owner_file(self.directory / 'startup.lock') as gate:
             while not _try_flock(gate):
                 time.sleep(min(_SPIN_SLEEP, countdown.left()))
-            if self._daemon_responds(countdown):
+            # Under the lock: a client that waited here finds the daemon the first one started.
+            live = self._daemon_responds(countdown)
+            if live is not None and live.get('fingerprint') == _fingerprints.fresh():
                 return
-            # A daemon without its model files could only answer errors while staying resident.
+            # A daemon without its model files could only answer errors while staying resident
+            # (checked before a live one of other code is stopped, which then keeps serving).
             missing = missing_model_message(self.home)
             if missing:
                 raise EmbeddingUnavailable(missing)
+            if live is not None:
+                self._retire_daemon(countdown)
             # Failure backoff shared by every starter, including one that was killed mid-launch.
             gate.seek(0)
             stamped = gate.read().strip()
@@ -552,7 +690,7 @@ class EmbeddingClient:
                     child = self._spawn_daemon(guard)
                     # Reap the child for as long as we live; never kill it on timeout or exit (the lifetime lock owns it).
                     threading.Thread(target=child.wait, daemon=True).start()
-                    while not self._daemon_responds(countdown):
+                    while self._daemon_responds(countdown) is None:
                         if child.poll() is not None:
                             raise EmbeddingUnavailable(_ERR['spawn_failed'])
                         time.sleep(min(_SPIN_SLEEP, countdown.left()))
@@ -562,11 +700,26 @@ class EmbeddingClient:
                     raise
 
     def request(self, op, value='', *, priority='interactive', **extra):
-        if op in _OPS:
-            if self.paused is not None and self.paused():
+        if op == SEARCH_OP:
+            return self._search(priority=priority, **extra)
+        if op in _SERVICE_OPS:
+            if op in _OPS and self.paused is not None and self.paused():
                 raise EmbeddingUnavailable(PAUSED_MESSAGE)
             self.ensure_daemon()
         return self._exchange(op, value, priority=priority, **extra)
+
+    def _search(self, **fields):
+        """A vector search goes straight to the live daemon (the query embedding before it has just checked the
+        daemon's code); ensure_daemon runs only when none answers or the one answering does not know searches."""
+        try:
+            return self._exchange(SEARCH_OP, **fields)
+        except (FileNotFoundError, ConnectionRefusedError, ConnectionResetError):
+            pass
+        except EmbeddingUnavailable as error:
+            if str(error) != _ERR['bad_op']:
+                raise
+        self.ensure_daemon()
+        return self._exchange(SEARCH_OP, **fields)
 
     def device(self):
         """Device the running daemon's model is on ('cpu' or 'directml'); None while it is still loading.

@@ -735,7 +735,6 @@ def tidy_saved_preference(store: MemoryStore, namespace: str, pref_id: int) -> d
     Returns {"deleted": [ids], "common": True when the new row was made common}. A row without its text
     vector is not compared."""
     from .preferences import BASIS_USER_SAID, PREF_CONSTRAINT, PREFERENCES_TABLE
-    from .store import dot_similarities
     result: dict[str, Any] = {"deleted": [], "common": False}
     with store._lock:
         row = store._conn.execute(f"SELECT text,embedding,situation,basis,type FROM {PREFERENCES_TABLE} "
@@ -748,8 +747,10 @@ def tidy_saved_preference(store: MemoryStore, namespace: str, pref_id: int) -> d
     if not others:
         return result
     new_words = len(str(row[0]).split())
-    scored = sorted(((similarity, index) for index, similarity in enumerate(
-        dot_similarities(array("f", row[1]), [other[2] for other in others])) if math.isfinite(similarity)),
+    # Only rows at or above DUPLICATE_COSINE can be duplicates, so the closest NEIGHBORS among those are the same.
+    scored = sorted(((similarity, index) for index, similarity in enumerate(vector_index.similarities(
+        store._conn, PREFERENCES_TABLE, [int(other[0]) for other in others], array("f", row[1]),
+        threshold=RememberTuning.DUPLICATE_COSINE)) if math.isfinite(similarity)),
         key=_pref_neighbor_order)[:RememberTuning.NEIGHBORS]
     duplicates = [others[index] for similarity, index in scored
                   if similarity >= RememberTuning.DUPLICATE_COSINE

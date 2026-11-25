@@ -14,6 +14,7 @@ from neospike import backup as db_backup
 from neospike import cli
 from neospike.config import EMBEDDING_DIMENSIONS, NeospikeConfig
 from neospike.tests.supersede_links import link_supersede
+from neospike.tests.support_vector import use_full_comparison
 from neospike.provider import NeospikeProvider
 from neospike.recall_log import REASON_SUPERSEDED
 from neospike.store import RELATION_SUPERSEDES, SCHEMA_VERSION, MemoryStore
@@ -263,9 +264,10 @@ def test_backup_restore_keeps_links_and_invalid_columns(provider: NeospikeProvid
 
 
 # schema v9 migration ----------------------------------------------------------------------------
-def test_v8_links_table_becomes_refers_code_links(tmp_path: Path) -> None:
+def test_v8_links_table_becomes_refers_code_links(tmp_path: Path, monkeypatch) -> None:
     """A v8 file (memories without invalid_at/superseded_by, links without id/relation) goes through the v22
     migration: a link keeps its rowid as id and becomes refers/code; a link whose source note is gone is dropped."""
+    use_full_comparison(monkeypatch)  # the migration's top-5 check reads the old memories table
     db = tmp_path / "memory.db"
     with closing(sqlite3.connect(db)) as connection:
         connection.executescript(

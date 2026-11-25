@@ -10,7 +10,7 @@ import faiss
 import numpy as np
 import pytest
 
-from neospike import vector_index
+from neospike import vector_index, vector_search
 from neospike.store import PENDING_EMBED_MARK, MemoryStore, vector_pending_sql
 
 DIMENSIONS = 32
@@ -22,13 +22,6 @@ SEED = 517
 VECTOR_INDEX = "items_vector_updated"
 PENDING_INDEX = "items_embed_pending"
 OLD_STAMP_SECONDS = 3600.0
-
-
-@pytest.fixture(autouse=True)
-def _fresh_registry():
-    vector_index.drop_all()
-    yield
-    vector_index.drop_all()
 
 
 @pytest.fixture
@@ -56,8 +49,8 @@ def _plan(store: MemoryStore, sql: str, args: tuple = ()) -> list[str]:
     return [str(row[3]) for row in store._conn.execute("EXPLAIN QUERY PLAN " + sql, args)]
 
 
-def _indexed_ids(store: MemoryStore) -> set[int]:
-    state = vector_index._registry[(vector_index._database_file(store._conn), "items")]
+def _indexed_ids(store: MemoryStore, service) -> set[int]:
+    state = service.state(vector_index._database_file(store._conn))
     return set(faiss.vector_to_array(state.index.id_map).tolist())
 
 
@@ -71,10 +64,10 @@ def _uses(plan: list[str], index: str) -> bool:
 
 
 def test_queries_take_the_partial_indexes(store: MemoryStore) -> None:
-    vector_rows = vector_index._vector_rows_sql()
+    vector_rows = vector_search.vector_rows_sql()
     count = _plan(store, f"SELECT count(*) FROM items WHERE {vector_rows}", (WIDTH,))
     assert any(f"COVERING INDEX {VECTOR_INDEX}" in line for line in count), count
-    changed = _plan(store, vector_index._CHANGED_SQL["items"].format(vector_rows=vector_rows), (0.0, WIDTH))
+    changed = _plan(store, vector_search.CHANGED_SQL.format(column="embedding", table="items", vector_rows=vector_rows), (0.0, WIDTH))
     assert _uses(changed, VECTOR_INDEX), changed
     pending = (f"SELECT id FROM items WHERE type='memory' AND {vector_pending_sql()} ORDER BY id",
                f"SELECT id FROM items WHERE type IN ('note','doc') AND title IS NULL AND {vector_pending_sql()} "
@@ -84,30 +77,30 @@ def test_queries_take_the_partial_indexes(store: MemoryStore) -> None:
         assert _uses(plan, PENDING_INDEX), (sql, plan)
 
 
-def test_pending_row_enters_the_index_once_embedded(store: MemoryStore) -> None:
+def test_pending_row_enters_the_index_once_embedded(store: MemoryStore, search_service) -> None:
     vectors = _vectors(ROWS + 1)
     stamp = time.time() - OLD_STAMP_SECONDS
     ids = [_insert(store, f"m{index}", vectors[index].tobytes(), stamp) for index in range(ROWS)]
     pending_id = _insert(store, "pending", PENDING_EMBED_MARK, stamp)
     assert [row["id"] for row in store.items_missing_embedding()] == [pending_id]
     _search(store, ids + [pending_id])
-    assert _indexed_ids(store) == set(ids)
+    assert _indexed_ids(store, search_service) == set(ids)
     assert store.write_missing_embedding(pending_id, vectors[ROWS].tolist())
     assert store.items_missing_embedding() == []
     _search(store, ids)  # not among the allowed ids: found through updated_at alone
-    assert _indexed_ids(store) == set(ids) | {pending_id}
+    assert _indexed_ids(store, search_service) == set(ids) | {pending_id}
 
 
-def test_rows_of_another_width_are_skipped(store: MemoryStore) -> None:
+def test_rows_of_another_width_are_skipped(store: MemoryStore, search_service) -> None:
     vectors = _vectors(ROWS)
     stamp = time.time() - OLD_STAMP_SECONDS
     ids = [_insert(store, f"m{index}", vectors[index].tobytes(), stamp) for index in range(ROWS)]
     wide_old = _insert(store, "wide-old", b"\x00" * OTHER_WIDTH, stamp)
     _search(store, ids + [wide_old])  # build
-    assert _indexed_ids(store) == set(ids)
+    assert _indexed_ids(store, search_service) == set(ids)
     wide_new = _insert(store, "wide-new", b"\x00" * OTHER_WIDTH, time.time())
     sims = _search(store, ids + [wide_old, wide_new])  # sync: changed rows and allowed ids the index lacks
-    assert _indexed_ids(store) == set(ids)
+    assert _indexed_ids(store, search_service) == set(ids)
     assert np.isnan(sims[-1]) and np.isnan(sims[-2])
 
 
