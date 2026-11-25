@@ -1,8 +1,8 @@
 ﻿# Neospike
 
 ![Neospike: knowledge that gathers, assembles, and grows on its own](assets/branding/neospike-hero.png)
-
 ![How Neospike works: recall, save, daily tidy-up and MCP](assets/branding/neospike-architecture.png)
+![How Neospike works: recall, save, daily tidy-up and MCP](assets/branding/dashboard.PNG)
 
 **An AI agent whose knowledge gathers, assembles, and grows on its own. Second brain + RAG, for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
